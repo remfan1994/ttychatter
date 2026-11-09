@@ -52,12 +52,15 @@ explain design intent rather than only restating the syntax.
 from __future__ import annotations
 
 import argparse
+import copy
 import base64
 import curses
+import fcntl
 import json
 import mimetypes
 import os
 import platform
+import queue
 import re
 import select
 import shlex
@@ -66,7 +69,11 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import textwrap
+import time
+import unicodedata
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -75,7 +82,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable, Dict, List, Optional, Tuple
 
-VERSION = "0.15.2-ai-files"
+VERSION = "0.17.0"
 PROGRAM = "ttychatter.ncurses"
 FALLBACK_MODEL = "openrouter/auto"
 DEFAULT_MODEL_TEST_PROMPT = "Please reply with one short sentence confirming this model is available for text generation."
@@ -104,7 +111,9 @@ DEFAULT_ATTACHMENT_DIR = DEFAULT_DATA_HOME / "ttychatter" / "openrouter" / "atta
 DEFAULT_MODEL_MIN_INPUT_TOKENS = 0
 DEFAULT_MODEL_MIN_OUTPUT_TOKENS = 0
 DEFAULT_MODEL_SORT_ORDER = "api"
-THEME_CHOICES = ["default", "dim", "high_contrast", "mono", "solarized_dark"]
+THEME_CHOICES = ["terminal"]
+WEB_SEARCH_ENGINES = ["auto", "native", "exa", "parallel", "perplexity", "firecrawl"]
+WEB_SEARCH_MODES = ["auto", "server-tool", "plugin"]
 MODEL_TYPE_CHOICES = ["all", "routers", "fixed", "free", "auto"]
 
 
@@ -156,7 +165,7 @@ class Config:
     model_min_output_tokens: int = DEFAULT_MODEL_MIN_OUTPUT_TOKENS
     model_sort_order: str = DEFAULT_MODEL_SORT_ORDER
     model_type_filter: str = "all"
-    theme: str = "default"
+    theme: str = "terminal"
     send_input: str = "enter"
     prompt_session_name: bool = True
     code_attachment_min_lines: int = 5
@@ -169,6 +178,14 @@ class Config:
     session_title_max_words: int = 8
     stream: bool = False
     ai_file_download_mode: str = "ask"
+    input_height: int = 3
+    web_search: bool = False
+    web_search_engine: str = "auto"
+    web_search_max_results: int = 5
+    web_search_max_uses: int = 3
+    web_search_mode: str = "auto"
+    request_session_id: str = ""
+    last_response_metadata: dict = field(default_factory=dict)
 
     @property
     # ------------------------------------------------------------
@@ -481,10 +498,8 @@ def load_config() -> Config:
                     if value in MODEL_TYPE_CHOICES:
                         cfg.model_type_filter = value
                 elif key == "THEME":
-                    if value in THEME_CHOICES:
-                        cfg.theme = value
-                        if value == "mono":
-                            cfg.monochrome = True
+                    # Old theme names remain readable; the terminal owns colors.
+                    cfg.theme = "terminal"
                 elif key == "MAX_ATTACHMENT_BYTES":
                     cfg.max_attachment_bytes = parse_nonnegative_int(value, cfg.max_attachment_bytes)
                 elif key == "SEND_INPUT":
@@ -511,6 +526,18 @@ def load_config() -> Config:
                     cfg.session_title_max_words = parse_positive_int(value, cfg.session_title_max_words)
                 elif key == "STREAM":
                     cfg.stream = parse_bool(value, cfg.stream)
+                elif key == "INPUT_HEIGHT":
+                    cfg.input_height = min(12, parse_positive_int(value, 3))
+                elif key == "WEB_SEARCH":
+                    cfg.web_search = parse_bool(value, cfg.web_search)
+                elif key == "WEB_SEARCH_ENGINE" and value in WEB_SEARCH_ENGINES:
+                    cfg.web_search_engine = value
+                elif key == "WEB_SEARCH_MAX_RESULTS":
+                    cfg.web_search_max_results = min(25, parse_nonnegative_int(value, 5))
+                elif key == "WEB_SEARCH_MAX_USES":
+                    cfg.web_search_max_uses = min(25, parse_nonnegative_int(value, 3))
+                elif key == "WEB_SEARCH_MODE" and value in WEB_SEARCH_MODES:
+                    cfg.web_search_mode = value
                 elif key in {"AI_FILE_DOWNLOAD_MODE", "AI_DOWNLOAD"}:
                     if value.lower() in {"ask", "auto", "metadata", "off"}:
                         cfg.ai_file_download_mode = value.lower()
@@ -525,69 +552,39 @@ def load_config() -> Config:
 
     return cfg
 
+def write_private_text(path: Path, text: str) -> None:
+    target = path.resolve()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(prefix='.' + target.name + '-', dir=target.parent)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(name, target)
+    finally:
+        try:
+            os.unlink(name)
+        except FileNotFoundError:
+            pass
+
+
 def set_config_value(cfg: Config, key: str, value: str) -> None:
-    cfg.config_file.parent.mkdir(parents=True, exist_ok=True)
-    lines: List[str] = []
-    replaced = False
+    if not re.fullmatch(r'[A-Z0-9_]+', key) or '\n' in value or '\r' in value:
+        raise ValueError('Configuration entries must be single KEY=VALUE lines.')
+    lines = cfg.config_file.read_text(encoding='utf-8', errors='replace').splitlines() if cfg.config_file.exists() else []
+    kept = [line for line in lines if line.partition('=')[0].strip() != key]
+    kept.append(key + '=' + value)
+    write_private_text(cfg.config_file, '\n'.join(kept) + '\n')
 
-    if cfg.config_file.exists():
-        lines = cfg.config_file.read_text(encoding="utf-8", errors="replace").splitlines()
 
-    new_lines: List[str] = []
-    for line in lines:
-        if line.strip().startswith(f"{key}="):
-            new_lines.append(f"{key}={value}")
-            replaced = True
-        else:
-            new_lines.append(line)
-
-    if not replaced:
-        new_lines.append(f"{key}={value}")
-
-    cfg.config_file.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
-    try:
-        os.chmod(cfg.config_file, 0o600)
-    except OSError:
-        pass
 
 
 def remove_config_key(cfg: Config, key: str) -> None:
-    """Remove one KEY=VALUE entry from the config file if it exists.
-
-    This small helper matters for secret hygiene.  When the user chooses GPG
-    encrypted key storage, keeping an older plaintext OPENROUTER_API_KEY line
-    would silently defeat the point.  Deleting the plaintext key is therefore
-    part of the encrypted-save workflow, not a cosmetic cleanup.
-    """
     if not cfg.config_file.exists():
         return
-    lines = cfg.config_file.read_text(encoding="utf-8", errors="replace").splitlines()
-    new_lines = [line for line in lines if not line.strip().startswith(f"{key}=")]
-    cfg.config_file.write_text("\n".join(new_lines) + ("\n" if new_lines else ""), encoding="utf-8")
-    try:
-        os.chmod(cfg.config_file, 0o600)
-    except OSError:
-        pass
-
-
-def remove_config_key(cfg: Config, key: str) -> None:
-    """Remove a KEY=VALUE entry from the config file if present.
-
-    The encrypted-key workflow uses this to clean up plaintext API-key entries
-    after successfully writing api-key.gpg.  Keeping the removal helper small
-    and explicit prevents a common security footgun: users select encrypted
-    storage but an older plaintext OPENROUTER_API_KEY line remains in the config
-    and silently takes precedence on the next launch.
-    """
-    if not cfg.config_file.exists():
-        return
-    lines = cfg.config_file.read_text(encoding="utf-8", errors="replace").splitlines()
-    kept = [line for line in lines if not line.strip().startswith(f"{key}=")]
-    cfg.config_file.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
-    try:
-        os.chmod(cfg.config_file, 0o600)
-    except OSError:
-        pass
+    lines = cfg.config_file.read_text(encoding='utf-8', errors='replace').splitlines()
+    write_private_text(cfg.config_file, '\n'.join(line for line in lines if line.partition('=')[0].strip() != key) + '\n')
 
 
 # ---------------------------------------------------------------------------
@@ -610,7 +607,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", metavar="NAME", help="resume an existing named session")
     parser.add_argument("--new", action="store_true", help="force a fresh timestamped session")
     parser.add_argument("--list", action="store_true", help="list saved sessions with title metadata when present")
-    parser.add_argument("--rename-session", nargs=2, metavar=("SESSION", "TITLE"), help="set friendly session title metadata without renaming the file")
+    parser.add_argument("--rename-session", nargs=2, metavar=("SESSION", "TITLE"), help="set the session title and safely rename its log file")
     parser.add_argument("--turns", metavar="SESSION", help="list user/assistant message numbers from a session")
     parser.add_argument("--branch", nargs=2, metavar=("SESSION", "TURN"), help="create a timestamped branch containing messages through TURN")
     parser.add_argument("--edit-turn", nargs=2, metavar=("SESSION", "TURN"), help="not implemented in ncurses; use C or ttychatter.python")
@@ -625,8 +622,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--test-model", metavar="MODEL", help="send the model-test prompt to MODEL and print the response")
     parser.add_argument("--demo", action="store_true", help="run without OpenRouter network calls using local demo responses and demo model metadata")
     parser.add_argument("--loopback-file", metavar="PATH", help="append each AI response to PATH while the ncurses UI remains interactive")
-    parser.add_argument("--stream", action="store_true", help="stream assistant output into the transcript; press ESC to stop an active stream")
+    parser.add_argument("--stream", action="store_true", help="stream assistant output into the transcript while the UI remains interactive")
     parser.add_argument("--no-stream", action="store_true", help="disable streaming for this run")
+    web = parser.add_mutually_exclusive_group()
+    web.add_argument('--web', action='store_true', help='enable OpenRouter web search for this run')
+    web.add_argument('--no-web', action='store_true', help='disable OpenRouter web search for this run')
+    parser.add_argument('--web-engine', choices=WEB_SEARCH_ENGINES, help='web search engine')
+    parser.add_argument('--web-max-results', type=int, choices=range(0, 26), metavar='0..25', help='maximum results per search; 0 leaves the provider default')
+    parser.add_argument('--web-max-uses', type=int, choices=range(0, 26), metavar='0..25', help='maximum server-tool search rounds; 0 imposes no ttychatter limit')
+    parser.add_argument('--web-mode', choices=WEB_SEARCH_MODES, help='web compatibility: auto, server-tool, or plugin')
     parser.add_argument("--ai-download", choices=("ask", "auto", "metadata", "off"), help="AI file receipt mode for provider-returned attachments")
     parser.add_argument("--version", action="store_true", help="show version information")
     return parser.parse_args()
@@ -659,39 +663,35 @@ def default_session_name() -> str:
 # the program. When changing it, check callers, documentation, config compatibility, session-log
 # compatibility, and the parallel Bash/C implementation plans.
 # ------------------------------------------------------------
-def clean_session_title(raw: str, max_words: int = 8) -> str:
-    text = re.sub(r"[\r\n\t\x00-\x1f]+", " ", raw or "")
-    text = re.sub(r"\s+", " ", text).strip()
-    text = re.sub(r"^(session[ -]?title|title)\s*:\s*", "", text, flags=re.I)
-    text = text.strip(" \"'`*.-")
-    words = text.split()
-    text = " ".join(words[: max(1, max_words)])
-    if len(text) > 96:
-        text = text[:96].rsplit(" ", 1)[0] or text[:96]
-    return text.strip()
+def clean_session_title(raw: str, max_words: int = 0) -> str:
+    text = re.sub(r'[\x00-\x1f\x7f]+', ' ', raw or '')
+    text = re.sub(r'\s+', ' ', text).strip()
+    if max_words:
+        text = re.sub(r'^(session[ -]?title|title)\s*:\s*', '', text, flags=re.I)
+        text = text.strip(' "\'`*.-')
+        text = ' '.join(text.split()[:max_words])
+    return text[:240].strip()
 
 
-def session_title_from_file(path: Path, max_words: int = 8) -> str:
-    if not path.exists():
-        return ""
-    title = ""
+def session_title_from_file(path: Path, max_words: int = 0) -> str:
+    title = ''
     try:
-        with path.open("r", encoding="utf-8", errors="replace") as fh:
+        with path.open('r', encoding='utf-8', errors='replace') as fh:
             for line in fh:
-                match = re.search(r"session-title\s*:\s*(.*)$", line, re.I)
+                match = re.match(r'^\[\d\d:\d\d:\d\d\] system: session-title: (.*)$', line)
                 if match:
-                    title = match.group(1).strip()
+                    title = match.group(1)
     except OSError:
-        return ""
-    return clean_session_title(title, max_words)
+        return ''
+    return clean_session_title(title)
 
 
-def write_session_title_metadata(path: Path, title: str, max_words: int = 8) -> bool:
-    clean = clean_session_title(title, max_words)
+def write_session_title_metadata(path: Path, title: str, max_words: int = 0) -> bool:
+    clean = clean_session_title(title)
     if not clean:
         return False
     ensure_prechat_line(path)
-    append_log(path, "system", f"session-title: {clean}", now_time())
+    append_log(path, 'system', f'session-title: {clean}', now_time())
     return True
 
 
@@ -732,10 +732,15 @@ def default_session_name_unique(session_dir: Path) -> str:
     return name
 
 
+def is_conversation_entry(entry: LogEntry) -> bool:
+    return entry.speaker.lower() != 'system' and not (
+        entry.speaker == 'remfan1994' and entry.text.strip() == PROJECT_NOTICE.strip())
+
+
 def real_session_messages(path: Path) -> List[LogEntry]:
     out: List[LogEntry] = []
     for entry in load_log_entries(path):
-        if entry.speaker.lower() == "system" or entry.speaker == "remfan1994":
+        if not is_conversation_entry(entry):
             continue
         if is_snapshot_entry(entry):
             continue
@@ -777,7 +782,7 @@ def branch_session_cli(cfg: Config, source_path: Path, turn_text: str) -> int:
             break
         append_log(branch, entry.speaker, entry.text, entry.timestamp)
     src_title = session_display_title(source_path)
-    write_session_title_metadata(branch, f"Branch of {src_title}", cfg.session_title_max_words)
+    branch = rename_session_file(branch, f"Branch of {src_title}")
     print(branch)
     return 0
 
@@ -814,21 +819,28 @@ def export_session_cli(source_path: Path, fmt: str, output: Optional[str]) -> in
     return 0
 
 
-def generate_session_title(cfg: Config, path: Path, user_text: str, assistant_text: str) -> None:
-    if not cfg.session_auto_title or session_title_from_file(path, cfg.session_title_max_words):
-        return
+def generate_session_title(cfg: Config, path: Path, user_text: str, assistant_text: str) -> Optional[Path]:
+    if not cfg.session_auto_title or session_title_from_file(path):
+        return None
     if cfg.demo_mode:
         title = clean_session_title(user_text, cfg.session_title_max_words)
     else:
-        prompt = (
-            "Generate a concise topical title for this ttychatter session. "
-            f"Reply only with the title, maximum {cfg.session_title_max_words} words.\n\n"
-            f"User: {user_text}\nAssistant: {assistant_text}"
-        )
-        ok, text = generate_with_model(cfg, cfg.session_title_model, prompt, path.stem, cfg.effective_attachment_dir, [], timeout=60)
-        title = clean_session_title(text.splitlines()[0] if ok and text else "", cfg.session_title_max_words)
+        prompt = ('Generate a concise topical session title. Reply only with the title, maximum '
+                  + str(cfg.session_title_max_words) + ' words.\nUser: ' + user_text + '\nAssistant: ' + assistant_text)
+        old_web, old_metadata = cfg.web_search, cfg.last_response_metadata
+        try:
+            cfg.web_search = False
+            ok, answer = generate_with_model(cfg, cfg.session_title_model, prompt, path.stem,
+                cfg.effective_attachment_dir, [], timeout=60)
+        finally:
+            cfg.web_search, cfg.last_response_metadata = old_web, old_metadata
+        title = clean_session_title(answer.splitlines()[0] if ok and answer else '', cfg.session_title_max_words)
     if title:
-        write_session_title_metadata(path, title, cfg.session_title_max_words)
+        if path.parent.resolve() == cfg.session_dir.resolve():
+            return rename_session_file(path, title)
+        write_session_title_metadata(path, title)
+        return path
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1336,29 +1348,45 @@ def _decode_data_url(url: str) -> Tuple[Optional[str], Optional[bytes]]:
     if ";base64" not in meta:
         return None, None
     mime = meta[5:].split(";", 1)[0] or "application/octet-stream"
-    return mime, base64.b64decode(payload)
+    return mime, base64.b64decode(re.sub(r'\s+', '', payload), validate=True)
 
 
 def _save_ai_file(attachment_dir: Path, rec: Dict[str, str]) -> Path:
-    path = _unique_ai_received_path(attachment_dir, rec)
-    url = rec.get("url", "")
-    data = rec.get("data", "")
-    if url.startswith("data:"):
+    url, data = rec.get('url', ''), rec.get('data', '')
+    limit = MAX_INLINE_ATTACHMENT_BYTES
+    if url.startswith('data:'):
+        if len(url) > (limit * 4 // 3 + 4096):
+            raise ValueError('Returned file exceeds the 20 MiB receipt limit.')
         mime, blob = _decode_data_url(url)
         if blob is None:
-            raise RuntimeError("unsupported data URL")
+            raise ValueError('Unsupported data URL.')
         if mime:
-            rec["mime"] = mime
-        path.write_bytes(blob)
-        return path
-    if data:
-        path.write_bytes(base64.b64decode(data))
-        return path
-    if url.startswith(("http://", "https://")):
+            rec['mime'] = mime
+    elif data:
+        compact = re.sub(r'\s+', '', data)
+        if len(compact) > (limit * 4 // 3 + 4):
+            raise ValueError('Returned file exceeds the 20 MiB receipt limit.')
+        blob = base64.b64decode(compact, validate=True)
+    elif url.startswith(('http://', 'https://')):
         with urllib.request.urlopen(url, timeout=120) as response:
-            path.write_bytes(response.read())
+            blob = response.read(limit + 1)
+    else:
+        raise ValueError('No downloadable URL or base64 payload.')
+    if len(blob) > limit:
+        raise ValueError('Returned file exceeds the 20 MiB receipt limit.')
+    while True:
+        path = _unique_ai_received_path(attachment_dir, rec)
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            continue
+        try:
+            with os.fdopen(fd, 'wb') as fh:
+                fh.write(blob)
+        except Exception:
+            path.unlink(missing_ok=True)
+            raise
         return path
-    raise RuntimeError("no downloadable URL or base64 payload")
 
 
 def parse_openrouter_text_and_files(
@@ -1429,85 +1457,62 @@ def parse_openrouter_text_and_files(
 # Single AI generation request. All request-part construction funnels through this area so
 # attachments, text prompts, and future media behavior stay centralized.
 # ------------------------------------------------------------
-def generate_with_model(
-    cfg: Config,
-    model_id: str,
-    prompt_text: str,
-    session_name: str,
-    attachment_dir: Path,
-    attachments: Optional[List[PendingAttachment]] = None,
-    timeout: int = 120,
-    ask_download: Optional[Callable[[Dict[str, str], int], bool]] = None,
-) -> Tuple[bool, str]:
-    """Send one OpenRouter chat-completions request.
-
-    Maintainers: keep this function boring. All provider-specific behavior for
-    a normal response should remain concentrated here. If OpenRouter changes its
-    request or response schema, patch this function and the model-list parser
-    first before touching the UI state machine.
-    """
+def generate_with_model(cfg: Config, model_id: str, prompt_text: str, session_name: str,
+                        attachment_dir: Path, attachments: Optional[List[PendingAttachment]] = None,
+                        timeout: int = 120, ask_download=None) -> Tuple[bool, str]:
+    cfg.last_response_metadata = {}
     if cfg.demo_mode:
         return True, demo_ai_response(prompt_text, attachments or [])
-
     if not cfg.api_key:
-        return False, "No OpenRouter API key loaded. Press F3 to paste an API key."
-
-    payload = {
-        "model": normalize_model_id(model_id),
-        "messages": [
-            {
-                "role": "user",
-                "content": build_openrouter_user_content(prompt_text, attachments or [], cfg.max_attachment_bytes),
-            }
-        ],
-    }
-    data = json.dumps(payload).encode("utf-8")
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {cfg.api_key}",
-        "HTTP-Referer": "https://github.com/remfan1994/ttychatter",
-        "X-Title": "ttychatter",
-    }
-    request = urllib.request.Request(model_endpoint(cfg, model_id), data=data, headers=headers, method="POST")
+        return False, 'No OpenRouter API key loaded. Press F3 to paste an API key.'
     try:
+        payload = openrouter_payload(cfg, model_id, prompt_text, attachments or [])
+        request = urllib.request.Request(model_endpoint(cfg, model_id),
+            data=json.dumps(payload).encode('utf-8'), headers={
+                'Content-Type': 'application/json', 'Authorization': f'Bearer {cfg.api_key}',
+                'HTTP-Referer': DEFAULT_GITHUB_URL, 'X-OpenRouter-Title': 'ttychatter'}, method='POST')
         with urllib.request.urlopen(request, timeout=timeout) as response:
-            body = response.read().decode("utf-8", errors="replace")
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        return False, f"OpenRouter HTTP error {exc.code}: {body[:1000]}"
-    except urllib.error.URLError as exc:
-        return False, f"OpenRouter network error: {exc}"
-    except Exception as exc:
-        return False, f"OpenRouter request error: {exc}"
-
-    try:
+            body = response.read().decode('utf-8', errors='replace')
+        obj = json.loads(body)
+        error = response_metadata(obj, cfg.last_response_metadata)
+        if error:
+            return False, ('OpenRouter error: ' + error).replace(cfg.api_key, '[redacted]')
         text = parse_openrouter_text_and_files(body, attachment_dir, session_name, cfg.ai_file_download_mode, ask_download)
+        if not text.strip():
+            suffix = ' Output budget was exhausted; a reasoning model may need a larger output allowance.' if cfg.last_response_metadata.get('finish_reason') == 'length' else ''
+            return False, 'OpenRouter returned no answer text.' + suffix
+        text += citation_text(cfg.last_response_metadata)
+        return True, text
+    except urllib.error.HTTPError as exc:
+        try:
+            body = exc.read().decode('utf-8', errors='replace')
+            detail = response_metadata(json.loads(body), cfg.last_response_metadata) or body[:1000]
+        except Exception:
+            detail = str(exc)
+        retry = exc.headers.get('Retry-After') if exc.headers else None
+        if retry:
+            detail += f' Retry-After: {retry}.'
+        return False, f'OpenRouter HTTP {exc.code}: {detail}'.replace(cfg.api_key, '[redacted]')
     except Exception as exc:
-        return False, f"OpenRouter response parse error: {exc}; raw response: {body[:1000]}"
-    if not text.strip():
-        return False, "OpenRouter returned an empty text response"
-    return True, text
+        return False, ('OpenRouter request failed: ' + str(exc)).replace(cfg.api_key, '[redacted]')
 
 
 def parse_openrouter_stream_piece(data: str) -> List[str]:
-    try:
-        obj = json.loads(data)
-    except Exception:
-        return []
-    pieces: List[str] = []
-    for choice in obj.get("choices", []) or []:
+    obj = json.loads(data)
+    pieces = []
+    for choice in obj.get('choices') or []:
         if not isinstance(choice, dict):
             continue
-        delta = choice.get("delta") or {}
-        piece = delta.get("content") if isinstance(delta, dict) else None
-        if piece is None:
-            message = choice.get("message") or {}
-            if isinstance(message, dict):
-                piece = message.get("content")
-        if piece is None:
-            piece = choice.get("text")
-        if isinstance(piece, str) and piece:
-            pieces.append(piece)
+        part = choice.get('delta') or choice.get('message') or {}
+        content = part.get('content') if isinstance(part, dict) else None
+        if content is None:
+            content = choice.get('text')
+        if isinstance(content, str):
+            pieces.append(content)
+        elif isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and item.get('type') in {'text', 'output_text'} and isinstance(item.get('text'), str):
+                    pieces.append(item['text'])
     return pieces
 
 
@@ -1522,91 +1527,164 @@ def response_fileno(response: object) -> Optional[int]:
         return None
 
 
-def generate_with_model_stream(
-    cfg: Config,
-    model_id: str,
-    prompt_text: str,
-    session_name: str,
-    attachment_dir: Path,
-    attachments: Optional[List[PendingAttachment]],
-    on_piece,
-    should_cancel,
-    timeout: int = 120,
-) -> Tuple[bool, str, bool]:
-    """Stream one OpenRouter response.
+def generate_with_model_stream(cfg: Config, model_id: str, prompt_text: str, session_name: str,
+                               attachment_dir: Path, attachments: Optional[List[PendingAttachment]],
+                               on_piece, should_cancel, timeout: int = 120) -> Tuple[bool, str, bool]:
+    """Parse complete SSE events while the UI can poll keys during slow reads.
 
-    ESC cancellation is deliberately owned by the UI callback.  This provider
-    routine only asks should_cancel() between network reads, appends a stable
-    interruption marker to the saved assistant text, and returns normally so the
-    log remains usable after the user stops an irrelevant response.
+    The reader owns the HTTP object. Never select() its socket ahead of a
+    buffered TLS reader: bytes may already be buffered above that socket.
     """
+    cfg.last_response_metadata = {}
     if cfg.demo_mode:
         text = demo_ai_response(prompt_text, attachments or [])
         on_piece(text)
         return True, text, False
-
     if not cfg.api_key:
-        return False, "No OpenRouter API key loaded. Press F3 to paste an API key.", False
-
-    payload = {
-        "model": normalize_model_id(model_id),
-        "stream": True,
-        "messages": [
-            {
-                "role": "user",
-                "content": build_openrouter_user_content(prompt_text, attachments or [], cfg.max_attachment_bytes),
-            }
-        ],
-    }
-    data = json.dumps(payload).encode("utf-8")
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {cfg.api_key}",
-        "HTTP-Referer": "https://github.com/remfan1994/ttychatter",
-        "X-Title": "ttychatter",
-    }
-    request = urllib.request.Request(model_endpoint(cfg, model_id), data=data, headers=headers, method="POST")
-    parts: List[str] = []
-    cancelled = False
+        return False, 'No OpenRouter API key loaded. Press F3 to paste an API key.', False
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            fd = response_fileno(response)
-            while True:
-                if should_cancel():
-                    cancelled = True
-                    break
-                if fd is not None:
-                    ready, _, _ = select.select([fd], [], [], 0.1)
-                    if not ready:
-                        continue
-                raw = response.readline()
-                if not raw:
-                    break
-                line = raw.decode("utf-8", errors="replace").strip()
-                if not line or not line.startswith("data:"):
-                    continue
-                payload_text = line[5:].strip()
-                if payload_text == "[DONE]":
-                    break
-                for piece in parse_openrouter_stream_piece(payload_text):
-                    parts.append(piece)
-                    on_piece(piece)
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        return False, f"OpenRouter HTTP error {exc.code}: {body[:1000]}", False
-    except urllib.error.URLError as exc:
-        return False, f"OpenRouter network error: {exc}", False
+        payload = openrouter_payload(cfg, model_id, prompt_text, attachments or [], stream=True)
+        request = urllib.request.Request(model_endpoint(cfg, model_id), data=json.dumps(payload).encode('utf-8'),
+            headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {cfg.api_key}',
+                     'HTTP-Referer': DEFAULT_GITHUB_URL, 'X-OpenRouter-Title': 'ttychatter'}, method='POST')
     except Exception as exc:
-        return False, f"OpenRouter streaming error: {exc}", False
+        return False, 'Could not prepare request: ' + str(exc), False
+    events = queue.Queue(maxsize=64)
+    stopped = threading.Event()
+    connection = []
 
-    text = "".join(parts)
+    def offer(kind, value):
+        while not stopped.is_set():
+            try:
+                events.put((kind, value), timeout=0.1)
+                return
+            except queue.Full:
+                pass
+
+    def reader():
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                raw_socket = getattr(getattr(getattr(response, 'fp', None), 'raw', None), '_sock', None)
+                if raw_socket is not None:
+                    connection.append(raw_socket)
+                while not stopped.is_set():
+                    raw = response.readline(4 * 1024 * 1024 + 1)
+                    if len(raw) > 4 * 1024 * 1024:
+                        raise ValueError('An SSE line exceeded the 4 MiB safety limit.')
+                    if not raw:
+                        break
+                    offer('line', raw)
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode('utf-8', errors='replace')[:1000]
+            offer('error', f'OpenRouter HTTP {exc.code}: {detail}')
+        except Exception as exc:
+            offer('error', str(exc))
+        finally:
+            offer('end', None)
+
+    threading.Thread(target=reader, daemon=True, name='ttychatter-stream').start()
+    parts, event_lines, raw_files = [], [], []
+    error, cancelled, done = None, False, False
+    deadline = time.monotonic() + timeout
+
+    def consume_event(data):
+        nonlocal done, error
+        if data.strip() == '[DONE]':
+            done = True
+            return
+        obj = json.loads(data)
+        error = response_metadata(obj, cfg.last_response_metadata) or error
+        for piece in parse_openrouter_stream_piece(data):
+            parts.append(piece)
+            on_piece(piece)
+        containers = [obj]
+        for choice in obj.get('choices') or []:
+            if isinstance(choice, dict):
+                containers.append(choice)
+                containers.extend(choice[key] for key in ('message', 'delta') if isinstance(choice.get(key), dict))
+        for container in containers:
+            for key in ('files', 'attachments', 'output_files', 'artifacts'):
+                values = container.get(key) or []
+                if isinstance(values, dict):
+                    values = [values]
+                if isinstance(values, list):
+                    for value in values:
+                        if value not in raw_files:
+                            raw_files.append(value)
+            if isinstance(container.get('content'), list):
+                for part in container['content']:
+                    if _looks_like_ai_file(part) and part not in raw_files:
+                        raw_files.append(part)
+
+    try:
+        while not done and not error:
+            if should_cancel():
+                cancelled = True
+                break
+            if time.monotonic() >= deadline:
+                error = 'No streaming data arrived before the timeout.'
+                break
+            try:
+                kind, value = events.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            deadline = time.monotonic() + timeout
+            if kind == 'error':
+                error = value
+                break
+            if kind == 'end':
+                if event_lines:
+                    consume_event('\n'.join(event_lines))
+                break
+            line = value.decode('utf-8', errors='strict').rstrip('\r\n')
+            if line == '':
+                if event_lines:
+                    consume_event('\n'.join(event_lines))
+                    event_lines = []
+            elif line.startswith('data:'):
+                data = line[5:]
+                event_lines.append(data[1:] if data.startswith(' ') else data)
+                if sum(len(part) for part in event_lines) > 8 * 1024 * 1024:
+                    raise ValueError('An SSE event exceeded the 8 MiB safety limit.')
+            elif line.startswith('{'):
+                # A proxy may return an HTTP-200 JSON error instead of SSE.
+                consume_event(line)
+                if not error:
+                    error = 'Expected a streaming event response.'
+    except Exception as exc:
+        error = 'Stream could not be completed: ' + str(exc)
+    finally:
+        stopped.set()
+        if not done:
+            # Interrupt a blocked TLS/socket read as well as the UI reader loop.
+            for raw_socket in connection:
+                try:
+                    raw_socket.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+    text = ''.join(parts)
+    text += citation_text(cfg.last_response_metadata)
+    if raw_files and cfg.ai_file_download_mode != 'off':
+        synthetic = json.dumps({'choices': [{'message': {'files': raw_files}}]})
+        notes = parse_openrouter_text_and_files(synthetic, attachment_dir, session_name, cfg.ai_file_download_mode)
+        if notes:
+            text += '\n\n' + notes
     if cancelled:
-        if text and not text.endswith("\n"):
-            text += "\n"
-        text += STREAM_INTERRUPT_MARKER + "\n"
-        return True, text, True
+        cfg.last_response_metadata['incomplete'] = True
+        return True, text.rstrip('\n') + '\n' + STREAM_INTERRUPT_MARKER + '\n', True
+    if not error and not done:
+        error = 'Connection ended before the stream completion marker.'
+    if cfg.last_response_metadata.get('finish_reason') == 'error' and not error:
+        error = 'Provider ended the stream with an error.'
+    if error:
+        error = str(error).replace(cfg.api_key, '[redacted]')
+        cfg.last_response_metadata['incomplete'] = True
+        cfg.last_response_metadata['error'] = error
+        cfg.last_response_metadata['partial_text'] = bool(parts)
+        return False, text.rstrip('\n') + ('\n' if text else '') + '[Incomplete response: ' + error + ']', False
     if not text.strip():
-        return False, "OpenRouter returned an empty streamed text response", False
+        reason = cfg.last_response_metadata.get('finish_reason')
+        return False, ('Output budget exhausted before answer text.' if reason == 'length' else 'OpenRouter returned no answer text.'), False
     return True, text, False
 
 
@@ -1639,12 +1717,9 @@ def fetch_models(cfg: Config) -> Tuple[List[ModelInfo], Optional[str]]:
     if cfg.demo_mode:
         return demo_model_list(), None
 
-    if not cfg.api_key:
-        return [], "No OpenRouter API key loaded. Press F3 to paste an API key."
-
     request = urllib.request.Request(
         "https://openrouter.ai/api/v1/models",
-        headers={"Authorization": f"Bearer {cfg.api_key}"},
+        headers={"Authorization": f"Bearer {cfg.api_key}"} if cfg.api_key else {},
         method="GET",
     )
     try:
@@ -1677,9 +1752,14 @@ def fetch_models(cfg: Config) -> Tuple[List[ModelInfo], Optional[str]]:
             input_limit = None
         arch = raw.get("architecture") if isinstance(raw.get("architecture"), dict) else {}
         modality = arch.get("modality") or arch.get("input_modalities") or ""
-        methods = ["chat.completions"]
-        if "image" in str(modality).lower():
-            methods.append("image")
+        methods = ['chat.completions']
+        supported = raw.get('supported_parameters') or []
+        methods.extend(str(value) for value in supported if value in {'tools', 'reasoning', 'structured_outputs'})
+        if raw.get('expiration_date'):
+            description += '\nExpiration: ' + str(raw['expiration_date'])
+        for kind in ('image', 'audio', 'video', 'file'):
+            if kind in str(modality).lower():
+                methods.append(kind)
         if model_id.startswith("openrouter/"):
             methods.append("router")
         pricing = raw.get("pricing") if isinstance(raw.get("pricing"), dict) else {}
@@ -1693,7 +1773,7 @@ def fetch_models(cfg: Config) -> Tuple[List[ModelInfo], Optional[str]]:
             display_name=display,
             description=description,
             input_token_limit=input_limit,
-            output_token_limit=None,
+            output_token_limit=(raw.get('top_provider') or {}).get('max_completion_tokens'),
             methods=methods,
         ))
     return models, None
@@ -1705,6 +1785,23 @@ def fetch_models(cfg: Config) -> Tuple[List[ModelInfo], Optional[str]]:
 # the program. When changing it, check callers, documentation, config compatibility, session-log
 # compatibility, and the parallel Bash/C implementation plans.
 # ------------------------------------------------------------
+def cached_model_tool_support(cfg: Config, model_id: str) -> Optional[bool]:
+    """Return cached tool support when known; None means the cache cannot answer."""
+    models, error, _updated_at = load_model_cache(cfg)
+    if error:
+        return None
+    target = normalize_model_id(model_id)
+    for model in models:
+        if normalize_model_id(model.model_id) == target:
+            return 'tools' in model.methods
+    return None
+
+
+def is_tool_endpoint_404(text: str) -> bool:
+    low = (text or '').lower()
+    return '404' in low and 'no endpoints found that support tool use' in low
+
+
 def model_to_dict(model: ModelInfo) -> dict:
     return {
         "model_id": model.model_id,
@@ -1743,8 +1840,6 @@ def model_from_dict(raw: dict) -> ModelInfo:
 # public behavior of the program. When changing it, check callers, documentation, config
 # compatibility, session-log compatibility, and the parallel Bash/C implementation plans.
 # ------------------------------------------------------------
-def model_supports_generate_content(model: ModelInfo) -> bool:
-    return "chat.completions" in (model.methods or [])
 
 
 # ------------------------------------------------------------
@@ -1753,13 +1848,6 @@ def model_supports_generate_content(model: ModelInfo) -> bool:
 # of the program. When changing it, check callers, documentation, config compatibility, session-
 # log compatibility, and the parallel Bash/C implementation plans.
 # ------------------------------------------------------------
-def model_token_value(value: Optional[int]) -> int:
-    try:
-        if value is None:
-            return 0
-        return int(value)
-    except (TypeError, ValueError):
-        return 0
 
 
 # ------------------------------------------------------------
@@ -2080,6 +2168,8 @@ def model_badges(model: ModelInfo) -> str:
     badges = [model_type_label(model)]
     if model_supports_generate_content(model):
         badges.append("gen")
+    if "tools" in (model.methods or []):
+        badges.append("tools")
     if model_has_required_token_limits(model):
         badges.append("tokens")
     if model_looks_preview(model):
@@ -2255,6 +2345,17 @@ def load_log_entries(path: Path) -> List[LogEntry]:
     with path.open("r", encoding="utf-8", errors="replace") as fh:
         for line in fh:
             line = line.rstrip("\n")
+            legacy_marker = {
+                '===== TTYCHATTER CONTEXT BEGIN =====': 'CONTEXT_BEGIN',
+                '===== TTYCHATTER CONTEXT END =====': 'CONTEXT_END',
+            }.get(line.strip())
+            if legacy_marker:
+                if current_speaker is not None and current_timestamp is not None:
+                    entries.append(LogEntry(current_timestamp, current_speaker, '\n'.join(current_lines)))
+                current_timestamp = current_timestamp or '00:00:00'
+                current_speaker = 'system'
+                current_lines = [legacy_marker]
+                continue
             match = ENTRY_RE.match(line)
             if match:
                 if current_speaker is not None and current_timestamp is not None:
@@ -2278,17 +2379,35 @@ def load_log_entries(path: Path) -> List[LogEntry]:
 # every line in a long log.
 # ------------------------------------------------------------
 def latest_context_snapshot(entries: List[LogEntry]) -> Optional[List[str]]:
-    for entry in reversed(entries):
-        if not is_snapshot_entry(entry):
-            continue
-        raw = entry.text[len(SNAPSHOT_PREFIX):]
-        try:
-            value = json.loads(raw)
-        except Exception:
-            continue
-        if isinstance(value, list) and all(isinstance(item, str) for item in value):
-            return value
-    return None
+    """Return the latest complete snapshot followed by newer conversation turns."""
+    context = None
+    pending_legacy = None
+    for entry in entries:
+        if is_snapshot_entry(entry):
+            try:
+                value = json.loads(entry.text[len(SNAPSHOT_PREFIX):])
+                if isinstance(value, list) and all(isinstance(item, str) for item in value):
+                    context = value
+            except (ValueError, TypeError):
+                pass
+        elif entry.speaker == 'system' and entry.text.split('\n', 1)[0].strip() in {
+                'CONTEXT_BEGIN', '===== TTYCHATTER CONTEXT BEGIN ====='}:
+            lines = entry.text.split('\n')[1:]
+            pending_legacy = []
+            for line in lines:
+                if line.startswith(('User: ', 'Assistant: ')):
+                    pending_legacy.append(line)
+                elif pending_legacy:
+                    pending_legacy[-1] += '\n' + line
+        elif entry.speaker == 'system' and entry.text.strip() in {
+                'CONTEXT_END', '===== TTYCHATTER CONTEXT END ====='}:
+            if pending_legacy is not None:
+                context = pending_legacy
+            pending_legacy = None
+        elif is_conversation_entry(entry) and context is not None:
+            role = 'Assistant: ' if entry.speaker in {'AI', 'OpenRouter', 'Assistant'} else 'User: '
+            context.append(role + entry.text)
+    return context
 
 
 # ---------------------------------------------------------------------------
@@ -2365,7 +2484,20 @@ def extract_code_attachments(text: str, attachment_dir: Path, session_name: str,
         number = next_attachment_number(attachment_dir, session_name, lang, ext)
         filename = f"{session_name}-{lang}-{number:02d}{ext}"
         path = attachment_dir / filename
-        path.write_text(content, encoding="utf-8")
+        while True:
+            try:
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                break
+            except FileExistsError:
+                number += 1
+                filename = f'{session_name}-{lang}-{number:02d}{ext}'
+                path = attachment_dir / filename
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+                fh.write(content)
+        except Exception:
+            path.unlink(missing_ok=True)
+            raise
         return f"\n[code attachment saved]\nfile: {filename}\nlines: {len(content.splitlines())}\nlocation: {attachment_dir}\n"
 
     return FENCE_RE.sub(replacement, text)
@@ -2384,22 +2516,22 @@ def extract_code_attachments(text: str, attachment_dir: Path, session_name: str,
 # ------------------------------------------------------------
 def wrap_for_width(text: str, width: int) -> List[str]:
     width = max(1, width)
-    result: List[str] = []
-    for paragraph in text.splitlines() or [""]:
-        if paragraph == "":
-            result.append("")
-        else:
-            result.extend(
-                textwrap.wrap(
-                    paragraph,
-                    width=width,
-                    replace_whitespace=False,
-                    drop_whitespace=False,
-                    break_long_words=True,
-                    break_on_hyphens=False,
-                )
-            )
-    return result or [""]
+    result = []
+    for paragraph in text.splitlines() or ['']:
+        remaining = ''.join(' ' if ord(char) < 32 or ord(char) == 127 else char for char in paragraph.expandtabs(4))
+        if not remaining:
+            result.append('')
+        while remaining:
+            chunk = clip_terminal_text(remaining, width)
+            if not chunk:
+                chunk = remaining[:1]
+            if len(chunk) < len(remaining):
+                split = chunk.rfind(' ')
+                if split > 0 and chunk[:split].strip():
+                    chunk = chunk[:split+1]
+            result.append(chunk)
+            remaining = remaining[len(chunk):]
+    return result or ['']
 
 
 @dataclass
@@ -2427,6 +2559,8 @@ class InputSegment:
     logical_row: int
     start: int
     available: int
+    end: int = 0
+    caret_cells: List[int] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -2440,8 +2574,182 @@ class InputSegment:
 # navigation. Keep external API/config/storage helpers outside when possible so the future C
 # implementation can mirror the architecture.
 # ------------------------------------------------------------
+
+def ensure_session_id(path: Path) -> str:
+    """Read or append an opaque ID while holding the session's advisory lock."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, 'O_NOFOLLOW', 0)
+    with os.fdopen(os.open(path, flags, 0o600), 'r+', encoding='utf-8', errors='replace') as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        text = fh.read()
+        match = re.search(r'^\[\d\d:\d\d:\d\d\] system: session-id: ([a-f0-9]{32})$', text, re.M)
+        if match:
+            return match.group(1)
+        identifier = uuid.uuid4().hex
+        if not text:
+            fh.write(PRECHAT_LINE + '\n')
+        elif not text.endswith('\n'):
+            fh.write('\n')
+        fh.write(f'[{now_time()}] system: session-id: {identifier}\n')
+        fh.flush()
+        return identifier
+
+
+def rename_session_file(path: Path, title: str) -> Path:
+    """Keep identity and contents; reserve a new filename without clobbering."""
+    title = clean_session_title(title)
+    if not title:
+        raise ValueError('Session name cannot be empty.')
+    if path.is_symlink() or not path.is_file():
+        raise ValueError('Session must be a regular log file, not a symbolic link.')
+    identifier = ensure_session_id(path)
+    previous_title = session_title_from_file(path)
+    aliases = [path.stem]
+    if previous_title and previous_title not in {title, path.stem}:
+        aliases.append(previous_title)
+    def update_title(target: Path) -> None:
+        write_session_title_metadata(target, title)
+        for alias in aliases:
+            append_log(target, 'system', 'session-alias: ' + alias, now_time())
+    stem = sanitize_session_name(title)[:80].rstrip('._-') or 'session'
+    stem += '--' + identifier[:12]
+    for index in range(10000):
+        tail = f'-{index:03d}' if index else ''
+        target = path.with_name(stem + tail + '.log')
+        if target == path:
+            update_title(path)
+            return path
+        try:
+            os.link(path, target, follow_symlinks=False)
+        except FileExistsError:
+            continue
+        try:
+            update_title(target)
+            path.unlink()
+        except Exception:
+            target.unlink()
+            raise
+        return target
+    raise OSError('Too many colliding session filenames.')
+
+
+def terminal_cell_width(char: str) -> int:
+    if unicodedata.combining(char):
+        return 0
+    return 2 if unicodedata.east_asian_width(char) in {'W', 'F'} else 1
+
+
+def clip_terminal_text(text: str, width: int) -> str:
+    result = []
+    used = 0
+    for char in text.expandtabs(4):
+        if ord(char) < 32 or ord(char) == 127:
+            char = ' '
+        cells = terminal_cell_width(char)
+        if used + cells > width:
+            break
+        result.append(char)
+        used += cells
+    return ''.join(result)
+
+
+def openrouter_payload(cfg: Config, model_id: str, prompt_text: str,
+                       attachments: List[PendingAttachment], stream: bool = False) -> dict:
+    payload = {'model': normalize_model_id(model_id),
+               'messages': [{'role': 'user', 'content': build_openrouter_user_content(
+                   prompt_text, attachments, cfg.max_attachment_bytes)}]}
+    if cfg.request_session_id:
+        payload['session_id'] = cfg.request_session_id
+    if stream:
+        payload['stream'] = True
+        payload['stream_options'] = {'include_usage': True}
+    if cfg.web_search:
+        if cfg.web_search_mode == 'plugin':
+            plugin = {'id': 'web'}
+            if cfg.web_search_max_results > 0:
+                plugin['max_results'] = min(25, cfg.web_search_max_results)
+            payload['plugins'] = [plugin]
+        else:
+            params = {'engine': cfg.web_search_engine}
+            if cfg.web_search_max_results > 0:
+                maximum = 20 if cfg.web_search_engine == 'perplexity' else 25
+                params['max_results'] = min(maximum, cfg.web_search_max_results)
+            payload['tools'] = [{'type': 'openrouter:web_search', 'parameters': params}]
+            # OpenRouter documents max_tool_calls as the server-tool search budget.
+            # Zero means ttychatter deliberately omits the cap rather than sending 0.
+            if cfg.web_search_max_uses > 0:
+                payload['max_tool_calls'] = min(25, cfg.web_search_max_uses)
+    return payload
+
+
+def response_metadata(obj: dict, metadata: dict) -> Optional[str]:
+    """Collect provider metadata without treating API errors as assistant text."""
+    if not isinstance(obj, dict):
+        return 'OpenRouter response was not an object.'
+    for key in ('id', 'model', 'provider', 'usage'):
+        if obj.get(key) is not None:
+            metadata[key] = obj[key]
+    containers = [obj]
+    choices = obj.get('choices') or []
+    for choice in choices:
+        if not isinstance(choice, dict):
+            continue
+        if choice.get('finish_reason'):
+            metadata['finish_reason'] = choice['finish_reason']
+        containers.append(choice)
+        for key in ('message', 'delta'):
+            if isinstance(choice.get(key), dict):
+                containers.append(choice[key])
+    error = None
+    for container in containers:
+        if container.get('error'):
+            detail = container['error']
+            if isinstance(detail, dict):
+                error = str(detail.get('message') or detail.get('code') or detail)
+                metadata['error'] = detail
+            else:
+                error = str(detail)
+                metadata['error'] = error
+        for key in ('annotations', 'reasoning_details'):
+            values = container.get(key)
+            if isinstance(values, list):
+                saved = metadata.setdefault(key, [])
+                for value in values:
+                    if value not in saved:
+                        saved.append(value)
+    return error
+
+
+def citation_text(metadata: dict) -> str:
+    rows = []
+    seen = set()
+    for item in metadata.get('annotations', []) or []:
+        if not isinstance(item, dict) or item.get('type') != 'url_citation':
+            continue
+        citation = item.get('url_citation') or item
+        if not isinstance(citation, dict):
+            continue
+        url = str(citation.get('url') or '').strip()
+        if any(ord(char) < 32 for char in url):
+            continue
+        try:
+            parsed = urllib.parse.urlsplit(url)
+        except ValueError:
+            continue
+        if parsed.scheme not in {'http', 'https'} or not parsed.netloc or url in seen:
+            continue
+        seen.add(url)
+        title = clean_session_title(str(citation.get('title') or url))
+        rows.append(f'[{len(rows)+1}] {title}\n    {url}')
+    return '\n\nSources:\n' + '\n'.join(rows) if rows else ''
+
+
+class ScreenNavigation(Exception):
+    def __init__(self, action: str):
+        self.action = action
+
+
 class AICursesApp:
-    INPUT_HEIGHT = 6
     TRANSCRIPT_REPLAY_LIMIT = 80
 
     # ------------------------------------------------------------
@@ -2454,6 +2762,14 @@ class AICursesApp:
         self.cfg = cfg
         self.session_name = session_name
         self.session_path = session_path
+        self.session_title = session_title_from_file(session_path)
+        self.input_visible = True
+        self._dispatching = False
+        self._active_screen = None
+        self._cursor_screen = None
+        self._named_after_reply = False
+        self._session_drafts = {}
+        self.last_reply = ''
         self.attachment_dir = cfg.effective_attachment_dir
         self.username = os.environ.get("USER") or os.environ.get("LOGNAME") or "user"
 
@@ -2487,6 +2803,11 @@ class AICursesApp:
         self.should_quit = False
         self.startup_notice_active = False
         self.first_user_message_sent = False
+        self._request_active = False
+        self._request_thread = None
+        self._request_events = queue.Queue()
+        self._request_cancel = threading.Event()
+        self._request_state = None
 
     # ------------------------------------------------------------
     # MAINTAINER COMMENTARY: def default_status
@@ -2495,12 +2816,7 @@ class AICursesApp:
     # session-log compatibility, and the parallel Bash/C implementation plans.
     # ------------------------------------------------------------
     def default_status(self) -> str:
-        # The status line is intentionally short.  The main command bar and the
-        # compose hotkey bar carry the stable command hints; the status line is
-        # reserved for current state.  Earlier builds mixed function-key screen
-        # navigation with Ctrl-key compose actions in one long strip.  That made
-        # the screen look crowded and made the configured send key easy to miss.
-        return f"F1 Menu | {self.send_key_label()} Send | F10 Quit"
+        return 'Ready'
 
     def send_key_label(self) -> str:
         """Return the user-facing label for the configured send action.
@@ -2530,30 +2846,24 @@ class AICursesApp:
     # ------------------------------------------------------------
     def load_session_into_ui(self) -> None:
         entries = load_log_entries(self.session_path)
-        if not entries:
+        visible = [entry for entry in entries if not (entry.speaker == 'system' and
+            entry.text.startswith(('session-id:', 'session-title:', 'session-alias:', 'openrouter-response:',
+                                   'CONTEXT_SNAPSHOT_JSON ', 'CONTEXT_BEGIN', 'CONTEXT_END',
+                                   '===== TTYCHATTER CONTEXT ')))]
+        if not visible:
             self.maybe_show_startup_notice()
-            return
-
-        for entry in entries[-self.TRANSCRIPT_REPLAY_LIMIT:]:
-            if is_snapshot_entry(entry):
-                continue
+        for entry in visible[-self.TRANSCRIPT_REPLAY_LIMIT:]:
             self.transcript.append(TranscriptItem(entry.speaker, entry.text, entry.timestamp))
-
         snapshot = latest_context_snapshot(entries)
         if snapshot is not None:
             self.context_buffer = snapshot
         else:
-            max_entries = self.cfg.context_turns * 2
-            for entry in entries[-max_entries:]:
-                if is_snapshot_entry(entry) or entry.speaker == "system":
-                    continue
-                if entry.speaker == "AI":
-                    self.context_buffer.append("Assistant: " + entry.text)
-                else:
-                    self.context_buffer.append("User: " + entry.text)
-
+            self.context_buffer = [('Assistant: ' if entry.speaker in {'AI', 'OpenRouter', 'Assistant'} else 'User: ') + entry.text
+                for entry in entries if is_conversation_entry(entry)]
         self.trim_context_buffer()
-        self.status = f"loaded session: {self.session_name}"
+        replies = [entry.text for entry in visible if entry.speaker in {'AI', 'OpenRouter', 'Assistant'}]
+        self.last_reply = replies[-1] if replies else ''
+        self.status = 'Loaded: ' + (self.session_title or self.session_name)
 
     # ------------------------------------------------------------
     # MAINTAINER COMMENTARY: def reset_to_session
@@ -2562,14 +2872,25 @@ class AICursesApp:
     # compatibility, session-log compatibility, and the parallel Bash/C implementation plans.
     # ------------------------------------------------------------
     def reset_to_session(self, session_name: str, session_path: Path) -> None:
-        self.session_name = session_name
-        self.session_path = session_path
-        self.transcript = []
-        self.context_buffer = []
+        if self._request_active:
+            self.status = 'A response is still in flight; finish or close it before switching sessions.'
+            return
+        if self.cfg.request_session_id:
+            self._session_drafts[self.cfg.request_session_id] = (list(self.input_lines), self.cursor_row,
+                self.cursor_col, list(self.pending_attachments))
+        self.session_name, self.session_path = session_name, session_path
+        self.cfg.request_session_id = ensure_session_id(session_path)
+        self.session_title = session_title_from_file(session_path)
+        draft = self._session_drafts.get(self.cfg.request_session_id, ([''], 0, 0, []))
+        self.input_lines, self.cursor_row, self.cursor_col, self.pending_attachments = draft
+        self.input_scroll = 0
+        self.transcript, self.context_buffer = [], []
         self.transcript_scroll = 0
         self.startup_notice_active = False
         self.first_user_message_sent = False
+        self._named_after_reply = False
         self.load_session_into_ui()
+        self.prompt_session_title(reminder=True)
 
     # ------------------------------------------------------------
     # MAINTAINER COMMENTARY: def trim_context_buffer
@@ -2633,24 +2954,7 @@ class AICursesApp:
     # compatibility, and the parallel Bash/C implementation plans.
     # ------------------------------------------------------------
     def dim_attr(self) -> int:
-        """Return the subdued text style for the active theme.
-
-        This is not just cosmetic.  ttychatter uses dim/normal/reverse as a
-        semantic map: AI output and metadata recede, user input stays readable,
-        and selections remain obvious.  Terminals differ wildly, so this helper
-        keeps all dimming decisions in one place.  The theme names are deliberately
-        simple; they are behavior profiles rather than a promise of exact RGB
-        colors on every terminal.
-        """
-        if self.cfg.monochrome or self.cfg.theme == "mono":
-            return 0
-        if self.cfg.theme == "high_contrast":
-            return curses.A_BOLD
-        if self.cfg.theme == "solarized_dark":
-            return curses.A_DIM
-        if self.cfg.theme == "dim":
-            return curses.A_DIM
-        return curses.A_DIM
+        return curses.A_NORMAL
 
     # ------------------------------------------------------------
     # MAINTAINER COMMENTARY: def reverse_attr
@@ -2660,21 +2964,10 @@ class AICursesApp:
     # rows remain clear even on dim displays.
     # ------------------------------------------------------------
     def reverse_attr(self) -> int:
-        if self.cfg.theme == "high_contrast":
-            return curses.A_REVERSE | curses.A_BOLD
         return curses.A_REVERSE
 
     def reverse_dim_attr(self) -> int:
-        """Reverse-video style used for secondary bars.
-
-        Header bars should be visually stronger than middle command bars or
-        table headings.  This helper gives the secondary bars a lower-weight
-        appearance when the terminal supports A_DIM.  In monochrome mode it
-        falls back to plain reverse video so information is not hidden.
-        """
-        if self.cfg.monochrome or self.cfg.theme in {"mono", "high_contrast"}:
-            return self.reverse_attr()
-        return curses.A_REVERSE | curses.A_DIM
+        return curses.A_REVERSE
 
     # ------------------------------------------------------------
     # MAINTAINER COMMENTARY: def attr_header
@@ -2703,23 +2996,7 @@ class AICursesApp:
     # compatibility, session-log compatibility, and the parallel Bash/C implementation plans.
     # ------------------------------------------------------------
     def transcript_attr_for(self, speaker: str) -> int:
-        """Map transcript speakers to theme roles.
-
-        The visible conversation has two different jobs: it must be pleasant to
-        read, and it must make ownership of each message unmistakable.  The user
-        asked for the active user's messages to stay bright/normal while AI and
-        system text sits back in grey/dim.  High-contrast and mono modes keep the
-        same ownership distinction through labels even when dimming is disabled.
-        """
-        if self.cfg.monochrome or self.cfg.theme == "mono":
-            return 0
-        if speaker in {"OpenRouter", "AI"}:
-            return curses.A_BOLD if self.cfg.theme == "high_contrast" else self.dim_attr()
-        if speaker == self.username:
-            return curses.A_BOLD if self.cfg.theme == "high_contrast" else 0
-        if speaker == "remfan1994" or speaker == "system":
-            return self.dim_attr()
-        return 0
+        return curses.A_NORMAL
 
     # ------------------------------------------------------------
     # MAINTAINER COMMENTARY: def maybe_show_startup_notice
@@ -2773,15 +3050,13 @@ class AICursesApp:
         height, width = self.stdscr.getmaxyx()
         if y < 0 or y >= height or x < 0 or x >= width:
             return
-        limit = width - x
+        limit = width - x - (1 if y == height - 1 else 0)
         if max_width is not None:
             limit = min(limit, max_width)
-        if y == height - 1:
-            limit = max(0, limit - 1)
-        if limit <= 0:
+        if limit < 1:
             return
         try:
-            self.stdscr.addstr(y, x, text[:limit], attr)
+            self.stdscr.addstr(y, x, clip_terminal_text(text, limit), attr)
         except curses.error:
             pass
 
@@ -2792,14 +3067,15 @@ class AICursesApp:
     # compatibility, session-log compatibility, and the parallel Bash/C implementation plans.
     # ------------------------------------------------------------
     def transcript_display_lines(self, width: int) -> List[Tuple[str, int]]:
-        lines: List[Tuple[str, int]] = []
+        lines = []
         for item in self.transcript:
-            attr = self.transcript_attr_for(item.speaker)
-            attr_prefix = "[system] " if item.speaker == "system" else ""
-            prefix = f"[{item.timestamp}] {item.speaker}: {attr_prefix}"
-            for wrapped in wrap_for_width(prefix + item.text, width):
-                lines.append((wrapped, attr))
-            lines.append(("", 0))
+            key = (width, item.speaker, item.timestamp, item.text)
+            if getattr(item, '_wrap_key', None) != key:
+                prefix = f'[{item.timestamp}] {item.speaker}: '
+                item._wrap_lines = [(text, self.transcript_attr_for(item.speaker))
+                                    for text in wrap_for_width(prefix + item.text, width)] + [('', 0)]
+                item._wrap_key = key
+            lines.extend(item._wrap_lines)
         return lines
 
     # ------------------------------------------------------------
@@ -2820,12 +3096,13 @@ class AICursesApp:
     # session-log compatibility, and the parallel Bash/C implementation plans.
     # ------------------------------------------------------------
     def draw_header(self, width: int) -> None:
-        key_state = "key:loaded" if self.cfg.api_key else "key:missing"
-        attach_state = f" files:{len(self.pending_attachments)}" if self.pending_attachments else ""
-        mode_state = " ~DEMO~" if self.cfg.demo_mode else ""
-        header = f"{PROGRAM}{mode_state} | {self.session_name} | {self.model_label()} | {key_state}{attach_state}"
-        self.safe_addstr(0, 0, header, width, self.reverse_attr())
-        self.safe_addstr(1, 0, "_" * width, width, self.dim_attr())
+        title = self.session_title or 'UNNAMED - name from Esc menu'
+        prefix = 'DEMO | ' if self.cfg.demo_mode else ''
+        text = prefix + title
+        extra = f' | {self.cfg.effective_model} | web:{"on" if self.cfg.web_search else "off"}'
+        if self.pending_attachments:
+            extra += f' | files:{len(self.pending_attachments)}'
+        self.safe_addstr(0, 0, text + extra, width, curses.A_BOLD)
 
     # ------------------------------------------------------------
     # MAINTAINER COMMENTARY: def draw_transcript
@@ -2835,6 +3112,10 @@ class AICursesApp:
     # ------------------------------------------------------------
     def draw_transcript(self, start_y: int, height: int, width: int) -> None:
         lines = self.transcript_display_lines(width)
+        previous = getattr(self, '_drawn_transcript_size', None)
+        if getattr(self, '_streaming', False) and self.transcript_scroll > 0 and previous and previous[0] == width:
+            self.transcript_scroll += max(0, len(lines) - previous[1])
+        self._drawn_transcript_size = (width, len(lines))
         max_scroll = max(0, len(lines) - height)
         self.transcript_scroll = min(self.transcript_scroll, max_scroll)
         start = max(0, len(lines) - height - self.transcript_scroll)
@@ -2851,28 +3132,35 @@ class AICursesApp:
     # session-log compatibility, and the parallel Bash/C implementation plans.
     # ------------------------------------------------------------
     def input_segments(self, width: int) -> Tuple[List[InputSegment], int, int]:
-        marker_width = 2
-        available = max(1, width - marker_width)
-        segments: List[InputSegment] = []
-        cursor_visual_index = 0
-        cursor_x = marker_width
-
-        for logical_row, line in enumerate(self.input_lines):
-            cursor_segment = self.cursor_col // available if logical_row == self.cursor_row else 0
-            segment_count = max(1, (len(line) + available - 1) // available)
-            if logical_row == self.cursor_row:
-                segment_count = max(segment_count, cursor_segment + 1)
-
-            for segment in range(segment_count):
-                start = segment * available
-                marker = "> " if logical_row == 0 and segment == 0 else "  "
-                chunk = line[start : start + available]
-                segments.append(InputSegment(marker + chunk, logical_row, start, available))
-                if logical_row == self.cursor_row and segment == cursor_segment:
-                    cursor_visual_index = len(segments) - 1
-                    cursor_x = marker_width + (self.cursor_col % available)
-
-        return segments or [InputSegment("> ", 0, 0, max(1, width - 2))], cursor_visual_index, cursor_x
+        available = max(1, width - 2)
+        segments = []
+        for row, line in enumerate(self.input_lines):
+            start, used, absolute = 0, 0, 0
+            chunks, columns = [], [0]
+            for index, char in enumerate(line):
+                cells = 4 - absolute % 4 if char == '\t' else terminal_cell_width(char)
+                if used and used + cells > available:
+                    marker = '> ' if row == 0 and start == 0 else '  '
+                    segments.append(InputSegment(marker + ''.join(chunks), row, start, available, index, columns))
+                    start, used, chunks, columns = index, 0, [], [0]
+                shown = ' ' * cells if char == '\t' else char
+                chunks.append(shown)
+                used += cells
+                absolute += cells
+                columns.append(used)
+            marker = '> ' if row == 0 and start == 0 else '  '
+            segments.append(InputSegment(marker + ''.join(chunks), row, start, available, len(line), columns))
+            if row == self.cursor_row and self.cursor_col == len(line) and used >= available:
+                segments.append(InputSegment('  ', row, len(line), available, len(line), [0]))
+        cursor_index, cursor_x = 0, 2
+        for index, segment in enumerate(segments):
+            if segment.logical_row == self.cursor_row and segment.start <= self.cursor_col <= segment.end:
+                offset = self.cursor_col - segment.start
+                cursor_index = index
+                cursor_x = 2 + segment.caret_cells[offset]
+                if self.cursor_col < segment.end:
+                    break
+        return segments, cursor_index, cursor_x
 
     # ------------------------------------------------------------
     # MAINTAINER COMMENTARY: def command_bar_items
@@ -2888,34 +3176,7 @@ class AICursesApp:
     # terminal sizes.  If a maintainer changes the names or actions here, update
     # handle_key(), dispatch_command_action(), the help menu, and the man page.
     # ------------------------------------------------------------
-    def command_bar_items(self) -> List[Tuple[str, str]]:
-        return [
-            ("F1 Help", "help"),
-            ("F2 Models", "models"),
-            ("F3 Key", "api-key"),
-            ("F4 Sessions", "sessions"),
-            ("F5 Options", "options"),
-            ("F6 Memory", "memory"),
-            ("F7 Files", "files"),
-            ("F8 Editor", "editor"),
-            ("F9 Credits", "credits"),
-        ]
 
-    def compose_hotkey_items(self) -> List[Tuple[str, str]]:
-        """Return non-function-key compose actions shown near the input pane.
-
-        Function keys are screen-navigation commands: F2 opens Models, F4 opens
-        Sessions, F8 launches the editor, and so on.  Ctrl-key actions are
-        different: they operate on the current message being composed.  Mixing
-        them with the F-key tier made the command strip visually confusing.
-        Keeping compose hotkeys in their own row lets users learn them without
-        making them look like more application screens.
-        """
-        return [
-            (f"Send:{self.send_key_label()}", "send"),
-            ("Attach:Ctrl+K", "attach"),
-            ("Pending:Ctrl+L", "pending"),
-        ]
 
     # ------------------------------------------------------------
     # MAINTAINER COMMENTARY: def draw_command_bar
@@ -2923,54 +3184,7 @@ class AICursesApp:
     # behavior of the program. When changing it, check callers, documentation, config
     # compatibility, session-log compatibility, and the parallel Bash/C implementation plans.
     # ------------------------------------------------------------
-    def draw_command_bar(self, y: int, width: int) -> None:
-        # The command bar is now strictly the function-key navigation tier.
-        # It names screens, not compose-time actions.  This separation matters
-        # because function keys are global: if the user presses F5 from inside
-        # the model browser, the app should jump to Options.  Ctrl+K and Ctrl+L
-        # are not screens; they operate on the current draft message.  They are
-        # therefore drawn by draw_hotkey_bar() directly below this bar.
-        self.command_click_targets = []
-        self.safe_addstr(y, 0, "_" * width, width, self.dim_attr())
-        if width < 72:
-            items = [("F1 Menu", "help"), ("F2 Models", "models"), ("F5 Options", "options"), ("F10 Quit", "quit")]
-        else:
-            items = self.command_bar_items()
-        x = 0
-        for idx, (label, action) in enumerate(items):
-            text = label if idx == 0 else " | " + label
-            if x + len(text) >= width:
-                if x + 4 < width:
-                    self.safe_addstr(y, x, " ...", width - x, self.dim_attr())
-                break
-            self.safe_addstr(y, x, text, width - x, self.dim_attr())
-            label_start = x + (3 if idx else 0)
-            label_end = label_start + len(label)
-            self.command_click_targets.append((y, label_start, label_end, action))
-            x += len(text)
 
-    def draw_hotkey_bar(self, y: int, width: int) -> None:
-        """Draw compose-time shortcuts separately from function-key screens.
-
-        This row answers a different question than the function-key bar.  The
-        function bar says "where can I go?"; the hotkey bar says "what can I do
-        to the message I am writing right now?"  It also reflects SEND_INPUT at
-        runtime, so the visible send instruction always matches Options.
-        """
-        self.safe_addstr(y, 0, "-" * width, width, self.dim_attr())
-        items = self.compose_hotkey_items()
-        x = 0
-        for idx, (label, action) in enumerate(items):
-            text = label if idx == 0 else " | " + label
-            if x + len(text) >= width:
-                if x + 4 < width:
-                    self.safe_addstr(y, x, " ...", width - x, self.dim_attr())
-                break
-            self.safe_addstr(y, x, text, width - x, self.dim_attr())
-            label_start = x + (3 if idx else 0)
-            label_end = label_start + len(label)
-            self.command_click_targets.append((y, label_start, label_end, action))
-            x += len(text)
 
     # ------------------------------------------------------------
     # MAINTAINER COMMENTARY: def draw_input
@@ -2979,40 +3193,30 @@ class AICursesApp:
     # session-log compatibility, and the parallel Bash/C implementation plans.
     # ------------------------------------------------------------
     def draw_input(self, label_y: int, input_y: int, width: int) -> None:
-        self.draw_command_bar(label_y, width)
-        self.draw_hotkey_bar(label_y + 1, width)
-
+        self.safe_addstr(label_y, 0, f'Draft | {self.send_key_label()} send | F11 read', width, curses.A_BOLD)
         segments, cursor_visual_index, cursor_x = self.input_segments(width)
         self.last_input_segments = segments
-        if cursor_visual_index < self.input_scroll:
-            self.input_scroll = cursor_visual_index
-        elif cursor_visual_index >= self.input_scroll + self.INPUT_HEIGHT:
-            self.input_scroll = cursor_visual_index - self.INPUT_HEIGHT + 1
-        self.input_scroll = max(0, min(self.input_scroll, max(0, len(segments) - self.INPUT_HEIGHT)))
-
-        if self.current_input() == "":
-            placeholder = f"> {self.cfg.input_placeholder}  [{self.send_key_label()} to send]"
-            self.safe_addstr(input_y, 0, placeholder, width, self.dim_attr())
-            for offset in range(1, self.INPUT_HEIGHT):
-                self.safe_addstr(input_y + offset, 0, "", width)
-            try:
-                curses.curs_set(1)
-                self.stdscr.move(input_y, 2)
-            except curses.error:
-                pass
-            return
-
-        visible = segments[self.input_scroll : self.input_scroll + self.INPUT_HEIGHT]
-        for offset in range(self.INPUT_HEIGHT):
-            text = visible[offset].display if offset < len(visible) else ""
-            self.safe_addstr(input_y + offset, 0, text, width)
-
-        cursor_screen_y = input_y + cursor_visual_index - self.input_scroll
-        try:
-            curses.curs_set(1)
-            self.stdscr.move(cursor_screen_y, min(cursor_x, width - 2))
-        except curses.error:
-            pass
+        input_h = self.layout['input_h']
+        self.input_scroll = min(self.input_scroll, cursor_visual_index)
+        if cursor_visual_index >= self.input_scroll + input_h:
+            self.input_scroll = cursor_visual_index - input_h + 1
+        self.input_scroll = max(0, min(self.input_scroll, max(0, len(segments) - input_h)))
+        visible = segments[self.input_scroll:self.input_scroll + input_h]
+        for offset, segment in enumerate(visible):
+            self.safe_addstr(input_y + offset, 0, segment.display, width)
+        if not self.current_input():
+            self.safe_addstr(input_y, 2, self.cfg.input_placeholder, width - 2)
+        y = input_y + cursor_visual_index - self.input_scroll
+        x = min(cursor_x, width - 1)
+        self._cursor_screen = (y, x)
+        # A cell marker also works when the terminal's own cursor has poor contrast.
+        char = self.input_lines[self.cursor_row][self.cursor_col:self.cursor_col+1]
+        if not char and not self.current_input() and self.cfg.input_placeholder:
+            char = self.cfg.input_placeholder[:1]
+        char = char or ' '
+        if char == '\t' or unicodedata.combining(char):
+            char = ' '
+        self.safe_addstr(y, x, char, max(1, width - x), curses.A_REVERSE)
 
     # ------------------------------------------------------------
     # MAINTAINER COMMENTARY: def draw_status
@@ -3021,8 +3225,16 @@ class AICursesApp:
     # session-log compatibility, and the parallel Bash/C implementation plans.
     # ------------------------------------------------------------
     def draw_status(self, y: int, width: int) -> None:
-        self.safe_addstr(y, 0, "_" * width, width, self.dim_attr())
-        self.safe_addstr(y, 0, self.status, width, self.reverse_attr())
+        position = f'L{self.cursor_row+1} C{self.cursor_col+1}' if self.input_visible else 'READ'
+        position += f' W:{"on" if self.cfg.web_search else "off"}'
+        if self._request_active:
+            position += ' AI:busy'
+        left = 'Esc Menu | F11 Draft' if not self.input_visible else 'Esc Menu | F11 Read'
+        room = width - len(position) - 2
+        if room > len(left) + 5:
+            left += ' | ' + self.status
+        self.safe_addstr(y, 0, left, room)
+        self.safe_addstr(y, max(0, width-len(position)-1), position, len(position))
 
     # ------------------------------------------------------------
     # MAINTAINER COMMENTARY: def draw
@@ -3033,36 +3245,34 @@ class AICursesApp:
     def draw(self) -> None:
         self.stdscr.erase()
         height, width = self.stdscr.getmaxyx()
-        min_height = self.INPUT_HEIGHT + 6
-        if height < min_height or width < 40:
+        self.command_click_targets = []
+        self._cursor_screen = None
+        if height < 5 or width < 20:
             self.layout = {}
-            self.safe_addstr(0, 0, "terminal too small", width, self.reverse_attr())
+            self.safe_addstr(0, 0, 'Resize terminal', width)
+            self.safe_addstr(1, 0, 'Esc menu F10 quit', width)
             self.stdscr.refresh()
             return
-
-        header_h = 2
-        status_h = 1
-        input_label_h = 2
-        transcript_h = height - header_h - input_label_h - self.INPUT_HEIGHT - status_h
-        transcript_y = header_h
-        input_label_y = transcript_y + transcript_h
-        input_y = input_label_y + input_label_h
-        status_y = height - 1
-        self.layout = {
-            "width": width,
-            "height": height,
-            "transcript_y": transcript_y,
-            "transcript_h": transcript_h,
-            "input_label_y": input_label_y,
-            "command_y": input_label_y,
-            "input_y": input_y,
-            "input_h": self.INPUT_HEIGHT,
-            "status_y": status_y,
-        }
+        input_h = min(self.cfg.input_height, max(1, height - 5)) if self.input_visible else 0
+        label_h = 1 if input_h else 0
+        transcript_h = height - 2 - label_h - input_h
+        input_label_y = 1 + transcript_h
+        input_y = input_label_y + label_h
+        self.layout = {'width': width, 'height': height, 'transcript_y': 1,
+                       'transcript_h': transcript_h, 'input_label_y': input_label_y,
+                       'input_y': input_y, 'input_h': input_h, 'status_y': height - 1}
         self.draw_header(width)
-        self.draw_transcript(transcript_y, transcript_h, width)
-        self.draw_input(input_label_y, input_y, width)
-        self.draw_status(status_y, width)
+        self.draw_transcript(1, transcript_h, width)
+        if self.input_visible:
+            self.draw_input(input_label_y, input_y, width)
+        self.draw_status(height - 1, width)
+        # All text must be drawn before moving the hardware cursor.
+        try:
+            curses.curs_set(1 if self.input_visible else 0)
+            if self._cursor_screen:
+                self.stdscr.move(*self._cursor_screen)
+        except curses.error:
+            pass
         self.stdscr.refresh()
 
     # ------------------------------------------------------------------
@@ -3152,7 +3362,8 @@ class AICursesApp:
         segment = self.last_input_segments[index]
         line = self.input_lines[segment.logical_row]
         clicked_col = max(0, x - 2)
-        logical_col = min(len(line), segment.start + clicked_col)
+        offset = max((index for index, cell in enumerate(segment.caret_cells) if cell <= clicked_col), default=0)
+        logical_col = min(len(line), segment.start + offset)
         self.cursor_row = segment.logical_row
         self.cursor_col = logical_col
 
@@ -3201,7 +3412,7 @@ class AICursesApp:
             self.safe_addstr(height - 1, 0, footer, width, self.reverse_attr())
             self.stdscr.refresh()
 
-            ch = self.stdscr.getch()
+            ch = self.ui_getch()
             if self.handle_global_hotkey(ch):
                 return
             if ch == curses.KEY_MOUSE:
@@ -3219,6 +3430,18 @@ class AICursesApp:
                 return
             if ch in (27, ord("q"), ord("Q")):
                 return
+            if ch == curses.KEY_UP:
+                scroll = max(0, scroll - 1)
+                continue
+            if ch == curses.KEY_DOWN:
+                scroll = min(max_scroll, scroll + 1)
+                continue
+            if ch == curses.KEY_HOME:
+                scroll = 0
+                continue
+            if ch == curses.KEY_END:
+                scroll = max_scroll
+                continue
             if ch == curses.KEY_PPAGE:
                 scroll = max(0, scroll - body_h)
                 continue
@@ -3238,37 +3461,23 @@ class AICursesApp:
         while True:
             self.stdscr.erase()
             height, width = self.stdscr.getmaxyx()
-            box_w = min(width - 4, 76)
-            box_h = 10
-            top = max(0, (height - box_h) // 2)
-            left = max(0, (width - box_w) // 2)
-            self.safe_addstr(top, left, "+" + "-" * (box_w - 2) + "+", attr=self.reverse_attr())
-            self.safe_addstr(top + 1, left, "|" + title.center(box_w - 2) + "|", attr=self.reverse_attr())
-            self.safe_addstr(top + 2, left, "+" + "-" * (box_w - 2) + "+", attr=self.reverse_attr())
-            y = top + 3
-            for line in wrap_for_width(message, box_w - 4)[:3]:
-                self.safe_addstr(y, left + 2, line, box_w - 4)
-                y += 1
-            default_label = "yes" if default else "no"
-            self.safe_addstr(top + box_h - 2, left + 2, f"Y/N? Enter={default_label} | Esc=no", box_w - 4, self.dim_attr())
-            self.safe_addstr(top + box_h - 1, left, "+" + "-" * (box_w - 2) + "+", attr=self.reverse_attr())
+            self.safe_addstr(0, 0, title, width, curses.A_BOLD)
+            for index, line in enumerate(wrap_for_width(message, max(1, width))):
+                self.safe_addstr(2 + index, 0, line, width)
+            self.safe_addstr(height-1, 0, 'Y=yes N=no Enter=no Esc=no' if not default else 'Y=yes N=no Enter=yes Esc=no', width)
+            try:
+                curses.curs_set(0)
+            except curses.error:
+                pass
             self.stdscr.refresh()
-            ch = self.stdscr.getch()
-            # Function keys remain global even inside confirmation dialogs.
-            # If the user opens the wrong screen, pressing another function
-            # key should jump there immediately instead of trapping them here.
+            ch = self.ui_getch()
+            if title == 'CLOSE SESSION' and ch in (curses.KEY_F10, 17):
+                continue
             if self.handle_global_hotkey(ch):
-                return default
-            if ch == curses.KEY_MOUSE:
-                try:
-                    _mid, x, y_mouse, _z, state = curses.getmouse()
-                except curses.error:
-                    continue
-                if self.mouse_button1(state) and top <= y_mouse <= top + box_h:
-                    return x < left + (box_w // 2)
-            if ch in (ord("y"), ord("Y")):
+                return False
+            if ch in (ord('y'), ord('Y')):
                 return True
-            if ch in (ord("n"), ord("N"), 27):
+            if ch in (ord('n'), ord('N'), 27):
                 return False
             if ch in (10, 13, curses.KEY_ENTER):
                 return default
@@ -3279,53 +3488,51 @@ class AICursesApp:
     # behavior of the program. When changing it, check callers, documentation, config
     # compatibility, session-log compatibility, and the parallel Bash/C implementation plans.
     # ------------------------------------------------------------
-    def text_input_modal(self, title: str, prompt: str, initial: str = "", secret: bool = False) -> Optional[str]:
-        value = initial
-        cursor = len(value)
+    def text_input_modal(self, title: str, prompt: str, initial: str = '', secret: bool = False) -> Optional[str]:
+        value, cursor = initial, len(initial)
         while True:
             self.stdscr.erase()
             height, width = self.stdscr.getmaxyx()
-            box_w = min(width - 4, 84)
-            box_h = 11
-            top = max(0, (height - box_h) // 2)
-            left = max(0, (width - box_w) // 2)
-            shown_value = ("*" * max(0, len(value) - 4) + value[-4:]) if secret else value
-            field_w = box_w - 6
-            shown = shown_value[max(0, cursor - field_w + 1):][:field_w]
-            self.safe_addstr(top, left, "+" + "-" * (box_w - 2) + "+", attr=self.reverse_attr())
-            self.safe_addstr(top + 1, left, "|" + title.center(box_w - 2) + "|", attr=self.reverse_attr())
-            self.safe_addstr(top + 2, left, "+" + "-" * (box_w - 2) + "+", attr=self.reverse_attr())
-            for idx, line in enumerate(wrap_for_width(prompt, box_w - 4)[:3]):
-                self.safe_addstr(top + 3 + idx, left + 2, line, box_w - 4)
-            self.safe_addstr(top + 7, left + 2, " " * field_w, field_w, self.reverse_attr())
-            self.safe_addstr(top + 7, left + 2, shown, field_w, self.reverse_attr())
-            self.safe_addstr(top + 9, left + 2, "Enter=accept | Esc=cancel | Backspace=edit", box_w - 4, self.dim_attr())
-            self.safe_addstr(top + 10, left, "+" + "-" * (box_w - 2) + "+", attr=self.reverse_attr())
+            self.safe_addstr(0, 0, title, width, curses.A_BOLD)
+            for index, line in enumerate(wrap_for_width(prompt, max(1, width))[:max(1, height-4)]):
+                self.safe_addstr(1+index, 0, line, width)
+            field_y = max(1, height-3)
+            field_w = max(1, width-3)
+            start = max(0, cursor-field_w+1)
+            masked = '*' * len(value) if secret else value
+            shown = masked[start:start+field_w]
+            self.safe_addstr(field_y, 0, '> ' + shown, width)
+            cursor_x = min(width-2, 2 + cursor-start)
+            self.safe_addstr(field_y, cursor_x, (masked[cursor:cursor+1] or ' '), 1, curses.A_REVERSE)
+            self.safe_addstr(height-1, 0, f'Enter=save Esc=cancel | C{cursor+1}', width)
+            try:
+                curses.curs_set(1)
+                self.stdscr.move(field_y, cursor_x)
+            except curses.error:
+                pass
             self.stdscr.refresh()
-            ch = self.stdscr.getch()
-            # Function keys remain global even inside text entry dialogs.
-            # This keeps F2/F3/F4/etc. as navigation tools everywhere in the UI.
+            ch = self.ui_getch()
             if self.handle_global_hotkey(ch):
                 return None
             if ch in (10, 13, curses.KEY_ENTER):
                 return value.strip()
             if ch == 27:
                 return None
-            if ch in (curses.KEY_BACKSPACE, 127, 8):
-                if cursor > 0:
-                    value = value[: cursor - 1] + value[cursor:]
-                    cursor -= 1
+            if ch in (curses.KEY_BACKSPACE, 127, 8) and cursor:
+                value = value[:cursor-1] + value[cursor:]
+                cursor -= 1
             elif ch == curses.KEY_DC:
-                if cursor < len(value):
-                    value = value[:cursor] + value[cursor + 1:]
+                value = value[:cursor] + value[cursor+1:]
             elif ch == curses.KEY_LEFT:
-                cursor = max(0, cursor - 1)
+                cursor = max(0, cursor-1)
             elif ch == curses.KEY_RIGHT:
-                cursor = min(len(value), cursor + 1)
+                cursor = min(len(value), cursor+1)
             elif ch == curses.KEY_HOME:
                 cursor = 0
             elif ch == curses.KEY_END:
                 cursor = len(value)
+            elif ch == 21:
+                value, cursor = '', 0
             elif 32 <= ch <= 126:
                 value = value[:cursor] + chr(ch) + value[cursor:]
                 cursor += 1
@@ -3390,7 +3597,7 @@ class AICursesApp:
             self.safe_addstr(top + 12, left, "+" + "-" * (box_w - 2) + "+", attr=self.reverse_attr())
             self.stdscr.refresh()
 
-            ch = self.stdscr.getch()
+            ch = self.ui_getch()
             if self.handle_global_hotkey(ch):
                 return None, False
             if ch in (10, 13, curses.KEY_ENTER):
@@ -3436,7 +3643,10 @@ class AICursesApp:
             curses.def_prog_mode()
             curses.endwin()
             try:
-                subprocess.call(shlex.split(editor) + [str(path)])
+                code = subprocess.call(shlex.split(editor) + [str(path)])
+                if code != 0:
+                    self.status = f'Editor exited with status {code}; draft preserved'
+                    return None
             finally:
                 curses.reset_prog_mode()
                 self.stdscr.keypad(True)
@@ -3462,18 +3672,14 @@ class AICursesApp:
     # ------------------------------------------------------------
     def command_items(self) -> List[Tuple[str, str, str]]:
         return [
-            ("F1", "Help / command menu", "noop"),
-            ("D", "Diagnostics / doctor checks", "doctor"),
-            ("F2", "Models: list, inspect, test, activate, save", "models"),
-            ("F3", "API key manager", "api_key"),
-            ("F4", "Sessions: browse, open, create, rename", "sessions"),
-            ("F5", "Options: edit config-backed settings", "options"),
-            ("F6", "Memory: view, edit, clear, rebuild", "memory"),
-            ("F7", "Files: attach local files, browse saved attachments", "files"),
-            ("F8", "Open configured external editor for current prompt", "editor"),
-            ("F9", "Credits / about", "credits"),
-            ("Ctrl+G", "Send current message", "send"),
-            ("F10", "Quit", "quit"),
+            ('F2', 'Models', 'models'), ('F3', 'API key', 'api-key'),
+            ('F4', 'Sessions', 'sessions'), ('F5', 'Options', 'options'),
+            ('F6', 'Memory', 'memory'), ('F7', 'Files / attachments', 'files'),
+            ('F8', 'External editor options', 'editor'), ('F9', 'About', 'credits'),
+            ('', 'Name current session', 'name'),
+            ('F11', 'Show or hide draft / read mode', 'toggle-input'),
+            (self.send_key_label(), 'Send draft', 'send'), ('', 'Diagnostics', 'doctor'),
+            ('', 'Keyboard help', 'key-help'), ('F10', 'Close session (confirm)', 'quit'),
         ]
 
     # ------------------------------------------------------------
@@ -3483,138 +3689,18 @@ class AICursesApp:
     # session-log compatibility, and the parallel Bash/C implementation plans.
     # ------------------------------------------------------------
     def run_command(self, action: str) -> None:
-        if action == "noop":
-            return
-        if action == "help":
-            self.open_help()
-        elif action == "doctor":
-            self.open_doctor()
-        elif action == "models":
-            self.open_model_selector()
-        elif action == "api_key":
-            self.open_api_key_input()
-        elif action == "sessions":
-            self.open_session_browser()
-        elif action == "options":
-            self.open_options_menu()
-        elif action == "memory":
-            self.open_memory_menu()
-        elif action == "files":
-            self.open_file_menu()
-        elif action == "attach":
-            self.quick_attach_file()
-        elif action == "pending":
-            self.show_pending_attachments()
-        elif action == "editor":
-            self.open_external_editor_for_input()
-        elif action == "credits":
-            self.open_credits()
-        elif action == "send":
-            self.send_current_message()
-        elif action == "quit":
-            self.should_quit = True
+        self.dispatch_command_action(action.replace('api_key', 'api-key'))
 
     # ------------------------------------------------------------
     # MAINTAINER COMMENTARY: def open_help
-    # F1 command surface. This is not just documentation; it is a launch pad for the app
-    # features.
+    # Full command menu, accessible without relying on emulator function-key bindings.
     # ------------------------------------------------------------
     def open_help(self) -> None:
-        # F1 is now an actionable command menu, not only a static help page.
-        # Function keys work while this menu is open, Enter launches the
-        # highlighted command, and mouse clicks launch rows directly.
-        selected = 0
-        top_index = 0
         items = self.command_items()
-        while True:
-            self.stdscr.erase()
-            height, width = self.stdscr.getmaxyx()
-            visible_h = max(1, height - 7)
-            self.safe_addstr(0, 0, "F1 HELP / COMMAND MENU", width, self.reverse_attr())
-            self.safe_addstr(1, 0, "Enter/click=launch | F2-F10 work here | Ctrl+G=send | Esc/q=return", width, self.dim_attr())
-            self.safe_addstr(2, 0, "_" * width, width, self.dim_attr())
-
-            if selected < top_index:
-                top_index = selected
-            elif selected >= top_index + visible_h:
-                top_index = selected - visible_h + 1
-
-            for row in range(visible_h):
-                idx = top_index + row
-                if idx >= len(items):
-                    break
-                key, desc, action = items[idx]
-                attr = self.reverse_attr() if idx == selected else 0
-                self.safe_addstr(3 + row, 0, f"{key:<8} {desc}", width, attr)
-
-            footer = "Mousewheel/PgUp/PgDn=scroll | Enter/click=launch | q/Esc=return"
-            self.safe_addstr(height - 2, 0, "_" * width, width, self.dim_attr())
-            self.safe_addstr(height - 1, 0, footer, width, self.reverse_attr())
-            self.stdscr.refresh()
-
-            ch = self.stdscr.getch()
-            if ch == curses.KEY_MOUSE:
-                try:
-                    _mid, _x, y, _z, state = curses.getmouse()
-                except curses.error:
-                    continue
-                delta = self.mouse_wheel_delta(state)
-                if delta > 0:
-                    selected = max(0, selected - MOUSE_SCROLL_LINES)
-                    continue
-                if delta < 0:
-                    selected = min(len(items) - 1, selected + MOUSE_SCROLL_LINES)
-                    continue
-                if self.mouse_button1(state) and 3 <= y < 3 + visible_h:
-                    idx = top_index + (y - 3)
-                    if 0 <= idx < len(items):
-                        selected = idx
-                        self.run_command(items[selected][2])
-                        return
-                continue
-
-            if ch in (27, ord("q"), ord("Q")):
-                return
-            if ch in (curses.KEY_UP, ord("k"), ord("K")):
-                selected = max(0, selected - 1)
-            elif ch in (curses.KEY_DOWN, ord("j"), ord("J")):
-                selected = min(len(items) - 1, selected + 1)
-            elif ch == curses.KEY_PPAGE:
-                selected = max(0, selected - visible_h)
-            elif ch == curses.KEY_NPAGE:
-                selected = min(len(items) - 1, selected + visible_h)
-            elif ch == curses.KEY_HOME:
-                selected = 0
-            elif ch == curses.KEY_END:
-                selected = len(items) - 1
-            elif ch in (10, 13, curses.KEY_ENTER):
-                self.run_command(items[selected][2])
-                return
-            elif ch in (ord("d"), ord("D")):
-                self.run_command("doctor")
-                return
-            elif ch == curses.KEY_F1:
-                continue
-            elif ch == curses.KEY_F2:
-                self.run_command("models"); return
-            elif ch == curses.KEY_F3:
-                self.run_command("api_key"); return
-            elif ch == curses.KEY_F4:
-                self.run_command("sessions"); return
-            elif ch == curses.KEY_F5:
-                self.run_command("options"); return
-            elif ch == curses.KEY_F6:
-                self.run_command("memory"); return
-            elif ch == curses.KEY_F7:
-                self.run_command("files"); return
-            elif ch == curses.KEY_F8:
-                self.run_command("editor"); return
-            elif ch == curses.KEY_F9:
-                self.run_command("credits"); return
-            elif ch in (curses.KEY_F10, 17):
-                self.run_command("quit"); return
-            elif ch == 7:
-                self.run_command("send"); return
+        labels = [f'{key:<8} {label}' for key, label, action in items]
+        chosen = self.choice_modal('COMMAND MENU - Esc', 'Esc is the primary menu key. Function keys remain direct screen navigation.', labels, labels[0])
+        if chosen is not None:
+            self.dispatch_command_action(items[labels.index(chosen)][2])
 
     # ------------------------------------------------------------
     # MAINTAINER COMMENTARY: def open_doctor
@@ -3714,7 +3800,7 @@ class AICursesApp:
             self.safe_addstr(top + 13, left, "+" + "-" * (box_w - 2) + "+", attr=self.reverse_attr())
             self.stdscr.refresh()
 
-            ch = self.stdscr.getch()
+            ch = self.ui_getch()
             if self.handle_global_hotkey(ch):
                 return
             if ch == ord(" "):
@@ -3851,7 +3937,7 @@ class AICursesApp:
                 self.safe_addstr(5 + row, 0, f"{key}  {label}", width, attr)
 
             self.stdscr.refresh()
-            ch = self.stdscr.getch()
+            ch = self.ui_getch()
             if self.handle_global_hotkey(ch, current_action="models"):
                 return
             if ch == curses.KEY_MOUSE:
@@ -4034,7 +4120,7 @@ class AICursesApp:
                 self.safe_addstr(4 + row, 0, line, width, attr)
             self.safe_addstr(height - 1, 0, "Model tests remain user-operated with t on one highlighted model.", width, self.dim_attr())
             self.stdscr.refresh()
-            ch = self.stdscr.getch()
+            ch = self.ui_getch()
             if self.handle_global_hotkey(ch, current_action="models"):
                 return
             if ch == curses.KEY_MOUSE:
@@ -4168,7 +4254,7 @@ class AICursesApp:
                 self.safe_addstr(4, 0, "No models match active filters/search.", width)
                 self.safe_addstr(6, 0, "/=search | f=filters | Esc/q=back | F-keys jump", width, self.dim_attr())
                 self.stdscr.refresh()
-                ch = self.stdscr.getch()
+                ch = self.ui_getch()
                 if self.handle_global_hotkey(ch, current_action="models"):
                     return
                 if ch in (27, ord("q"), ord("Q")):
@@ -4217,7 +4303,7 @@ class AICursesApp:
             self.safe_addstr(height - 2, 0, "_" * width, width, self.dim_attr())
             self.safe_addstr(height - 1, 0, f"{selected + 1}/{len(filtered)} shown; {len(raw_models)} total; {len(favorites)} favorites", width, self.dim_attr())
             self.stdscr.refresh()
-            ch = self.stdscr.getch()
+            ch = self.ui_getch()
             if self.handle_global_hotkey(ch, current_action="models"):
                 return
             if ch == curses.KEY_MOUSE:
@@ -4325,14 +4411,18 @@ class AICursesApp:
     # session-log compatibility, and the parallel Bash/C implementation plans.
     # ------------------------------------------------------------
     def rename_session(self, old_name: str, new_name: str) -> None:
-        old_path = self.cfg.session_dir / f"{old_name}.log"
-        if not old_path.exists():
-            self.show_message("RETITLE SESSION", [f"Session not found: {old_name}"])
+        if self._request_active and old_name == self.session_name:
+            self.show_message('REQUEST ACTIVE', ['The current session cannot be renamed while its response is in flight.'])
             return
-        if write_session_title_metadata(old_path, new_name, self.cfg.session_title_max_words):
-            self.status = f"session title set: {session_display_title(old_path, self.cfg.session_title_max_words)}"
-        else:
-            self.show_message("RETITLE SESSION", ["Title was empty after cleanup."])
+        old_path = self.session_path if old_name == self.session_name else self.cfg.session_dir / (old_name + '.log')
+        try:
+            new_path = rename_session_file(old_path, new_name)
+            if old_path == self.session_path:
+                self.session_path, self.session_name = new_path, new_path.stem
+                self.session_title = session_title_from_file(new_path)
+            self.status = 'Session named: ' + session_title_from_file(new_path)
+        except (OSError, ValueError) as exc:
+            self.show_message('NAME SESSION', [str(exc)])
 
 
     # ------------------------------------------------------------
@@ -4341,39 +4431,108 @@ class AICursesApp:
     # behavior of the program. When changing it, check callers, documentation, config
     # compatibility, session-log compatibility, and the parallel Bash/C implementation plans.
     # ------------------------------------------------------------
+    def session_records(self, sort_mode: str = 'newest', title_query: str = '', content_query: str = '') -> List[Tuple[str, Path, str, float]]:
+        """Return session rows with filtering and deterministic sort order."""
+        self.cfg.session_dir.mkdir(parents=True, exist_ok=True)
+        tq = title_query.casefold().strip()
+        cq = content_query.casefold().strip()
+        rows = []
+        for path in self.cfg.session_dir.glob('*.log'):
+            if path.is_symlink() or not path.is_file():
+                continue
+            title = session_display_title(path, self.cfg.session_title_max_words)
+            if tq and tq not in (title + ' ' + path.stem).casefold():
+                continue
+            if cq and not self.session_file_contains(path, cq):
+                continue
+            try:
+                stamp = path.stat().st_mtime
+            except OSError:
+                stamp = 0.0
+            rows.append((path.stem, path, title, stamp))
+        if sort_mode == 'oldest':
+            rows.sort(key=lambda row: (row[3], row[0].casefold()))
+        elif sort_mode == 'title-a-z':
+            rows.sort(key=lambda row: (row[2].casefold(), -row[3], row[0].casefold()))
+        elif sort_mode == 'title-z-a':
+            rows.sort(key=lambda row: (row[2].casefold(), row[3], row[0].casefold()), reverse=True)
+        elif sort_mode == 'filename-a-z':
+            rows.sort(key=lambda row: row[0].casefold())
+        elif sort_mode == 'filename-z-a':
+            rows.sort(key=lambda row: row[0].casefold(), reverse=True)
+        else:
+            rows.sort(key=lambda row: (row[3], row[0].casefold()), reverse=True)
+        return rows
+
+    def session_file_contains(self, path: Path, needle_casefold: str) -> bool:
+        """Case-insensitive streaming search so advanced search does not load huge logs at once."""
+        if not needle_casefold:
+            return True
+        carry = ''
+        overlap = max(0, len(needle_casefold) - 1)
+        try:
+            with path.open('r', encoding='utf-8', errors='replace') as fh:
+                while True:
+                    chunk = fh.read(65536)
+                    if not chunk:
+                        return False
+                    haystack = (carry + chunk).casefold()
+                    if needle_casefold in haystack:
+                        return True
+                    carry = haystack[-overlap:] if overlap else ''
+        except OSError:
+            return False
+
     def open_session_browser(self) -> None:
         selected = 0
         top_index = 0
+        sort_mode = 'newest'
+        title_query = ''
+        content_query = ''
+        sort_choices = ['newest', 'oldest', 'title-a-z', 'title-z-a', 'filename-a-z', 'filename-z-a']
         while True:
-            names = self.session_names()
-            if not names:
-                self.show_message("SESSIONS", ["No sessions found."])
+            rows = self.session_records(sort_mode, title_query, content_query)
+            if not rows:
+                if title_query or content_query:
+                    self.show_message('SESSIONS', ['No sessions match the current search.', 'Clear or change the search to continue.'])
+                    title_query = ''
+                    content_query = ''
+                    selected = top_index = 0
+                    continue
+                self.show_message('SESSIONS', ['No sessions found.'])
                 return
-            selected = min(selected, len(names) - 1)
+            selected = min(selected, len(rows) - 1)
             self.stdscr.erase()
             height, width = self.stdscr.getmaxyx()
-            visible_h = max(1, height - 6)
-            self.safe_addstr(0, 0, "SESSION BROWSER", width, self.reverse_attr())
-            self.safe_addstr(1, 0, "Enter=switch | a=new chat | d=delete | r=retitle | n=retitle current | j/k move | Esc/q=cancel", width, self.dim_attr())
-            self.safe_addstr(2, 0, f"Current: {self.session_name}", width)
-            self.safe_addstr(3, 0, "_" * width, width, self.dim_attr())
+            visible_h = max(1, height - 7)
+            self.safe_addstr(0, 0, 'SESSION BROWSER', width, self.reverse_attr())
+            self.safe_addstr(1, 0, 'Enter=switch | s=sort | /=title search | f=full-text search | x=clear search | a=new | r=retitle', width, self.dim_attr())
+            filters = []
+            if title_query:
+                filters.append('title=' + title_query)
+            if content_query:
+                filters.append('content=' + content_query)
+            self.safe_addstr(2, 0, 'Sort: ' + sort_mode + (' | ' + ' | '.join(filters) if filters else ''), width)
+            self.safe_addstr(3, 0, 'Current: ' + self.session_name + (' | response in flight' if self._request_active else ''), width)
+            self.safe_addstr(4, 0, '_' * width, width, self.dim_attr())
             if selected < top_index:
                 top_index = selected
             elif selected >= top_index + visible_h:
                 top_index = selected - visible_h + 1
-            for row in range(visible_h):
-                idx = top_index + row
-                if idx >= len(names):
+            top_index = max(0, min(top_index, max(0, len(rows) - visible_h)))
+            for row_no in range(visible_h):
+                idx = top_index + row_no
+                if idx >= len(rows):
                     break
-                marker = "* " if names[idx] == self.session_name else "  "
-                title = session_display_title(self.cfg.session_dir / f"{names[idx]}.log", self.cfg.session_title_max_words)
-                label = f"{title}  ({names[idx]})" if title != names[idx] else names[idx]
+                name, _path, title, stamp = rows[idx]
+                marker = '* ' if name == self.session_name else '  '
+                label = f'{title}  ({name})' if title != name else name
                 attr = self.reverse_attr() if idx == selected else 0
-                self.safe_addstr(4 + row, 0, marker + label, width, attr)
-            self.safe_addstr(height - 1, 0, f"{selected + 1}/{len(names)}", width, self.dim_attr())
+                self.safe_addstr(5 + row_no, 0, marker + label, width, attr)
+            self.safe_addstr(height - 1, 0, f'{selected + 1}/{len(rows)} | Esc/q=return | j/k move | PgUp/PgDn', width, self.dim_attr())
             self.stdscr.refresh()
-            ch = self.stdscr.getch()
-            if self.handle_global_hotkey(ch, current_action="sessions"):
+            ch = self.ui_getch()
+            if self.handle_global_hotkey(ch, current_action='sessions'):
                 return
             if ch == curses.KEY_MOUSE:
                 try:
@@ -4384,62 +4543,96 @@ class AICursesApp:
                 if delta > 0:
                     selected = max(0, selected - MOUSE_SCROLL_LINES)
                 elif delta < 0:
-                    selected = min(len(names) - 1, selected + MOUSE_SCROLL_LINES)
-                elif self.mouse_button1(state) and 4 <= y < 4 + visible_h:
-                    idx = top_index + (y - 4)
-                    if 0 <= idx < len(names):
+                    selected = min(len(rows) - 1, selected + MOUSE_SCROLL_LINES)
+                elif self.mouse_button1(state) and 5 <= y < 5 + visible_h:
+                    idx = top_index + (y - 5)
+                    if 0 <= idx < len(rows):
                         selected = idx
                 continue
-            if ch in (27, ord("q"), ord("Q")):
+            if ch in (27, ord('q'), ord('Q')):
                 return
+            if ch in (ord('s'), ord('S')):
+                picked = self.choice_modal('SESSION SORT', 'Choose how the session browser is ordered.', sort_choices, sort_mode)
+                if picked:
+                    sort_mode = picked
+                    selected = top_index = 0
+                continue
+            if ch == ord('/'):
+                value = self.text_input_modal('SESSION TITLE SEARCH', 'Case-insensitive substring in friendly title or filename. Blank clears.', title_query)
+                if value is not None:
+                    title_query = value.strip()
+                    selected = top_index = 0
+                continue
+            if ch in (ord('f'), ord('F')):
+                value = self.text_input_modal('SESSION FULL-TEXT SEARCH', 'Search inside session log files. Case-insensitive substring. Blank clears.', content_query)
+                if value is not None:
+                    content_query = value.strip()
+                    selected = top_index = 0
+                continue
+            if ch in (ord('x'), ord('X')):
+                title_query = content_query = ''
+                selected = top_index = 0
+                continue
             if ch in (10, 13, curses.KEY_ENTER):
-                name = names[selected]
-                self.reset_to_session(name, self.cfg.session_dir / f"{name}.log")
+                if self._request_active:
+                    self.show_message('REQUEST ACTIVE', ['The response continues in the current session.', 'Session switching is disabled until it completes so the reply cannot be written to the wrong log.'])
+                    continue
+                name, path, _title, _stamp = rows[selected]
+                self.reset_to_session(name, path)
                 return
-            if ch in (ord("a"), ord("A")):
-                new = self.text_input_modal("NEW SESSION", "Name this new chat session (blank for timestamp):", "")
+            if ch in (ord('a'), ord('A')):
+                if self._request_active:
+                    self.show_message('REQUEST ACTIVE', ['Finish the current response before creating or switching sessions.'])
+                    continue
+                new = self.text_input_modal('NEW SESSION', 'Name this new chat session (blank for timestamp):', '')
                 if new is None:
                     continue
-                name = sanitize_session_name(new) if new.strip() else default_session_name_unique(self.cfg.session_dir)
-                self.reset_to_session(name, self.cfg.session_dir / f"{name}.log")
+                name = default_session_name_unique(self.cfg.session_dir)
+                path = self.cfg.session_dir / (name + '.log')
+                ensure_session_id(path)
+                if new.strip():
+                    path = rename_session_file(path, new)
+                self.reset_to_session(path.stem, path)
                 return
-            if ch in (ord("d"), ord("D")):
-                victim = names[selected]
-                if victim == self.session_name:
-                    if not self.ask_yes_no("DELETE CURRENT SESSION", f"Delete current session log {victim}.log?", default=False):
-                        continue
-                else:
-                    if not self.ask_yes_no("DELETE SESSION", f"Delete session log {victim}.log?", default=False):
-                        continue
+            if ch in (ord('d'), ord('D')):
+                if self._request_active:
+                    self.show_message('REQUEST ACTIVE', ['Session deletion is disabled while a response is in flight.'])
+                    continue
+                victim, path, _title, _stamp = rows[selected]
+                if not self.ask_yes_no('DELETE SESSION', f'Delete session log {victim}.log?', default=False):
+                    continue
                 try:
-                    (self.cfg.session_dir / f"{victim}.log").unlink()
-                    self.status = f"deleted session: {victim}"
+                    path.unlink()
+                    self.status = f'deleted session: {victim}'
                     if victim == self.session_name:
                         name = default_session_name_unique(self.cfg.session_dir)
-                        self.reset_to_session(name, self.cfg.session_dir / f"{name}.log")
+                        self.reset_to_session(name, self.cfg.session_dir / f'{name}.log')
                         return
                 except OSError as exc:
-                    self.show_message("DELETE SESSION", [f"Could not delete {victim}: {exc}"])
+                    self.show_message('DELETE SESSION', [f'Could not delete {victim}: {exc}'])
+                selected = min(selected, max(0, len(rows) - 2))
                 continue
-            if ch in (ord("r"), ord("R")):
-                old = names[selected]
-                new = self.text_input_modal("RETITLE SESSION", f"Friendly title for '{old}':", session_display_title(self.cfg.session_dir / f"{old}.log", self.cfg.session_title_max_words))
+            if ch in (ord('r'), ord('R')):
+                old, path, title, _stamp = rows[selected]
+                if self._request_active and old == self.session_name:
+                    self.show_message('REQUEST ACTIVE', ['The active session cannot be retitled until its response completes.'])
+                    continue
+                new = self.text_input_modal('RETITLE SESSION', f"Friendly title for '{old}':", title)
                 if new:
                     self.rename_session(old, new)
                 continue
-            if ch in (ord("n"), ord("N")):
-                new = self.text_input_modal("RETITLE CURRENT SESSION", "Friendly title for current session:", session_display_title(self.session_path, self.cfg.session_title_max_words))
-                if new:
-                    self.rename_session(self.session_name, new)
-                continue
-            if ch in (curses.KEY_UP, ord("k"), ord("K")):
+            if ch in (curses.KEY_UP, ord('k'), ord('K')):
                 selected = max(0, selected - 1)
-            elif ch in (curses.KEY_DOWN, ord("j"), ord("J")):
-                selected = min(len(names) - 1, selected + 1)
+            elif ch in (curses.KEY_DOWN, ord('j'), ord('J')):
+                selected = min(len(rows) - 1, selected + 1)
             elif ch == curses.KEY_PPAGE:
                 selected = max(0, selected - visible_h)
             elif ch == curses.KEY_NPAGE:
-                selected = min(len(names) - 1, selected + visible_h)
+                selected = min(len(rows) - 1, selected + visible_h)
+            elif ch == curses.KEY_HOME:
+                selected = 0
+            elif ch == curses.KEY_END:
+                selected = len(rows) - 1
 
     # ------------------------------------------------------------
     # MAINTAINER COMMENTARY: def choice_modal
@@ -4485,8 +4678,8 @@ class AICursesApp:
 
             self.safe_addstr(height - 1, 0, f"{selected + 1}/{len(choices)}", width, self.reverse_dim_attr())
             self.stdscr.refresh()
-            ch = self.stdscr.getch()
-            if self.handle_global_hotkey(ch, current_action="options"):
+            ch = self.ui_getch()
+            if self.handle_global_hotkey(ch, current_action=self._active_screen):
                 return None
             if ch == curses.KEY_MOUSE:
                 try:
@@ -4552,6 +4745,12 @@ class AICursesApp:
         def current_fields() -> List[dict]:
             return [
                 {"key": "MODEL", "label": "Model", "kind": "text", "value": self.cfg.model},
+                {"key": "WEB_SEARCH", "label": "Web search", "kind": "bool", "value": self.cfg.web_search},
+                {"key": "WEB_SEARCH_ENGINE", "label": "Web search engine", "kind": "choice", "value": self.cfg.web_search_engine, "choices": WEB_SEARCH_ENGINES},
+                {"key": "WEB_SEARCH_MODE", "label": "Web compatibility", "kind": "choice", "value": self.cfg.web_search_mode, "choices": WEB_SEARCH_MODES},
+                {"key": "WEB_SEARCH_MAX_RESULTS", "label": "Web results/search (0=provider default)", "kind": "int", "value": str(self.cfg.web_search_max_results)},
+                {"key": "WEB_SEARCH_MAX_USES", "label": "Web search rounds (0=no ttychatter cap)", "kind": "int", "value": str(self.cfg.web_search_max_uses)},
+                {"key": "INPUT_HEIGHT", "label": "Draft rows (1..12)", "kind": "int", "value": str(self.cfg.input_height)},
                 {"key": "CONTEXT_TURNS", "label": "Context turns", "kind": "int", "value": str(self.cfg.context_turns)},
                 {"key": "SESSION_DIR", "label": "Session directory", "kind": "path", "value": str(self.cfg.session_dir)},
                 {"key": "ATTACHMENT_DIR", "label": "Attachment directory", "kind": "path", "value": str(self.cfg.effective_attachment_dir)},
@@ -4566,7 +4765,6 @@ class AICursesApp:
                 {"key": "MODEL_MIN_OUTPUT_TOKENS", "label": "Model browser: min output tokens", "kind": "int", "value": str(self.cfg.model_min_output_tokens)},
                 {"key": "MODEL_SORT_ORDER", "label": "Model browser: sort order", "kind": "choice", "value": self.cfg.model_sort_order, "choices": ["favorites", "type", "api", "name", "display", "input-desc", "output-desc"]},
                 {"key": "MODEL_TYPE_FILTER", "label": "Model browser: type filter", "kind": "choice", "value": self.cfg.model_type_filter, "choices": MODEL_TYPE_CHOICES},
-                {"key": "THEME", "label": "Theme / style profile", "kind": "choice", "value": self.cfg.theme, "choices": THEME_CHOICES},
                 {"key": "MODEL_TEST_PROMPT", "label": "Model test prompt", "kind": "text", "value": self.cfg.model_test_prompt},
                 {"key": "GITHUB_URL", "label": "GitHub/status URL", "kind": "text", "value": self.cfg.github_url},
                 {"key": "INPUT_PLACEHOLDER", "label": "Input placeholder", "kind": "text", "value": self.cfg.input_placeholder},
@@ -4579,7 +4777,6 @@ class AICursesApp:
                 {"key": "SESSION_AUTO_TITLE", "label": "AI session-title metadata", "kind": "bool", "value": self.cfg.session_auto_title},
                 {"key": "SESSION_TITLE_MODEL", "label": "Session title model", "kind": "text", "value": self.cfg.session_title_model},
                 {"key": "SESSION_TITLE_MAX_WORDS", "label": "Session title max words", "kind": "int", "value": str(self.cfg.session_title_max_words)},
-                {"key": "MONOCHROME", "label": "Monochrome mode", "kind": "bool", "value": self.cfg.monochrome},
                 {"key": "STARTUP_NOTICE", "label": "Startup Project Lead notice", "kind": "bool", "value": self.cfg.startup_notice},
                 {"key": "DEMO_MODE", "label": "Demo mode", "kind": "bool", "value": self.cfg.demo_mode},
                 {"key": "CONFIRM_LIVE_SEND", "label": "Confirm first live send", "kind": "bool", "value": self.cfg.confirm_live_send},
@@ -4596,6 +4793,24 @@ class AICursesApp:
             if key == "MODEL":
                 self.cfg.model = normalize_model_id(str(value))
                 set_config_value(self.cfg, key, self.cfg.model)
+            elif key == "WEB_SEARCH":
+                self.cfg.web_search = bool(value)
+                set_config_value(self.cfg, key, '1' if value else '0')
+            elif key == "WEB_SEARCH_ENGINE" and str(value) in WEB_SEARCH_ENGINES:
+                self.cfg.web_search_engine = str(value)
+                set_config_value(self.cfg, key, str(value))
+            elif key == "WEB_SEARCH_MODE" and str(value) in WEB_SEARCH_MODES:
+                self.cfg.web_search_mode = str(value)
+                set_config_value(self.cfg, key, str(value))
+            elif key == "WEB_SEARCH_MAX_RESULTS":
+                self.cfg.web_search_max_results = min(25, parse_nonnegative_int(str(value), self.cfg.web_search_max_results))
+                set_config_value(self.cfg, key, str(self.cfg.web_search_max_results))
+            elif key == "WEB_SEARCH_MAX_USES":
+                self.cfg.web_search_max_uses = min(25, parse_nonnegative_int(str(value), self.cfg.web_search_max_uses))
+                set_config_value(self.cfg, key, str(self.cfg.web_search_max_uses))
+            elif key == "INPUT_HEIGHT":
+                self.cfg.input_height = min(12, parse_positive_int(str(value), 3))
+                set_config_value(self.cfg, key, str(self.cfg.input_height))
             elif key == "CONTEXT_TURNS":
                 self.cfg.context_turns = parse_positive_int(str(value), self.cfg.context_turns)
                 set_config_value(self.cfg, key, str(self.cfg.context_turns))
@@ -4721,9 +4936,9 @@ class AICursesApp:
                 top_index = selected - body_h + 1
 
             self.safe_addstr(0, 0, "OPTIONS", width, self.reverse_attr())
-            help_line = "Space=toggle | Enter=edit | s=save edit | Esc/q=return | F-keys jump screens"
+            help_line = "Space=toggle | Enter=edit/save | Esc/q=return | F-keys jump"
             if editing:
-                help_line = "Editing inline: Enter/s=save | Esc=cancel edit | Backspace=delete"
+                help_line = "Editing inline: Enter=save | Esc=cancel edit | Backspace=delete"
             self.safe_addstr(1, 0, help_line, width, self.dim_attr())
             self.safe_addstr(2, 0, "_" * width, width, self.dim_attr())
 
@@ -4753,7 +4968,7 @@ class AICursesApp:
                 self.safe_addstr(height - 1, 0, f"{selected + 1}/{len(fields)}  Config: {self.cfg.config_file}", width, self.reverse_attr())
             self.stdscr.refresh()
 
-            ch = self.stdscr.getch()
+            ch = self.ui_getch()
             if self.handle_global_hotkey(ch, current_action="options"):
                 return
             field = fields[selected]
@@ -4782,7 +4997,7 @@ class AICursesApp:
                     editing = False
                     edit_value = ""
                     continue
-                if ch in (10, 13, curses.KEY_ENTER, ord("s"), ord("S")):
+                if ch in (10, 13, curses.KEY_ENTER):
                     apply_field(field["key"], edit_value)
                     editing = False
                     edit_value = ""
@@ -4884,7 +5099,7 @@ class AICursesApp:
                 attr = self.reverse_attr() if row == selected else 0
                 self.safe_addstr(4 + row, 0, f"{_key}  {label}", width, attr)
             self.stdscr.refresh()
-            ch = self.stdscr.getch()
+            ch = self.ui_getch()
             if self.handle_global_hotkey(ch, current_action="memory"):
                 return
             if ch == curses.KEY_MOUSE:
@@ -4977,7 +5192,7 @@ class AICursesApp:
                 attr = self.reverse_attr() if idx == selected else 0
                 self.safe_addstr(3 + row, 0, label, width, attr)
             self.stdscr.refresh()
-            ch = self.stdscr.getch()
+            ch = self.ui_getch()
             if self.handle_global_hotkey(ch, current_action="files"):
                 return None
             if ch == curses.KEY_MOUSE:
@@ -5001,43 +5216,6 @@ class AICursesApp:
                     current = chosen.resolve(); selected = 0; top_index = 0
                 else:
                     return chosen
-
-    # ------------------------------------------------------------
-    # MAINTAINER COMMENTARY: def quick_attach_file
-    # Ctrl+K uses this helper to expose the most common file workflow without
-    # forcing the user through the full F7 file menu.  Earlier versions used
-    # Ctrl+T, but on ChromeOS Terminal that keystroke can be intercepted by the
-    # terminal emulator to open a new tab before ttychatter ever receives it.
-    # Ctrl+K is not perfect -- Emacs-style editors often use it for kill-line --
-    # but ttychatter owns the keystroke while focus is inside the curses
-    # application, and it is less likely to be stolen globally by the terminal.
-    #
-    # The shortcut deliberately reuses the same file picker and PendingAttachment
-    # object as F7 so the application has one attachment pipeline rather than two
-    # subtly different pipelines.  If future ports add drag/drop, paste-from-
-    # clipboard, or richer file browsers, keep them feeding this same pending-
-    # attachment list.
-    # ------------------------------------------------------------
-    def quick_attach_file(self) -> None:
-        path = self.file_picker(Path.cwd(), "ATTACH FILE")
-        if path:
-            self.pending_attachments.append(PendingAttachment(path, guess_mime(path)))
-            self.status = f"attached file for next request: {path.name}"
-
-    # ------------------------------------------------------------
-    # MAINTAINER COMMENTARY: def show_pending_attachments
-    # Ctrl+L uses this helper to let the user check what will be sent with the
-    # next message without opening the full F7 file tools screen.  The pending
-    # list is intentionally a local compose-state list: it is cleared after a
-    # successful send and is not written to memory as if it were normal chat
-    # text.  The log records that attachments were sent, but the pending UI list
-    # itself is just an operational aid for the human at the terminal.
-    # ------------------------------------------------------------
-    def show_pending_attachments(self) -> None:
-        if not self.pending_attachments:
-            self.show_message("PENDING FILES", ["No files are queued for the next message."])
-            return
-        self.show_message("PENDING FILES", [f"{idx + 1}. {p.path} ({p.mime_type})" for idx, p in enumerate(self.pending_attachments)])
 
     # ------------------------------------------------------------
     # MAINTAINER COMMENTARY: def open_file_menu
@@ -5066,7 +5244,7 @@ class AICursesApp:
                 self.safe_addstr(4 + row, 0, f"{_key}  {label}", width, attr)
             self.stdscr.refresh()
 
-            ch = self.stdscr.getch()
+            ch = self.ui_getch()
             if self.handle_global_hotkey(ch, current_action="files"):
                 return
             if ch == curses.KEY_MOUSE:
@@ -5197,19 +5375,13 @@ class AICursesApp:
     # compatibility, session-log compatibility, and the parallel Bash/C implementation plans.
     # ------------------------------------------------------------
     def open_external_editor_for_input(self) -> None:
-        """Open the configured editor immediately for the current draft.
-
-        F8 is the compose shortcut: users expect it to edit the message, not to
-        make them choose an editor every time.  Editor selection belongs in the
-        Options screen, where it behaves like a stable preference.  This routine
-        therefore uses the effective editor, opens a temporary file, and loads
-        the edited result back into the input pane.
-        """
+        """Run the editor after the explicit Open in external editor action."""
         edited = self.run_external_editor(self.current_input())
         if edited is not None:
             self.input_lines = edited.rstrip("\n").splitlines() or [""]
             self.cursor_row = len(self.input_lines) - 1
             self.cursor_col = len(self.input_lines[-1])
+            self.input_visible = True
             self.status = "input loaded from external editor"
 
     # ------------------------------------------------------------------
@@ -5337,116 +5509,238 @@ class AICursesApp:
     # AI request parts, and visible transcript output.
     # ------------------------------------------------------------
     def ask_ai_file_download(self, rec: Dict[str, str], idx: int) -> bool:
-        return self.ask_yes_no("AI FILE ATTACHMENT", f"Download AI attachment {idx}: {rec.get('name','assistant-file')} ({rec.get('mime','application/octet-stream')})?", default=False)
+        return self.ask_yes_no('AI FILE ATTACHMENT', f"Download AI attachment {idx}: {rec.get('name','assistant-file')} ({rec.get('mime','application/octet-stream')})?", default=False)
+
+    def _run_request_worker(self, cfg_work: Config, prompt_text: str, session_name: str,
+                            attachments: List[PendingAttachment]) -> None:
+        """Network work only. The worker never calls curses or mutates live UI state."""
+        fallback_used = False
+        cached_support = cached_model_tool_support(cfg_work, cfg_work.effective_model) if cfg_work.web_search else None
+        if cfg_work.web_search and cfg_work.web_search_mode == 'auto' and cached_support is False:
+            cfg_work.web_search_mode = 'plugin'
+            fallback_used = True
+            self._request_events.put(('notice', 'Current model cache does not advertise tool support; using OpenRouter web plugin fallback.'))
+
+        def run_once() -> Tuple[bool, str, bool]:
+            if cfg_work.stream:
+                def on_piece(piece: str) -> None:
+                    self._request_events.put(('piece', piece))
+                return generate_with_model_stream(cfg_work, cfg_work.effective_model, prompt_text,
+                    session_name, cfg_work.effective_attachment_dir, attachments, on_piece,
+                    self._request_cancel.is_set)
+            ok, output = generate_with_model(cfg_work, cfg_work.effective_model, prompt_text,
+                session_name, cfg_work.effective_attachment_dir, attachments, timeout=120, ask_download=None)
+            return ok, output, False
+
+        ok, output, cancelled = run_once()
+        if (not ok and cfg_work.web_search and cfg_work.web_search_mode == 'auto'
+                and is_tool_endpoint_404(output) and not cfg_work.last_response_metadata.get('partial_text')):
+            cfg_work.web_search_mode = 'plugin'
+            fallback_used = True
+            self._request_events.put(('notice', 'Server web tool is unavailable on this route; retrying once with the OpenRouter web plugin.'))
+            ok, output, cancelled = run_once()
+        self._request_events.put(('done', {
+            'ok': ok, 'output': output, 'cancelled': cancelled,
+            'metadata': dict(cfg_work.last_response_metadata),
+            'fallback_used': fallback_used,
+        }))
 
     def send_current_message(self) -> None:
+        if self._request_active:
+            self.status = 'A response is already being generated; the UI remains available.'
+            return
         message = self.current_input()
         if not message.strip() and not self.pending_attachments:
-            self.status = "empty message ignored"
-            self.clear_input()
+            self.status = 'Empty message ignored'
             return
-        if not message.strip() and self.pending_attachments:
-            message = "Please review the attached file(s)."
-
-        if (not self.cfg.demo_mode) and self.cfg.confirm_live_send and (not self.cfg.live_send_confirmed):
-            if not self.ask_yes_no(
-                "LIVE OPENROUTER REQUEST",
-                "This will send a real chat request to OpenRouter. Use --demo to test the interface without network chat calls. Continue?",
-                default=False,
-            ):
-                self.status = "live send cancelled; run with --demo for offline testing"
+        if not message.strip():
+            message = 'Please review the attached file(s).'
+        if not self.cfg.demo_mode and self.cfg.confirm_live_send and not self.cfg.live_send_confirmed:
+            if not self.ask_yes_no('LIVE OPENROUTER REQUEST', 'Send this request to OpenRouter?', default=False):
+                self.status = 'Send cancelled; draft retained'
                 return
             self.cfg.live_send_confirmed = True
 
+        attachments = list(self.pending_attachments)
+        note = '\n[Attachments sent: ' + ', '.join(p.path.name for p in attachments) + ']' if attachments else ''
+        old_context = list(self.context_buffer)
+        prompt_text = (self.build_context() + '\n' if self.context_buffer else '') + 'User: ' + message
         user_time = now_time()
-        attachment_note = ""
-        if self.pending_attachments:
-            attachment_note = "\n[Pending attachments sent: " + ", ".join(p.path.name for p in self.pending_attachments) + "]"
-        self.transcript.append(TranscriptItem(self.username, message + attachment_note, user_time))
-        append_log(self.session_path, self.username, message + attachment_note, user_time)
-        self.context_buffer.append("User: " + message + attachment_note)
+        self.remove_startup_notice()
+        append_log(self.session_path, self.username, message + note, user_time)
+        self.transcript.append(TranscriptItem(self.username, message + note, user_time))
+        self.context_buffer.append('User: ' + message + note)
         self.trim_context_buffer()
         self.clear_input()
-        self.transcript_scroll = 0
-        self.status = "Generating response..."
-        self.draw()
-
-        context = self.build_context()
-        prompt_text = (context + "\n" if context else "") + "User: " + message
-        attachments_to_send = list(self.pending_attachments)
-        stream_item: Optional[TranscriptItem] = None
-
-        if self.cfg.stream:
-            openrouter_time = now_time()
-            stream_item = TranscriptItem("AI", "", openrouter_time)
-            self.transcript.append(stream_item)
-            self.status = "Streaming... press ESC to stop"
-            self.draw()
-
-            def on_stream_piece(piece: str) -> None:
-                if stream_item is not None:
-                    stream_item.text += piece
-                self.transcript_scroll = 0
-                self.status = "Streaming... press ESC to stop"
-                self.draw()
-
-            def stream_cancel_requested() -> bool:
-                while True:
-                    ch = self.stdscr.getch()
-                    if ch == -1:
-                        return False
-                    if ch == 27:
-                        return True
-                    if ch == curses.KEY_MOUSE:
-                        continue
-                return False
-
-            try:
-                self.stdscr.nodelay(True)
-                ok, streamed_text, cancelled = generate_with_model_stream(
-                    self.cfg,
-                    self.cfg.effective_model,
-                    prompt_text,
-                    self.session_name,
-                    self.attachment_dir,
-                    attachments_to_send,
-                    on_stream_piece,
-                    stream_cancel_requested,
-                    timeout=120,
-                )
-            finally:
-                self.stdscr.nodelay(False)
-            raw_output = streamed_text if ok else f"({streamed_text})"
-            if stream_item is not None:
-                stream_item.text = raw_output
-            if cancelled:
-                self.status = "stream stopped; partial response saved"
-        else:
-            raw_output = call_ai(self.cfg, prompt_text, self.session_name, self.attachment_dir, attachments_to_send, self.ask_ai_file_download)
-            openrouter_time = now_time()
-
+        # Files in this request are consumed now. Files attached while it runs belong
+        # to the next request and must never be cleared by completion of this one.
         self.pending_attachments = []
+        self.transcript_scroll = 0
+        stream_item = None
+        if self.cfg.stream:
+            stream_item = TranscriptItem('AI', '', now_time())
+            self.transcript.append(stream_item)
+        self._request_state = {
+            'message': message,
+            'attachments': attachments,
+            'old_context': old_context,
+            'stream_item': stream_item,
+            'session_path': self.session_path,
+            'session_name': self.session_name,
+        }
+        self._request_active = True
+        self._request_cancel = threading.Event()
+        self.status = 'Generating response in background; UI remains available.'
+        cfg_work = copy.deepcopy(self.cfg)
+        # 'ask' would require curses input from the worker. Metadata mode preserves
+        # the returned-file references without ever touching curses off-thread.
+        if cfg_work.ai_file_download_mode == 'ask':
+            cfg_work.ai_file_download_mode = 'metadata'
+        self._request_thread = threading.Thread(target=self._run_request_worker,
+            args=(cfg_work, prompt_text, self.session_name, attachments), daemon=True,
+            name='ttychatter-request')
+        self._request_thread.start()
 
-        append_log(self.session_path, "AI", raw_output, openrouter_time)
-        cleaned_output = extract_code_attachments(raw_output, self.attachment_dir, self.session_name, self.cfg.code_attachment_min_lines)
-        if self.cfg.loopback_file is not None:
+    def process_request_events(self) -> None:
+        """Apply completed network work on the curses/main thread."""
+        while True:
             try:
-                self.cfg.loopback_file.parent.mkdir(parents=True, exist_ok=True)
-                with self.cfg.loopback_file.open("a", encoding="utf-8") as loopback_fh:
-                    loopback_fh.write(cleaned_output + "\n")
-            except OSError as exc:
-                self.status = f"loopback file write failed: {exc}"
+                kind, payload = self._request_events.get_nowait()
+            except queue.Empty:
+                return
+            state = self._request_state
+            if state is None:
+                continue
+            if kind == 'notice':
+                self.status = str(payload)
+                continue
+            if kind == 'piece':
+                stream_item = state.get('stream_item')
+                if stream_item is None:
+                    stream_item = TranscriptItem('AI', '', now_time())
+                    self.transcript.append(stream_item)
+                    state['stream_item'] = stream_item
+                stream_item.text += str(payload)
+                self.input_visible = False
+                self.transcript_scroll = 0
+                self.status = 'Streaming response; read mode entered automatically.'
+                continue
+            if kind == 'done':
+                self._finish_request(payload)
 
-        self.context_buffer.append("Assistant: " + cleaned_output)
-        self.trim_context_buffer()
-        self.save_context_snapshot()
-        generate_session_title(self.cfg, self.session_path, message, cleaned_output)
-        if stream_item is not None:
-            stream_item.text = cleaned_output
+    def ui_getch(self) -> int:
+        """Wait for a real curses key while continuing background request work."""
+        while True:
+            ch = self.stdscr.getch()
+            if ch != -1:
+                return ch
+            self.process_request_events()
+
+    def _finish_request(self, result: dict) -> None:
+        state = self._request_state or {}
+        self._request_active = False
+        self._request_thread = None
+        self._request_state = None
+        ok = bool(result.get('ok'))
+        output = str(result.get('output') or '')
+        cancelled = bool(result.get('cancelled'))
+        metadata = dict(result.get('metadata') or {})
+        self.cfg.last_response_metadata = metadata
+        partial = bool(metadata.get('partial_text'))
+        stream_item = state.get('stream_item')
+        old_context = list(state.get('old_context') or [])
+        message = str(state.get('message') or '')
+        sent_attachments = list(state.get('attachments') or [])
+
+        if not ok and not partial:
+            append_log(self.session_path, 'system', 'request-failed: ' + output, now_time())
+            self.transcript.append(TranscriptItem('system', self._friendly_request_error(output), now_time()))
+            if stream_item is not None and stream_item in self.transcript:
+                self.transcript.remove(stream_item)
+            self.context_buffer = old_context
+            # Restore the failed prompt only if the user has not already started the next one.
+            if not self.current_input().strip():
+                self.input_lines = message.split('\n') or ['']
+                self.cursor_row = len(self.input_lines) - 1
+                self.cursor_col = len(self.input_lines[-1])
+            existing = {str(item.path) for item in self.pending_attachments}
+            self.pending_attachments = sent_attachments + [item for item in self.pending_attachments if str(item.path) not in {str(x.path) for x in sent_attachments}]
+            self.input_visible = True
+            self.status = 'Request failed; original prompt/files retained. UI remained responsive.'
         else:
-            self.transcript.append(TranscriptItem("AI", cleaned_output, openrouter_time))
-        if self.status.startswith("Streaming"):
-            self.status = "response complete"
+            if stream_item is not None:
+                stream_item.text = output
+            else:
+                stream_item = TranscriptItem('AI', output, now_time())
+                self.transcript.append(stream_item)
+            self.input_visible = False
+            self.transcript_scroll = 0
+            self.last_reply = output
+            storage_errors = []
+            try:
+                append_log(self.session_path, 'AI', output, now_time())
+            except OSError as exc:
+                storage_errors.append('Reply log: ' + str(exc))
+            try:
+                cleaned = extract_code_attachments(output, self.attachment_dir, self.session_name, self.cfg.code_attachment_min_lines)
+                stream_item.text = cleaned
+            except OSError as exc:
+                cleaned = output
+                storage_errors.append('Code attachment: ' + str(exc))
+            self.context_buffer.append('Assistant: ' + cleaned)
+            self.trim_context_buffer()
+            if not storage_errors:
+                try:
+                    self.save_context_snapshot()
+                except OSError as exc:
+                    storage_errors.append('Context snapshot: ' + str(exc))
+            if self.cfg.loopback_file is not None:
+                try:
+                    self.cfg.loopback_file.parent.mkdir(parents=True, exist_ok=True)
+                    with self.cfg.loopback_file.open('a', encoding='utf-8') as fh:
+                        fh.write(cleaned + '\n')
+                except OSError as exc:
+                    self.transcript.append(TranscriptItem('system', 'Loopback write failed: ' + str(exc), now_time()))
+            suffix = ' (web plugin fallback)' if result.get('fallback_used') else ''
+            self.status = ('Partial response saved' if cancelled or not ok else 'Response complete') + suffix + '; read mode'
+            if not cancelled and ok and not storage_errors:
+                new_path = generate_session_title(self.cfg, self.session_path, message, cleaned)
+                if new_path:
+                    self.session_path, self.session_name = new_path, new_path.stem
+                    self.session_title = session_title_from_file(new_path)
+            if storage_errors:
+                self.status = 'Response received; save failed. F8 can save the last reply.'
+                self.transcript.append(TranscriptItem('system', self.status + '\n' + '\n'.join(storage_errors), now_time()))
+
+        if metadata:
+            try:
+                encoded = json.dumps(metadata, ensure_ascii=True)
+                if self.cfg.api_key:
+                    encoded = encoded.replace(self.cfg.api_key, '[redacted]')
+                append_log(self.session_path, 'system', 'openrouter-response: ' + encoded, now_time())
+            except OSError as exc:
+                self.status = 'Response metadata could not be saved: ' + str(exc)
+        if ok and not cancelled and not self._named_after_reply and not self.should_quit:
+            self._named_after_reply = True
+            # Do not interrupt read mode with a naming modal. The prominent UNNAMED
+            # header and Esc menu keep naming available without hijacking the reply.
+            if not self.session_title:
+                self.status += ' | Session is UNNAMED; name it from Esc menu.'
+
+    def _friendly_request_error(self, output: str) -> str:
+        if is_tool_endpoint_404(output):
+            return ('Web server tool unavailable for this model/provider route. '
+                    'Use F5 Options > Web compatibility = auto/plugin, or choose a tool-capable model.\n' + output)
+        return output
+
+    def wait_for_request_completion(self, timeout: float = 5.0) -> bool:
+        """Test/maintenance helper; the interactive UI never waits this way."""
+        deadline = time.monotonic() + timeout
+        while self._request_active and time.monotonic() < deadline:
+            self.process_request_events()
+            time.sleep(0.01)
+        self.process_request_events()
+        return not self._request_active
 
     # ------------------------------------------------------------------
     # Command dispatch
@@ -5459,19 +5753,10 @@ class AICursesApp:
     # compatibility, session-log compatibility, and the parallel Bash/C implementation plans.
     # ------------------------------------------------------------
     def action_for_function_key(self, ch: int) -> Optional[str]:
-        mapping = {
-            curses.KEY_F1: "help",
-            curses.KEY_F2: "models",
-            curses.KEY_F3: "api-key",
-            curses.KEY_F4: "sessions",
-            curses.KEY_F5: "options",
-            curses.KEY_F6: "memory",
-            curses.KEY_F7: "files",
-            curses.KEY_F8: "editor",
-            curses.KEY_F9: "credits",
-            curses.KEY_F10: "quit",
-        }
-        return mapping.get(ch)
+        return {curses.KEY_F1: 'help', curses.KEY_F2: 'models', curses.KEY_F3: 'api-key',
+                curses.KEY_F4: 'sessions', curses.KEY_F5: 'options', curses.KEY_F6: 'memory',
+                curses.KEY_F7: 'files', curses.KEY_F8: 'editor', curses.KEY_F9: 'credits',
+                curses.KEY_F10: 'quit', curses.KEY_F11: 'toggle-input'}.get(ch)
 
     # ------------------------------------------------------------
     # MAINTAINER COMMENTARY: def dispatch_command_action
@@ -5479,39 +5764,103 @@ class AICursesApp:
     # behavior of the program. When changing it, check callers, documentation, config
     # compatibility, session-log compatibility, and the parallel Bash/C implementation plans.
     # ------------------------------------------------------------
-    def dispatch_command_action(self, action: str) -> None:
-        if action == "help":
-            self.open_help()
-        elif action == "doctor":
-            self.open_doctor()
-        elif action == "models":
-            self.open_model_selector()
-        elif action == "api-key":
-            self.open_api_key_input()
-        elif action == "sessions":
-            self.open_session_browser()
-        elif action == "options":
-            self.open_options_menu()
-        elif action == "memory":
-            self.open_memory_menu()
-        elif action == "files":
-            self.open_file_menu()
-        elif action == "attach":
-            self.quick_attach_file()
-        elif action == "pending":
-            self.show_pending_attachments()
-        elif action == "editor":
-            self.open_external_editor_for_input()
-        elif action == "quick-attach":
-            # Backward-compatible alias used by older generated help rows.
-            self.quick_attach_file()
-        elif action == "pending-files":
-            # Backward-compatible alias used by older generated help rows.
-            self.show_pending_attachments()
-        elif action == "credits":
-            self.open_credits()
-        elif action == "quit":
+
+    def perform_command_action(self, action: str) -> None:
+        commands = {'help': self.open_help, 'doctor': self.open_doctor,
+                    'models': self.open_model_selector, 'api-key': self.open_api_key_input,
+                    'sessions': self.open_session_browser, 'options': self.open_options_menu,
+                    'memory': self.open_memory_menu, 'files': self.open_file_menu,
+                    'editor': self.open_editor_menu, 'credits': self.open_credits,
+                    'send': self.send_current_message, 'quit': self.request_quit,
+                    'name': self.prompt_session_title,
+                    'toggle-input': self.toggle_input, 'key-help': self.open_key_help}
+        if action in commands:
+            commands[action]()
+
+    def toggle_input(self) -> None:
+        self.input_visible = not self.input_visible
+        self.status = 'Draft visible' if self.input_visible else 'Read mode: arrows or j/k; u/d half-page; g/G oldest/latest'
+
+    def request_quit(self) -> None:
+        if self.ask_yes_no('CLOSE SESSION', 'Session will be ended and unsaved data lost. Really close? Y/N', default=False):
+            if self._request_active:
+                self._request_cancel.set()
             self.should_quit = True
+
+    def prompt_session_title(self, reminder: bool = False) -> None:
+        if reminder and (not self.cfg.prompt_session_name or self.session_title):
+            return
+        title = self.text_input_modal('NAME THIS SESSION',
+            'Use a name you will recognize in the log directory. Blank or Esc keeps it unnamed.', self.session_title)
+        if title:
+            self.rename_session(self.session_name, title)
+        elif not self.session_title:
+            self.status = 'Session is UNNAMED. Use Esc menu > Name current session.'
+
+    def open_editor_menu(self) -> None:
+        choices = ['Open in external editor', 'Choose or configure editor', 'Save last reply to file', 'Return to chat']
+        while True:
+            selected = self.choice_modal('EXTERNAL EDITOR - F8',
+                'Current editor: ' + self.cfg.effective_editor, choices, choices[0])
+            if selected == choices[0]:
+                self.open_external_editor_for_input()
+                return
+            if selected == choices[1]:
+                editor = self.select_editor_value()
+                if editor:
+                    self.cfg.editor = editor
+                    set_config_value(self.cfg, 'EDITOR', editor)
+            elif selected == choices[2]:
+                self.save_last_reply()
+            else:
+                return
+
+    def save_last_reply(self) -> None:
+        if not self.last_reply:
+            self.show_message('SAVE REPLY', ['No reply has been received in this session yet.'])
+            return
+        name = self.text_input_modal('SAVE LAST REPLY', 'Enter a new file path. Existing files are kept.',
+            str(self.attachment_dir / (self.session_name[:80] + '-reply.txt')))
+        if not name:
+            return
+        try:
+            target = expand_path(name)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with target.open('x', encoding='utf-8') as fh:
+                fh.write(self.last_reply)
+            self.status = 'Reply saved: ' + str(target)
+        except OSError as exc:
+            self.show_message('SAVE REPLY', [str(exc)])
+
+    def open_key_help(self) -> None:
+        self.show_message('KEYBOARD HELP', [
+            'Esc: complete command menu. F1 remains an optional alias for terminals where it is available.',
+            'F2 Models; F3 API key; F4 Sessions; F5 Options; F6 Memory; F7 Files; F8 Editor options; F9 About.',
+            'F11 toggles draft/read mode. PgUp/PgDn scroll the transcript.',
+            'Read mode: Up/Down or k/j scroll one line; u/d scroll half a page; g/G go oldest/latest.',
+            'Draft mode: arrows and Home/End edit the draft. Ctrl+G sends when configured as the send key.',
+            'Attachments are managed from F7 Files; they intentionally have no global control-key shortcuts.',
+            'Web search settings are ordinary F5 Options entries; there is no separate web-search hotkey.',
+            'F10 opens the close confirmation. Enter/Esc/N cancels. Only Y confirms.',
+            'While a response is in flight, the UI remains interactive. The first rendered response automatically enters read mode.',
+            'Function keys remain direct navigation between feature screens.'])
+
+    def dispatch_command_action(self, action: str) -> None:
+        # Switching screens unwinds the old screen; it cannot grow the call stack.
+        if self._dispatching:
+            raise ScreenNavigation(action)
+        self._dispatching = True
+        try:
+            while action:
+                self._active_screen = action
+                try:
+                    self.perform_command_action(action)
+                    action = ''
+                except ScreenNavigation as navigation:
+                    action = navigation.action
+        finally:
+            self._dispatching = False
+            self._active_screen = None
 
     # ------------------------------------------------------------
     # MAINTAINER COMMENTARY: def handle_global_hotkey
@@ -5520,20 +5869,12 @@ class AICursesApp:
     # main chat.
     # ------------------------------------------------------------
     def handle_global_hotkey(self, ch: int, current_action: Optional[str] = None) -> bool:
-        """Allow F-key navigation from feature screens.
-
-        A user looking at F1/F2/F5/etc. screens should be able to jump
-        directly to another screen by pressing that function key. The only
-        exception is pressing the function key for the screen already open;
-        that is ignored to avoid recursive redraw loops.
-        """
         action = self.action_for_function_key(ch)
         if not action:
             return False
-        if current_action is not None and action == current_action:
+        if action == (current_action or self._active_screen):
             return False
-        self.dispatch_command_action(action)
-        return True
+        raise ScreenNavigation(action)
 
     # ------------------------------------------------------------------
     # Main event loop
@@ -5546,37 +5887,45 @@ class AICursesApp:
     # session-log compatibility, and the parallel Bash/C implementation plans.
     # ------------------------------------------------------------
     def handle_key(self, ch: int) -> None:
-        if ch == curses.KEY_MOUSE:
-            self.handle_mouse()
-            return
-
         action = self.action_for_function_key(ch)
         if action:
             self.dispatch_command_action(action)
             return
-
-        if ch == 7:  # Ctrl+G remains a reliable send key. F5 is Options, not send.
-            self.send_current_message()
+        if ch == 7 and (self.cfg.send_input or 'enter').lower() == 'ctrl_g':
+            self.dispatch_command_action('send')
             return
-
-        if ch == 11:  # Ctrl+K = quick attach file.  See quick_attach_file() for why Ctrl+T was retired.
-            self.quick_attach_file()
+        if ch == curses.KEY_MOUSE:
+            self.handle_mouse()
             return
-
-        if ch == 12:  # Ctrl+L = list pending files.  This replaces the old redraw-only use of Ctrl+L.
-            self.show_pending_attachments()
+        if ch == 27:
+            self.dispatch_command_action('help')
             return
-
-        if ch == 17:  # Ctrl+Q
-            self.should_quit = True
-            return
-        if ch == curses.KEY_ENTER and self.cfg.send_input == "ctrl_enter":
-            # Ctrl+Enter is terminal-dependent: many terminal emulators collapse
-            # it into ordinary Enter. If curses reports a distinct KEY_ENTER,
-            # honor it here; otherwise users should choose enter or ctrl_g.
+        page = max(1, self.layout.get('transcript_h', 10)-1)
+        if ch == curses.KEY_PPAGE:
+            self.transcript_scroll += page
+        elif ch == curses.KEY_NPAGE:
+            self.transcript_scroll = max(0, self.transcript_scroll-page)
+        elif ch == getattr(curses, 'KEY_SR', -999):
+            self.transcript_scroll += 1
+        elif ch == getattr(curses, 'KEY_SF', -999):
+            self.transcript_scroll = max(0, self.transcript_scroll-1)
+        elif not self.input_visible:
+            if ch in (curses.KEY_UP, ord('k'), ord('K')):
+                self.transcript_scroll += 1
+            elif ch in (curses.KEY_DOWN, ord('j'), ord('J')):
+                self.transcript_scroll = max(0, self.transcript_scroll-1)
+            elif ch in (ord('u'), ord('U')):
+                self.transcript_scroll += max(1, page // 2)
+            elif ch in (ord('d'), ord('D')):
+                self.transcript_scroll = max(0, self.transcript_scroll - max(1, page // 2))
+            elif ch in (curses.KEY_HOME, ord('g')):
+                self.transcript_scroll = len(self.transcript_display_lines(self.layout.get('width', 80)))
+            elif ch in (curses.KEY_END, ord('G')):
+                self.transcript_scroll = 0
+        elif ch == curses.KEY_ENTER and self.cfg.send_input == 'ctrl_enter':
             self.send_current_message()
         elif ch in (10, 13, curses.KEY_ENTER):
-            if self.cfg.send_input == "enter":
+            if self.cfg.send_input == 'enter':
                 self.send_current_message()
             else:
                 self.insert_newline()
@@ -5588,10 +5937,8 @@ class AICursesApp:
         elif ch == curses.KEY_DOWN: self.move_down()
         elif ch == curses.KEY_HOME: self.cursor_col = 0
         elif ch == curses.KEY_END: self.cursor_col = len(self.input_lines[self.cursor_row])
-        elif ch == curses.KEY_PPAGE: self.transcript_scroll += 10
-        elif ch == curses.KEY_NPAGE: self.transcript_scroll = max(0, self.transcript_scroll - 10)
         elif ch == 21: self.clear_input()
-        elif ch == 9: self.insert_text("    ")
+        elif ch == 9: self.insert_text('    ')
         elif 32 <= ch <= 126: self.insert_text(chr(ch))
 
     # ------------------------------------------------------------
@@ -5602,18 +5949,48 @@ class AICursesApp:
     # ------------------------------------------------------------
     def run(self, stdscr: curses.window) -> None:
         self.stdscr = stdscr
-        curses.noecho(); curses.cbreak(); stdscr.keypad(True)
-        mouse_mask = curses.ALL_MOUSE_EVENTS | getattr(curses, "REPORT_MOUSE_POSITION", 0)
-        try: curses.mousemask(mouse_mask)
-        except curses.error: pass
+        curses.noecho()
+        curses.cbreak()
+        stdscr.keypad(True)
+        try:
+            stdscr.timeout(50)
+        except (AttributeError, curses.error):
+            pass
+        try:
+            curses.start_color()
+            curses.use_default_colors()
+        except curses.error:
+            pass
+        stdscr.bkgd(' ', curses.A_NORMAL)
+        try:
+            curses.set_escdelay(35)
+        except (AttributeError, curses.error):
+            pass
+        try:
+            curses.mousemask(curses.ALL_MOUSE_EVENTS)
+        except curses.error:
+            pass
+        self.cfg.request_session_id = ensure_session_id(self.session_path)
+        self.session_title = session_title_from_file(self.session_path)
         self.load_session_into_ui()
-        if not self.cfg.api_key: self.status = "No API key loaded. Press F3 to paste one."
-        elif not self.cfg.model: self.status = "No MODEL configured. Press F2 to choose/test one."
+        try:
+            self.prompt_session_title(reminder=True)
+        except ScreenNavigation as navigation:
+            self.dispatch_command_action(navigation.action)
         while not self.should_quit:
+            self.process_request_events()
             self.draw()
-            try: ch = stdscr.getch()
-            except KeyboardInterrupt: break
-            self.handle_key(ch)
+            try:
+                ch = stdscr.getch()
+                if ch == -1:
+                    continue
+                self.handle_key(ch)
+            except ScreenNavigation as navigation:
+                self.dispatch_command_action(navigation.action)
+            except KeyboardInterrupt:
+                self.dispatch_command_action('quit')
+            except OSError as exc:
+                self.status = 'File or system error: ' + str(exc)
 
 
 # ---------------------------------------------------------------------------
@@ -5623,19 +6000,33 @@ class AICursesApp:
 
 
 def resolve_session_argument(cfg: Config, value: str) -> Tuple[str, Path]:
-    """Resolve --resume values in user-friendly ways.
-
-    Accept all of these forms so shell tab-completion is useful:
-        --resume notes
-        --resume notes.log
-        --resume /path/to/notes.log
-    """
     raw = Path(os.path.expanduser(value))
-    if raw.suffix == ".log" or "/" in value:
-        path = raw if raw.is_absolute() else (Path.cwd() / raw)
-        return sanitize_session_name(path.stem), path
-    name = sanitize_session_name(value)
-    return name, cfg.session_dir / f"{name}.log"
+    if '/' in value:
+        path = raw if raw.is_absolute() else Path.cwd() / raw
+        return path.stem, path
+    stem = raw.stem if raw.suffix == '.log' else value
+    direct = cfg.session_dir / (sanitize_session_name(stem) + '.log')
+    if direct.exists():
+        return direct.stem, direct
+    if raw.suffix == '.log' and raw.is_file():
+        return raw.stem, raw.resolve()
+    matches = []
+    for path in cfg.session_dir.glob('*.log'):
+        if path.is_symlink() or not path.is_file():
+            continue
+        if session_title_from_file(path) == value:
+            matches.append(path)
+            continue
+        try:
+            pattern = r'^\[\d\d:\d\d:\d\d\] system: session-alias: ' + re.escape(stem) + r'$'
+            if re.search(pattern, path.read_text(encoding='utf-8', errors='replace'), re.M):
+                matches.append(path)
+        except OSError:
+            continue
+    if len(matches) > 1:
+        raise ValueError('Ambiguous session name; use the exact filename from --list.')
+    path = matches[0] if matches else direct
+    return path.stem, path
 
 # ------------------------------------------------------------
 # MAINTAINER COMMENTARY: def main
@@ -5659,6 +6050,18 @@ def main() -> int:
         cfg.stream = True
     if args.no_stream:
         cfg.stream = False
+    if args.web:
+        cfg.web_search = True
+    if args.no_web:
+        cfg.web_search = False
+    if args.web_engine:
+        cfg.web_search_engine = args.web_engine
+    if args.web_max_results is not None:
+        cfg.web_search_max_results = args.web_max_results
+    if args.web_max_uses is not None:
+        cfg.web_search_max_uses = args.web_max_uses
+    if getattr(args, "web_mode", None):
+        cfg.web_search_mode = args.web_mode
     if getattr(args, "ai_download", None):
         cfg.ai_file_download_mode = args.ai_download
     cfg.session_dir.mkdir(parents=True, exist_ok=True)
@@ -5672,11 +6075,13 @@ def main() -> int:
         if not session_path.exists():
             print(f"error: session not found: {args.rename_session[0]}", file=sys.stderr)
             return 1
-        ok = write_session_title_metadata(session_path, args.rename_session[1], cfg.session_title_max_words)
-        if not ok:
-            print("error: title was empty after cleanup", file=sys.stderr)
+        try:
+            session_path = rename_session_file(session_path, args.rename_session[1])
+        except (OSError, ValueError) as exc:
+            print('error: ' + str(exc), file=sys.stderr)
             return 1
-        print(f"session title set: {session_display_title(session_path, cfg.session_title_max_words)}")
+        print('session title set: ' + session_display_title(session_path))
+        print('session: ' + str(session_path.resolve()))
         return 0
     if args.turns:
         _session_name, session_path = resolve_session_argument(cfg, args.turns)
@@ -5722,6 +6127,9 @@ def main() -> int:
         session_name = default_session_name_unique(cfg.session_dir)
         session_path = cfg.session_dir / f"{session_name}.log"
 
+    if chosen and not session_path.exists():
+        ensure_session_id(session_path)
+        write_session_title_metadata(session_path, Path(chosen).stem if '/' in chosen else chosen)
     app = AICursesApp(cfg, session_name, session_path)
     try:
         curses.wrapper(app.run)
@@ -5731,4 +6139,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except (OSError, ValueError) as exc:
+        print('error: ' + str(exc), file=sys.stderr)
+        raise SystemExit(1)

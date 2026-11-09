@@ -1,4 +1,4 @@
-.TH TTYCHATTER.NCURSES 1 "June 2026" "ttychatter.ncurses 0.15.2-ai-files" "User Commands"
+.TH TTYCHATTER.NCURSES 1 "November 2026" "ttychatter.ncurses 0.17.0" "User Commands"
 .SH NAME
 ttychatter.ncurses \- full-screen ncurses OpenRouter chat interface
 .SH SYNOPSIS
@@ -28,8 +28,9 @@ ttychatter.ncurses \- full-screen ncurses OpenRouter chat interface
 .B ttychatter.ncurses
 is the full-screen terminal UI edition. It prioritizes interactive browsing,
 model selection, options, attachments, memory inspection, and session management.
-Batch-only command-line features are intentionally limited, but title metadata,
-list, retitle, turns, branch, and export are available outside the UI.
+It inherits the terminal foreground and background, supports a hideable draft,
+and offers a full command menu through Escape, with F1 as an optional alias. List, rename, turns,
+branch, and export operations are also available outside the UI.
 .SH SESSION LOGS AND TITLES
 New logs begin with:
 .PP
@@ -37,9 +38,17 @@ New logs begin with:
 Everyone is encouraged to get the cruelty-free vegetarian alternatives and remember the bloodguilt curse from the Bible... http://bloodguiltcurse.net
 .fi
 .PP
-Session files keep timestamped or user-supplied filenames. Friendly names are
-stored as session-title metadata. --list and the session browser display those
-titles when present. Retitling does not rename files or attachments.
+New unnamed interactive sessions ask for a human title. If still unnamed after
+the first successful reply, the program asks again. The Escape command menu
+contains the naming action. PROMPT_SESSION_NAME=0 disables automatic naming prompts.
+.PP
+Titles are stored as session-title metadata and appear in the physical log
+filename. A named file uses a sanitized title, two hyphens, and the first 12
+characters of its stable session-id. Collision suffixes prevent overwriting.
+Renaming retains the full title, session ID, old filename and title aliases,
+and existing attachment paths. Exact title or alias lookups must be unambiguous.
+Explicit --session names initially keep their requested filename. Unnamed logs
+keep timestamped filenames until named. Existing logs remain readable.
 .SH OPTIONS
 .TP
 .BR -h , " --help"
@@ -64,7 +73,7 @@ Force a fresh timestamped session.
 List saved sessions with title metadata when present.
 .TP
 .BR --rename-session " SESSION TITLE"
-Set session-title metadata for SESSION.
+Set the full human title, safely rename the physical log, and print its new path.
 .TP
 .BR --turns " SESSION"
 List user/assistant message numbers.
@@ -107,15 +116,35 @@ Send MODEL_TEST_PROMPT to MODEL and print the response.
 Append each AI response to PATH while the ncurses UI remains interactive.
 .TP
 .B --stream
-Stream assistant output into the transcript. During an active stream, the status
-bar reads "Streaming... press ESC to stop"; pressing ESC stops the response and
-saves the partial reply with an interruption marker.
+Stream assistant output into the transcript. Provider I/O runs outside the curses
+event loop, so menus, options, and transcript navigation remain usable while the
+stream is active.
 .TP
 .B --no-stream
 Disable streaming for this run even when STREAM=1 is configured.
 .TP
+.B --web
+Enable the OpenRouter web-search server tool for this run. The model decides
+whether to search. Search and token charges may apply.
+.TP
+.B --no-web
+Do not add the web-search tool for this run, overriding WEB_SEARCH=1.
+.TP
+.BR --web-engine " auto|native|exa|parallel|perplexity|firecrawl"
+Choose the search engine. The default is auto.
+.TP
+.BR --web-max-results " N"
+Request 0..25 results per search; the default is 5. Zero leaves the provider default. Perplexity is capped at 20 when a nonzero limit is set.
+.TP
+.BR --web-max-uses " N"
+Request 0..25 search rounds per reply; the default is 3. Zero omits ttychatter's max_tool_calls cap. Provider limits still apply. It is not a monetary budget.
+.TP
 .BR --ai-download " ask|auto|metadata|off"
-Control provider-returned file attachments. In ask mode the TUI prompts before saving each returned file. auto saves all returned files under ATTACHMENT_DIR/received, metadata lists them without saving, and off ignores them.
+Control provider-returned file attachments. In ask mode a nonstreaming response
+prompts before saving each returned file. During streaming, ask records metadata
+only. auto saves returned files under ATTACHMENT_DIR/received, metadata lists
+them without saving, and off ignores them. Received files have a 20 MiB size
+limit and never overwrite an existing file.
 .SH CONFIGURATION
 The shared config file is
 .IR $XDG_CONFIG_HOME/ttychatter/openrouter/config
@@ -136,18 +165,92 @@ Relevant keys include MODEL, CONTEXT_TURNS, SESSION_DIR, ATTACHMENT_DIR,
 EDITOR, MODEL_CACHE_FILE, MODEL_FAVORITES_FILE, MODEL_FILTER_CHAT_COMPLETIONS,
 MODEL_FILTER_REQUIRE_TOKENS, MODEL_FILTER_HIDE_PREVIEW,
 MODEL_MIN_INPUT_TOKENS, MODEL_MIN_OUTPUT_TOKENS, MODEL_SORT_ORDER,
-MODEL_TYPE_FILTER, THEME, SEND_INPUT, PROMPT_SESSION_NAME,
+MODEL_TYPE_FILTER, THEME, SEND_INPUT, PROMPT_SESSION_NAME, INPUT_HEIGHT,
+WEB_SEARCH, WEB_SEARCH_ENGINE, WEB_SEARCH_MODE, WEB_SEARCH_MAX_RESULTS, WEB_SEARCH_MAX_USES,
 CODE_ATTACHMENT_MIN_LINES, MAX_ATTACHMENT_BYTES, GITHUB_URL, STARTUP_NOTICE, SESSION_AUTO_TITLE,
 SESSION_TITLE_MODEL, SESSION_TITLE_MAX_WORDS, STREAM, AI_FILE_DOWNLOAD_MODE, DEMO_MODE,
 CONFIRM_LIVE_SEND, API_KEY_GPG_FILE, and LOOPBACK_FILE.
 .PP
-SESSION_AUTO_TITLE defaults to 0. When enabled, SESSION_TITLE_MODEL is a
-secondary model used only to write session-title metadata after a response. The
-chat model remains MODEL.
-.SH UI NOTES
-F4 opens the session browser. The rename actions now retitle metadata instead of
-renaming log files. F5 opens options, including streaming mode, AI returned-file download mode, loopback output, attachment
-limits, model favorites/cache paths, and the AI session-title metadata settings.
-F2 opens model selection and F7 opens file/attachment tools.
+SESSION_AUTO_TITLE defaults to 0. When enabled, SESSION_TITLE_MODEL generates a
+short title after a response and the log is renamed accordingly. The chat model
+remains MODEL. Title generation does not enable web search. Manual titles are
+not shortened to SESSION_TITLE_MAX_WORDS.
+.PP
+All legacy THEME values now use the terminal's foreground and background. Bold
+and reverse video provide emphasis without a custom palette. INPUT_HEIGHT is
+the visible draft height, default 3, range 1..12, constrained by screen size.
+.SH KEYBOARD AND LAYOUT
+.TP
+.B Escape
+Open the full scrollable command menu. F1 is an optional alias, so a terminal emulator that consumes F1 does not block access.
+.TP
+.B F11
+Hide or show the draft. Hidden text and cursor position are preserved.
+.TP
+.B PgUp / PgDn
+Scroll the transcript by one visible page.
+.TP
+.B Up / Down or k / j
+In read mode, scroll the transcript one line. With the draft visible, arrow keys edit the draft.
+.TP
+.B u / d
+In read mode, scroll half a page.
+.TP
+.B g / G
+In read mode, go to the oldest or latest transcript position.
+.TP
+.B F2 / F3 / F4
+Models / API key / sessions. The session browser defaults to newest first; s changes sorting, / searches titles, f searches inside log files, and x clears searches.
+.TP
+.B F5 / F6 / F7
+Options / memory / files. Web settings live in Options. Attachment actions live in Files and have no global control-key shortcuts.
+.TP
+.B F8
+Open external-editor options. The editor runs only after selecting Open in external editor.
+.TP
+.B F9
+About / credits.
+.TP
+.B F10
+Close-session confirmation. Only Y exits.
+.TP
+.B Configured send key
+Enter is the default. Ctrl+G is captured only when SEND_INPUT=ctrl_g is explicitly selected.
+.PP
+Network generation is asynchronous in the ncurses client. Menus, function-key screens, options, and transcript navigation remain usable while a response is in flight. When response text is first rendered, the main chat automatically enters read mode.
+.SH WEB SEARCH AND RESPONSE METADATA
+WEB_SEARCH defaults to 0. The preferred implementation uses the
+openrouter:web_search server tool. No separate search key or local search
+process is required. WEB_SEARCH_MODE may be auto, server-tool, or plugin. Auto
+uses the agentic server tool when possible and falls back once to OpenRouter's
+web plugin when cached model metadata lacks tools or OpenRouter returns the
+specific no-tool-capable-endpoint HTTP 404. The plugin performs one pre-answer
+search rather than an agentic search loop.
+.PP
+WEB_SEARCH_MAX_RESULTS and WEB_SEARCH_MAX_USES accept 0. Zero results omits an
+explicit result limit and leaves the provider default. Zero uses omits
+max_tool_calls, meaning ttychatter imposes no search-round cap. Nonzero values
+are bounded by ttychatter and provider constraints and are not a dollar budget.
+.PP
+Supplied source annotations become a Sources section. Response IDs, usage,
+provider/model information, annotations, and reasoning details are recorded as
+system metadata outside conversation memory. Stream parsing reads final usage
+through [DONE] and retains partial text on error. Both streaming and
+nonstreaming generation run outside the curses event loop so the UI remains
+interactive while the request is in flight.
+.PP
+Current OpenRouter reference pages:
+https://openrouter.ai/tool/web-search/
+https://openrouter.ai/blog/agentic-web-tools/
+.SH MEMORY AND FILE PRESERVATION
+JSON context snapshots preserve multiline entries. Resume loads the latest
+complete snapshot plus later real conversation turns. An empty snapshot means
+memory was intentionally cleared. Legacy CONTEXT_BEGIN / CONTEXT_END blocks
+remain readable. Metadata and the exact project-notice entry are excluded.
+.PP
+If saving a received answer fails, the raw reply remains in the transcript and
+F8 Save last reply to file can recover it. Configuration replacement is atomic.
+Extracted code and received attachments reserve new filenames without replacing
+earlier files.
 .SH SEE ALSO
 ttychatter.bash(1), ttychatter.python(1)

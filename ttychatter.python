@@ -6,7 +6,7 @@
 # Bash + Python 3 helper terminal OpenRouter AI interface.
 #
 # VERSION
-#   3.11
+#   3.19-web-limits
 #
 # DESIGN ROLE
 #   This Bash edition is the lightweight, line-oriented version of
@@ -81,9 +81,10 @@
 # original design conversations.
 # ==========================================================
 set -o pipefail
+umask 077
 
 PROGRAM="ttychatter.python"
-VERSION="3.17-ai-files"
+VERSION="3.19-web-limits"
 
 XDG_CONFIG_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}"
 XDG_DATA_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}"
@@ -137,6 +138,13 @@ VOICE_INPUT_CMD=""
 VOICE_OUTPUT_CMD=""
 VOICE_OUTPUT=0
 AI_FILE_DOWNLOAD_MODE="ask"
+WEB_SEARCH=0
+WEB_SEARCH_ENGINE="auto"
+WEB_SEARCH_MAX_RESULTS=5
+WEB_SEARCH_MAX_USES=3
+PROMPT_SESSION_NAME=1
+SESSION_ID=""
+SESSION_FIXED_PATH=0
 
 MAX_ATTACHMENT_BYTES=1048576
 EDITOR_CMD=""
@@ -449,7 +457,12 @@ if [ -f "$CONFIG_READ_FILE" ]; then
       SESSION_DIR) SESSION_DIR="$(expand_path "$value")" ;;
       ATTACHMENT_DIR) ATTACHMENT_DIR="$(expand_path "$value")"; ATTACHMENT_DIR_CONFIGURED=1 ;;
       AI_FILE_DOWNLOAD_MODE|AI_DOWNLOAD) AI_FILE_DOWNLOAD_MODE="$value" ;;
-      MODEL_TEST_PROMPT) [ -n "$value" ] && MODEL_TEST_PROMPT="$value" ;;
+      WEB_SEARCH) WEB_SEARCH="$value" ;;
+    WEB_SEARCH_ENGINE) WEB_SEARCH_ENGINE="$value" ;;
+    WEB_SEARCH_MAX_RESULTS) WEB_SEARCH_MAX_RESULTS="$value" ;;
+    WEB_SEARCH_MAX_USES) WEB_SEARCH_MAX_USES="$value" ;;
+    PROMPT_SESSION_NAME) PROMPT_SESSION_NAME="$value" ;;
+    MODEL_TEST_PROMPT) [ -n "$value" ] && MODEL_TEST_PROMPT="$value" ;;
       DEMO_MODE) DEMO_MODE="$value" ;;
       STARTUP_NOTICE) STARTUP_NOTICE="$value" ;;
       STREAM) STREAM="$value" ;;
@@ -564,6 +577,11 @@ Core:
   ATTACHMENT_DIR=$ATTACHMENT_DIR
   MODEL_TEST_PROMPT=$MODEL_TEST_PROMPT
   STARTUP_NOTICE=$STARTUP_NOTICE
+  WEB_SEARCH=$WEB_SEARCH
+  WEB_SEARCH_ENGINE=$WEB_SEARCH_ENGINE
+  WEB_SEARCH_MAX_RESULTS=$WEB_SEARCH_MAX_RESULTS
+  WEB_SEARCH_MAX_USES=$WEB_SEARCH_MAX_USES
+  PROMPT_SESSION_NAME=$PROMPT_SESSION_NAME
   STREAM=$STREAM
   STATUS_UPDATES=$STATUS_UPDATES
   SESSION_AUTO_TITLE=$SESSION_AUTO_TITLE
@@ -905,6 +923,8 @@ USAGE
     $PROGRAM --editor-prompt [session]
     $PROGRAM --attach FILE [session]
     $PROGRAM --stream | --no-stream
+    $PROGRAM --web | --no-web
+    $PROGRAM --web-engine ENGINE --web-max-results N --web-max-uses N
     $PROGRAM --ai-download ask|auto|metadata|off
     $PROGRAM --status | --no-status
     $PROGRAM --voice-input FILE | --transcribe FILE
@@ -963,8 +983,9 @@ RUNTIME COMMAND MODE
     Type :help during a chat for the full runtime command list.
 
 SESSION TITLES
-    Logs keep timestamped filenames. --list shows Session-Title metadata when present.
-    --rename-session changes title metadata, not the filename.
+    Named logs use TITLE--ID.log; --list shows friendly names and actual filenames.
+    --rename-session updates the title and the actual log filename without overwriting another session.
+    PROMPT_SESSION_NAME=1 asks interactive unnamed sessions for a name; batch input is never read for naming.
     Optional title generation is off by default and uses SESSION_AUTO_TITLE=1 plus SESSION_TITLE_MODEL.
 
 STREAMING / STATUS / VOICE
@@ -1039,7 +1060,6 @@ resolve_session_path() { printf '%s/%s.log\n' "$SESSION_DIR" "$1"; }
 # call sites before changing it, and update man pages/help/comments when
 # behavior changes.
 # ----------------------------------------------------------
-list_sessions() { local path; for path in "$SESSION_DIR"/*.log; do [ -e "$path" ] || continue; basename "$path" .log; done; }
 
 # ----------------------------------------------------------
 # MAINTAINER COMMENTARY: function rename_session_command
@@ -1047,15 +1067,7 @@ list_sessions() { local path; for path in "$SESSION_DIR"/*.log; do [ -e "$path" 
 # check call sites before changing it, and update man pages/help/comments
 # when behavior changes.
 # ----------------------------------------------------------
-rename_session_command() {
-  local old_name new_name old_path new_path
-  old_name="$(sanitize_session_name "$1")"; new_name="$(sanitize_session_name "$2")"
-  old_path="$(resolve_session_path "$old_name")"; new_path="$(resolve_session_path "$new_name")"
-  [ -f "$old_path" ] || { printf 'ERROR: session not found: %s\n' "$old_name" >&2; return 1; }
-  [ ! -e "$new_path" ] || { printf 'ERROR: destination already exists: %s\n' "$new_name" >&2; return 1; }
-  mv "$old_path" "$new_path"
-  printf 'renamed session: %s -> %s\n' "$old_name" "$new_name"
-}
+
 
 # ==========================================================
 # MEMORY SNAPSHOTS / RESUME CONTEXT
@@ -1067,39 +1079,42 @@ rename_session_command() {
 # like conversations instead of just appending to a file.
 # ----------------------------------------------------------
 load_context_from_path() {
-  local path="$1" max_entries
+  local path="$1" max_entries=$((CONTEXT_TURNS*2))
   [ -f "$path" ] || return 0
-  max_entries=$((CONTEXT_TURNS * 2))
-  [ "$max_entries" -lt 2 ] && max_entries=2
-  awk -v max="$max_entries" '
-    function push(role,text, i) {
-      if (role == "" || text == "") return
-      entries[++n] = role ": " text
-      if (n > max) { for (i = 2; i <= n; i++) entries[i-1] = entries[i]; n = max }
-    }
-    function flush() {
-      if (speaker != "") {
-        low = tolower(speaker)
-        if (low != "system" && speaker != "remfan1994") {
-          role = (speaker == "AI" || speaker == "OpenRouter" || speaker == "Assistant") ? "Assistant" : "User"
-          push(role, text)
-        }
-      }
-      speaker = ""; text = ""
-    }
-    /^\[[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\] [^:]+:/ {
-      flush()
-      line = $0
-      sub(/^\[[^]]*\] /, "", line)
-      speaker = line
-      sub(/:.*/, "", speaker)
-      sub(/^[^:]*:[[:space:]]*/, "", line)
-      text = line
-      next
-    }
-    { if (speaker != "") text = text "\n" $0 }
-    END { flush(); for (i = 1; i <= n; i++) printf "%s%c", entries[i], 0 }
-  ' "$path"
+  [ "$max_entries" -ge 2 ] || max_entries=2
+  python3 - "$path" "$max_entries" "$TC_PRECHAT_LINE" <<'PY_LOAD_CONTEXT'
+import json,re,sys
+path,maximum,notice=sys.argv[1],int(sys.argv[2]),sys.argv[3]
+pattern=re.compile(r'^\[[0-9]{2}:[0-9]{2}:[0-9]{2}\] ([^:]+): ?(.*)$')
+entries=[]
+with open(path,encoding='utf-8',errors='replace') as fh:
+    for line in fh:
+        line=line.rstrip('\n'); match=pattern.match(line)
+        if match: entries.append([match.group(1),match.group(2)])
+        elif entries: entries[-1][1]+='\n'+line
+context=[]; pending=None
+for speaker,text in entries:
+    if speaker.lower()=='system':
+        if text.startswith('CONTEXT_SNAPSHOT_JSON '):
+            try: snapshot=json.loads(text[len('CONTEXT_SNAPSHOT_JSON '):])
+            except (ValueError,TypeError): continue
+            if isinstance(snapshot,list) and all(isinstance(item,str) for item in snapshot):
+                context=snapshot[-maximum:]; pending=None
+        elif text=='CONTEXT_BEGIN' or text.startswith('CONTEXT_BEGIN\n'):
+            pending=[]
+            for line in text.split('\n')[1:]:
+                if re.match(r'^(User|Assistant): ',line): pending.append(line)
+                elif pending: pending[-1]+='\n'+line
+        elif text.strip()=='CONTEXT_END' and pending is not None:
+            context=pending[-maximum:]; pending=None
+        continue
+    pending=None
+    if speaker=='remfan1994' and text.strip()==notice.strip(): continue
+    if text:
+        role='Assistant' if speaker in ('AI','OpenRouter','Assistant') else 'User'
+        context=(context+[role+': '+text])[-maximum:]
+for item in context: sys.stdout.buffer.write(item.encode('utf-8')+b'\0')
+PY_LOAD_CONTEXT
 }
 
 # ----------------------------------------------------------
@@ -1119,7 +1134,11 @@ load_context_from_session() { load_context_from_path "$SESSION"; }
 rebuild_context_from_session() {
   CONTEXT_BUFFER=()
   [ -f "$SESSION" ] || return 0
-  while IFS= read -r -d '' entry; do CONTEXT_BUFFER+=("$entry"); done < <(load_context_from_session)
+  local tmp entry
+  tmp="$(mktemp "${TMPDIR:-/tmp}/ttychatter.memory.XXXXXX")" || return 1
+  load_context_from_session > "$tmp" || { rm -f "$tmp"; return 1; }
+  while IFS= read -r -d '' entry; do CONTEXT_BUFFER+=("$entry"); done < "$tmp"
+  rm -f "$tmp"
 }
 
 # ----------------------------------------------------------
@@ -1128,10 +1147,9 @@ rebuild_context_from_session() {
 # behavior when logs become long or contain non-chat system messages.
 # ----------------------------------------------------------
 write_context_snapshot_to_path() {
-  local path="$1" ts="$2" item
-  printf '[%s] system: CONTEXT_BEGIN\n' "$ts" >> "$path"
-  for item in "${CONTEXT_BUFFER[@]}"; do printf '%s\n' "$item" >> "$path"; done
-  printf '[%s] system: CONTEXT_END\n' "$ts" >> "$path"
+  local path="$1" ts="$2" snapshot
+  snapshot="$(if [ "${#CONTEXT_BUFFER[@]}" -gt 0 ]; then printf '%s\0' "${CONTEXT_BUFFER[@]}"; fi | python3 -c 'import json,sys; raw=sys.stdin.buffer.read(); print(json.dumps([x.decode("utf-8", "replace") for x in raw.split(b"\0")[:-1]] if raw else [],ensure_ascii=True))')" || return 1
+  printf '[%s] system: CONTEXT_SNAPSHOT_JSON %s\n' "$ts" "$snapshot" >> "$path"
 }
 
 # ----------------------------------------------------------
@@ -1150,7 +1168,7 @@ write_context_snapshot() { write_context_snapshot_to_path "$SESSION" "$1"; }
 # ----------------------------------------------------------
 show_memory_command() {
   local name path
-  name="$(sanitize_session_name "$1")"; path="$(resolve_session_path "$name")"
+  name="$1"; path="$(resolve_session_arg "$name")" || return 1
   [ -f "$path" ] || { printf 'ERROR: session not found: %s\n' "$name" >&2; return 1; }
   while IFS= read -r -d '' entry; do printf '%s\n' "$entry"; done < <(load_context_from_path "$path")
 }
@@ -1163,7 +1181,7 @@ show_memory_command() {
 # ----------------------------------------------------------
 edit_memory_command() {
   local name path tmp editor
-  name="$(sanitize_session_name "$1")"; path="$(resolve_session_path "$name")"
+  name="$1"; path="$(resolve_session_arg "$name")" || return 1
   [ -f "$path" ] || { printf 'ERROR: session not found: %s\n' "$name" >&2; return 1; }
   tmp="$(mktemp)"
   while IFS= read -r -d '' entry; do printf '%s\n' "$entry" >> "$tmp"; done < <(load_context_from_path "$path")
@@ -1181,7 +1199,7 @@ edit_memory_command() {
 # ----------------------------------------------------------
 clear_memory_command() {
   local name path
-  name="$(sanitize_session_name "$1")"; path="$(resolve_session_path "$name")"
+  name="$1"; path="$(resolve_session_arg "$name")" || return 1
   [ -f "$path" ] || { printf 'ERROR: session not found: %s\n' "$name" >&2; return 1; }
   CONTEXT_BUFFER=(); write_context_snapshot_to_path "$path" "$(timestamp)"
   printf 'cleared memory snapshot for session: %s\n' "$name"
@@ -1226,11 +1244,14 @@ fetch_models_live_json() {
 # behind casual screen navigation.
 # ----------------------------------------------------------
 update_models_cache() {
-  local json
-  mkdir -p "$(dirname "$MODEL_CACHE_FILE")" 2>/dev/null || true
-  json="$(fetch_models_live_json)" || return 1
-  printf '%s' "$json" > "$MODEL_CACHE_FILE"
-  chmod 600 "$MODEL_CACHE_FILE" 2>/dev/null || true
+  local tmp
+  mkdir -p "$(dirname "$MODEL_CACHE_FILE")" || return 1
+  tmp="$(mktemp "${MODEL_CACHE_FILE}.tmp.XXXXXX")" || return 1
+  if ! fetch_models_live_json > "$tmp"; then rm -f "$tmp"; return 1; fi
+  if ! python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if isinstance(d,dict) and isinstance(d.get("data"),list) and not d.get("error") else 1)' "$tmp" 2>/dev/null; then
+    rm -f "$tmp"; printf '%s\n' 'Invalid model catalog; existing cache preserved.' >&2; return 1
+  fi
+  mv "$tmp" "$MODEL_CACHE_FILE" || { rm -f "$tmp"; return 1; }
   printf 'updated model cache: %s\n' "$MODEL_CACHE_FILE" >&2
 }
 
@@ -1275,6 +1296,10 @@ raw=sys.stdin.read()
 try: data=json.loads(raw)
 except Exception as exc:
     print(f"ERROR: could not parse OpenRouter model-list JSON: {exc}", file=sys.stderr); sys.exit(1)
+if not isinstance(data, dict):
+    print("invalid JSON response: expected an object")
+    sys.exit(1)
+
 if "error" in data:
     err=data["error"]
     if isinstance(err, dict):
@@ -1375,13 +1400,15 @@ print_models() { local json; json="$(models_json_for_display)" || return 1; prin
 make_openrouter_payload() {
   local model="$1"
   shift
+  normalize_web_options
   python3 -c '
 import base64, json, mimetypes, os, sys
 from pathlib import Path
 
 max_bytes = int(sys.argv[1])
 model = sys.argv[2]
-files = sys.argv[3:]
+web, engine, results, uses, session_id = sys.argv[3:8]
+files = sys.argv[8:]
 text = sys.stdin.read()
 
 text_exts = {
@@ -1427,8 +1454,21 @@ payload = {
     "model": model,
     "messages": [{"role": "user", "content": content}]
 }
+if session_id:
+    payload["session_id"] = session_id
+if web.lower() in ("1", "true", "yes", "on", "y"):
+    count = int(results)
+    if engine == "perplexity" and count > 20:
+        count = 20
+    parameters = {"engine": engine}
+    if count > 0:
+        parameters["max_results"] = count
+    payload["tools"] = [{"type": "openrouter:web_search", "parameters": parameters}]
+    search_rounds = int(uses)
+    if search_rounds > 0:
+        payload["max_tool_calls"] = min(search_rounds, 25)
 print(json.dumps(payload, ensure_ascii=False))
-' "$MAX_ATTACHMENT_BYTES" "$model" "$@"
+' "$MAX_ATTACHMENT_BYTES" "$model" "$WEB_SEARCH" "$WEB_SEARCH_ENGINE" "$WEB_SEARCH_MAX_RESULTS" "$WEB_SEARCH_MAX_USES" "${SESSION_ID:-}" "$@"
 }
 # ----------------------------------------------------------
 # MAINTAINER COMMENTARY: function parse_openrouter_response
@@ -1437,17 +1477,21 @@ print(json.dumps(payload, ensure_ascii=False))
 # when behavior changes.
 # ----------------------------------------------------------
 parse_openrouter_response() {
-  local response_file status
-  response_file="$(mktemp "${TMPDIR:-/tmp}/ttychatter.response.XXXXXX")" || return 1
-  cat > "$response_file"
-  python3 - "$ATTACHMENT_DIR" "$SESSION_NAME" "$AI_FILE_DOWNLOAD_MODE" "$response_file" <<'PY_PARSE_OPENROUTER_RESPONSE'
-import base64, json, mimetypes, os, re, sys, urllib.request
+  local response_file="${1:-}" status owns_temp=0
+  if [ -z "$response_file" ]; then
+    response_file="$(mktemp "${TMPDIR:-/tmp}/ttychatter.response.XXXXXX")" || return 1
+    owns_temp=1
+    cat > "$response_file"
+  fi
+  python3 - "$ATTACHMENT_DIR" "$SESSION_NAME" "$AI_FILE_DOWNLOAD_MODE" "$response_file" "${SESSION:-}" <<'PY_PARSE_OPENROUTER_RESPONSE'
+import base64, json, mimetypes, os, re, sys, time, urllib.request
 from pathlib import Path
 
 attachment_dir = sys.argv[1]
 session_name = sys.argv[2] or "model-test"
 mode = (sys.argv[3] or "ask").lower()
 response_file = sys.argv[4]
+session_path = sys.argv[5]
 try:
     raw = Path(response_file).read_text(encoding="utf-8", errors="replace")
 except Exception as exc:
@@ -1575,6 +1619,38 @@ for key in ("files", "attachments", "output_files", "artifacts"):
 
 text = "\n".join(t for t in texts if t is not None)
 
+# URL annotations are sources, never downloadable assistant files.
+annotations=[]
+for owner in [data] + [x.get("message") or {} for x in data.get("choices",[]) if isinstance(x,dict)]:
+    if isinstance(owner,dict) and isinstance(owner.get("annotations"),list):
+        annotations.extend(owner["annotations"])
+sources=[]; seen=set()
+for item in annotations:
+    if not isinstance(item,dict) or item.get("type") != "url_citation": continue
+    citation=item.get("url_citation") or item
+    if not isinstance(citation,dict): continue
+    url=citation.get("url")
+    if not isinstance(url,str) or not url.startswith(("https://","http://")) or url in seen: continue
+    seen.add(url)
+    title=citation.get("title") or url
+    title=" ".join(str(title).split())
+    sources.append("[%d] %s - %s" % (len(sources)+1,title,url))
+if sources:
+    text=text.rstrip()+"\n\nSources:\n"+"\n".join(sources)
+if session_path and os.path.isfile(session_path):
+    meta={k:data[k] for k in ("id","model","usage","provider","service_tier") if k in data}
+    if annotations: meta["annotations"]=annotations
+    messages=[x.get("message") or {} for x in data.get("choices",[]) if isinstance(x,dict)]
+    reasoning=[m["reasoning_details"] for m in messages if isinstance(m,dict) and m.get("reasoning_details")]
+    if reasoning: meta["reasoning_details"]=reasoning
+    if meta:
+        try:
+            with open(session_path,"a",encoding="utf-8") as log:
+                log.write("[%s] system: openrouter-response: %s\n" % (time.strftime("%H:%M:%S"),json.dumps(meta,ensure_ascii=True,separators=(",",":"))))
+        except OSError as exc:
+            print("Response received, but metadata could not be saved: "+str(exc),file=sys.stderr)
+
+
 def leaf(name):
     base = os.path.basename(name or "assistant-file") or "assistant-file"
     base = re.sub(r"[^A-Za-z0-9._-]+", "-", base).strip(".-_") or "assistant-file"
@@ -1663,7 +1739,7 @@ if not text.strip():
 print(text)
 PY_PARSE_OPENROUTER_RESPONSE
   status=$?
-  rm -f "$response_file"
+  [ "$owns_temp" -eq 0 ] || rm -f "$response_file"
   return "$status"
 }
 # ----------------------------------------------------------
@@ -1674,7 +1750,7 @@ PY_PARSE_OPENROUTER_RESPONSE
 call_openrouter_model() {
   local model="$1" prompt="$2" timeout="${3:-120}"; shift 3 || true
   local attachments=("$@") clean_model response curl_status output parse_status
-  local body_file err_file http_code
+  local body_file err_file payload_file http_code
   if truthy "$DEMO_MODE"; then demo_ai_response "$prompt"; return 0; fi
   if truthy "$STREAM"; then
     call_openrouter_model_stream "$model" "$prompt" "$timeout" "${attachments[@]}"
@@ -1686,9 +1762,11 @@ call_openrouter_model() {
   body_file="$(mktemp "${TMPDIR:-/tmp}/ttychatter.openrouter.body.XXXXXX")" || return 1
   err_file="$(mktemp "${TMPDIR:-/tmp}/ttychatter.openrouter.err.XXXXXX")" || { rm -f "$body_file"; return 1; }
 
+  payload_file="$(mktemp "${TMPDIR:-/tmp}/ttychatter.openrouter.payload.XXXXXX")" || { rm -f "$body_file" "$err_file" "$payload_file"; return 1; }
+  if ! printf '%s' "$prompt" | make_openrouter_payload "$clean_model" "${attachments[@]}" > "$payload_file"; then
+    rm -f "$body_file" "$err_file" "$payload_file"; return 1
+  fi
   http_code="$(
-    printf '%s' "$prompt" |
-      make_openrouter_payload "$clean_model" "${attachments[@]}" |
       curl -sS --max-time "$timeout" \
         -o "$body_file" \
         -w "%{http_code}" \
@@ -1696,16 +1774,16 @@ call_openrouter_model() {
         -H "Authorization: Bearer $OPENROUTER_API_KEY" \
         -H "HTTP-Referer: https://github.com/remfan1994/ttychatter" \
         -H "X-Title: ttychatter" \
-        -d @- \
+        -d "@$payload_file" \
         "https://openrouter.ai/api/v1/chat/completions" \
         2>"$err_file"
   )"
   curl_status=$?
-  response="$(cat "$body_file" 2>/dev/null || true)"
+  response="$(head -c 4096 "$body_file" 2>/dev/null || true)"
 
   if [ "$curl_status" -ne 0 ]; then
     printf 'curl error (%s): %s\n' "$curl_status" "$(cat "$err_file" 2>/dev/null)"
-    rm -f "$body_file" "$err_file"
+    rm -f "$body_file" "$err_file" "$payload_file"
     return 1
   fi
 
@@ -1717,19 +1795,19 @@ call_openrouter_model() {
       else
         printf 'OpenRouter HTTP error %s with empty response body\n' "$http_code"
       fi
-      rm -f "$body_file" "$err_file"
+      rm -f "$body_file" "$err_file" "$payload_file"
       return 1
       ;;
   esac
 
   if [ -z "$response" ]; then
     printf 'OpenRouter returned HTTP %s with an empty response body\n' "$http_code"
-    rm -f "$body_file" "$err_file"
+    rm -f "$body_file" "$err_file" "$payload_file"
     return 1
   fi
 
-  output="$(printf '%s' "$response" | parse_openrouter_response)"; parse_status=$?
-  rm -f "$body_file" "$err_file"
+  output="$(parse_openrouter_response "$body_file")"; parse_status=$?
+  rm -f "$body_file" "$err_file" "$payload_file"
   printf '%s\n' "$output"; return "$parse_status"
 }
 # ==========================================================
@@ -1892,8 +1970,14 @@ def repl(m):
     if len([line for line in content.splitlines() if line.strip()]) < min_lines:
         return m.group(0)
     raw=(m.group(1) or "text").strip().lower(); lang=safe_tag(raw); ext=ext_map.get(raw,ext_map.get(lang,".txt")); num=next_number(lang,ext)
-    filename=f"{session_name}-{lang}-{num:02d}{ext}"; path=os.path.join(attachment_dir,filename); os.makedirs(attachment_dir,exist_ok=True)
-    with open(path,"w",encoding="utf-8") as fh: fh.write(content)
+    os.makedirs(attachment_dir,exist_ok=True)
+    while True:
+        filename=f"{session_name}-{lang}-{num:02d}{ext}"; path=os.path.join(attachment_dir,filename)
+        try:
+            with open(path,"x",encoding="utf-8") as fh: fh.write(content)
+            break
+        except FileExistsError:
+            num+=1
     return f"\n[attachment saved]\nfile: {filename}\nlocation: {attachment_dir}\n"
 print(pattern.sub(repl,text))
 ' "$ATTACHMENT_DIR" "$SESSION_NAME" "$CODE_ATTACHMENT_MIN_LINES"
@@ -1986,6 +2070,7 @@ Files and editor:
   :editor                       Compose a prompt in external editor and send it
   :turns                        List message numbers in the current session
   :branch N                     Create a branch after message N
+  :web [on|off|status]                 Show/toggle OpenRouter web search
   :stream on|off                Toggle streaming token display
   :ai-download MODE             AI file receipt: ask, auto, metadata, off
   :status on|off                Toggle local status/progress output
@@ -2000,37 +2085,7 @@ Notes:
 EOF
 }
 
-rename_current_session() {
-  local new_name="$1"
-  local clean_name new_path old_path
 
-  if [ -z "$new_name" ]; then
-    printf '%s\n' "usage: :rename NEW_SESSION_NAME"
-    return 1
-  fi
-
-  clean_name="$(sanitize_session_name "$new_name")"
-  new_path="$(resolve_session_path "$clean_name")"
-  old_path="$SESSION"
-
-  if [ "$new_path" = "$old_path" ]; then
-    printf 'session already named: %s\n' "$clean_name"
-    return 0
-  fi
-
-  if [ -e "$new_path" ]; then
-    printf 'cannot rename: target session already exists: %s\n' "$clean_name"
-    return 1
-  fi
-
-  if [ -f "$old_path" ]; then
-    mv "$old_path" "$new_path" || return 1
-  fi
-
-  SESSION_NAME="$clean_name"
-  SESSION="$new_path"
-  printf 'current session renamed to: %s\n' "$SESSION_NAME"
-}
 
 show_current_memory_runtime() {
   local item
@@ -2104,9 +2159,19 @@ ACTIVE_MODEL="$(effective_model)"
     AI_FILE_DOWNLOAD_MODE|AI_DOWNLOAD)
       AI_FILE_DOWNLOAD_MODE="$value"
       ;;
+    WEB_SEARCH) WEB_SEARCH="$value" ;;
+    WEB_SEARCH_ENGINE) WEB_SEARCH_ENGINE="$value" ;;
+    WEB_SEARCH_MAX_RESULTS) WEB_SEARCH_MAX_RESULTS="$value" ;;
+    WEB_SEARCH_MAX_USES) WEB_SEARCH_MAX_USES="$value" ;;
+    PROMPT_SESSION_NAME) PROMPT_SESSION_NAME="$value" ;;
     MODEL_TEST_PROMPT)
       MODEL_TEST_PROMPT="$value"
       ;;
+    SEND_INPUT) SEND_INPUT="$value" ;;
+    STREAM) STREAM="$value" ;;
+    SESSION_AUTO_TITLE) SESSION_AUTO_TITLE="$value" ;;
+    SESSION_TITLE_MODEL) SESSION_TITLE_MODEL="$value" ;;
+    SESSION_TITLE_MAX_WORDS) SESSION_TITLE_MAX_WORDS="$value" ;;
     STARTUP_NOTICE)
       STARTUP_NOTICE="$value"
       ;;
@@ -2119,25 +2184,198 @@ ACTIVE_MODEL="$(effective_model)"
 # PARITY: SESSION TITLES, STREAMING, VOICE, BRANCHING, EXPORT
 # ==========================================================
 
-resolve_session_arg() {
+
+# Web search uses OpenRouter's server tool. No local tool execution is needed.
+normalize_web_options() {
+  case "$WEB_SEARCH_ENGINE" in auto|native|exa|parallel|perplexity|firecrawl) ;; *) WEB_SEARCH_ENGINE=auto ;; esac
+  case "$WEB_SEARCH_MAX_RESULTS" in ''|*[!0-9]*) WEB_SEARCH_MAX_RESULTS=5 ;; esac
+  case "$WEB_SEARCH_MAX_USES" in ''|*[!0-9]*) WEB_SEARCH_MAX_USES=3 ;; esac
+  [ "${#WEB_SEARCH_MAX_RESULTS}" -le 2 ] || WEB_SEARCH_MAX_RESULTS=5
+  [ "${#WEB_SEARCH_MAX_USES}" -le 2 ] || WEB_SEARCH_MAX_USES=3
+  WEB_SEARCH_MAX_RESULTS=$((10#$WEB_SEARCH_MAX_RESULTS))
+  WEB_SEARCH_MAX_USES=$((10#$WEB_SEARCH_MAX_USES))
+  [ "$WEB_SEARCH_MAX_RESULTS" -ge 0 ] && [ "$WEB_SEARCH_MAX_RESULTS" -le 25 ] || WEB_SEARCH_MAX_RESULTS=5
+  [ "$WEB_SEARCH_MAX_USES" -ge 0 ] && [ "$WEB_SEARCH_MAX_USES" -le 25 ] || WEB_SEARCH_MAX_USES=3
+}
+
+web_status() {
+  if truthy "$WEB_SEARCH"; then
+    printf 'web search: on (engine=%s, results=%s, uses=%s; provider charges may apply)\n' "$WEB_SEARCH_ENGINE" "$WEB_SEARCH_MAX_RESULTS" "$WEB_SEARCH_MAX_USES"
+  else
+    printf '%s\n' 'web search: off; use :web on to enable'
+  fi
+}
+
+web_command() {
   case "$1" in
-    */*|*.log) printf '%s\n' "$(expand_path "$1")" ;;
-    *) printf '%s/%s.log\n' "$SESSION_DIR" "$(sanitize_session_name "$1")" ;;
+    on|1|yes|true) WEB_SEARCH=1 ;;
+    off|0|no|false) WEB_SEARCH=0 ;;
+    ''|status) ;;
+    *) printf '%s\n' 'usage: :web [on|off|status]'; return 1 ;;
   esac
+  normalize_web_options
+  web_status
+}
+
+# Titles and IDs are separate. A rename never changes request session_id.
+manual_session_title_clean() {
+  printf '%s' "$1" | LC_ALL=C tr '\r\n\t' '   ' | LC_ALL=C tr -d '\000-\010\013\014\016-\037\177' | awk '{gsub(/[[:space:]]+/," "); sub(/^ /,""); sub(/ $/,""); if(length($0)>200) $0=substr($0,1,200); if(length($0)) print}'
+}
+
+absolute_session_path() {
+  local dir
+  dir="$(cd "$(dirname "$1")" && pwd -P)" || return 1
+  printf '%s/%s\n' "$dir" "$(basename "$1")"
+}
+
+emit_session_path() { printf 'session: %s\n' "$(absolute_session_path "$SESSION")" >&2; }
+
+session_id_from_file() {
+  [ -f "$1" ] || return 1
+  LC_ALL=C awk '/^\[[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\] system: session-id: [0-9a-f]+$/ { id=$NF; if(length(id)==32) { print id; found=1; exit } } END { if(!found) exit 1 }' "$1"
+}
+
+ensure_session_id() {
+  local path="$1" id
+  id="$(session_id_from_file "$path" 2>/dev/null)"
+  if [ -z "$id" ]; then
+    id="$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
+    [ "${#id}" -eq 32 ] || { printf '%s\n' 'cannot generate a private session ID' >&2; return 1; }
+    if [ -s "$path" ] && [ "$(tail -c 1 "$path" | od -An -tu1 | tr -d ' ')" != 10 ]; then printf '\n' >> "$path" || return 1; fi
+    printf '[%s] system: session-id: %s\n' "$(timestamp)" "$id" >> "$path" || return 1
+  fi
+  printf '%s\n' "$id"
+}
+
+# Reserve with a hard link so an existing destination is never overwritten.
+# Both paths are in the same directory; symlink sources are left untouched.
+set_session_title() {
+  local path="$1" title="$2" rename_file="${3:-1}" clean id slug dir target old_title old_stem n=0
+  clean="$(manual_session_title_clean "$title")"
+  [ -n "$clean" ] || { printf '%s\n' 'session name must contain visible text' >&2; return 1; }
+  [ -f "$path" ] || { printf 'session not found: %s\n' "$path" >&2; return 1; }
+  [ ! -L "$path" ] || { printf '%s\n' 'rename refused: session path is a symbolic link' >&2; return 1; }
+  id="$(ensure_session_id "$path")" || return 1
+  old_title="$(session_title_from_file "$path" 2>/dev/null || true)"
+  old_stem="$(basename "$path" .log)"
+  target="$path"
+  if [ "$rename_file" -eq 1 ]; then
+    slug="$(sanitize_session_name "$clean")"; slug="${slug:0:80}"
+    dir="$(dirname "$path")"
+    target="$dir/$slug--${id:0:12}.log"
+    if [ "$target" != "$path" ]; then
+      while ! ln -T "$path" "$target" 2>/dev/null; do
+        if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+          printf 'cannot rename session to %s; original preserved\n' "$target" >&2; return 1
+        fi
+        n=$((n+1))
+        [ "$n" -le 9999 ] || { printf '%s\n' 'no free session filename' >&2; return 1; }
+        target="$(printf '%s/%s--%s-%03d.log' "$dir" "$slug" "${id:0:12}" "$n")"
+        [ "$target" = "$path" ] && break
+      done
+    fi
+  fi
+  if { [ "$old_stem" != "$clean" ] && ! write_session_alias_metadata "$target" "$old_stem"; } ||
+     { [ -n "$old_title" ] && [ "$old_title" != "$clean" ] && [ "$old_title" != "$old_stem" ] && ! write_session_alias_metadata "$target" "$old_title"; }; then
+    [ "$target" = "$path" ] || rm -f "$target"
+    return 1
+  fi
+  if ! write_session_title_metadata "$target" "$clean"; then
+    [ "$target" = "$path" ] || rm -f "$target"
+    return 1
+  fi
+  if [ "$target" != "$path" ]; then
+    if ! rm "$path"; then
+      printf 'could not remove old log name; saved log is also at %s\n' "$target" >&2
+      return 1
+    fi
+  fi
+  RENAMED_SESSION_PATH="$target"
+  if [ "${SESSION:-}" = "$path" ]; then
+    SESSION="$target"; SESSION_NAME="$(basename "$target" .log)"; SESSION_ID="$id"
+  fi
+}
+
+session_needs_name() {
+  [ -z "$(session_title_from_file "$SESSION" 2>/dev/null)" ] || return 1
+  case "$(basename "$SESSION" .log)" in session|session-[0-9]*|[0-9][0-9][0-9][0-9]-[0-9]*|[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]*) return 0 ;; *) return 1 ;; esac
+}
+
+maybe_prompt_session_name() {
+  truthy "$PROMPT_SESSION_NAME" || return 0
+  [ -t 0 ] && [ -t 2 ] || return 0
+  [ -z "$PROMPT_TEXT" ] && [ -z "$INPUT_FILE" ] && [ -z "$VOICE_INPUT_PATH" ] || return 0
+  session_needs_name || return 0
+  local answer
+  printf '\nSESSION NAME NEEDED: %s\nName this conversation [Enter to defer]: ' "$(basename "$SESSION")" >&2
+  IFS= read -r answer || return 0
+  [ -n "$(manual_session_title_clean "$answer")" ] || return 0
+  set_session_title "$SESSION" "$answer" "$((1-SESSION_FIXED_PATH))" || return 0
+  printf 'Session saved as: %s\n\n' "$SESSION" >&2
+}
+
+show_session_name() {
+  local title
+  title="$(session_title_from_file "$SESSION" 2>/dev/null)"
+  if [ -n "$title" ]; then printf 'session name: %s\n' "$title"
+  elif session_needs_name; then printf '%s\n' 'SESSION NAME: unnamed. Use :rename Your session name.'
+  else printf 'session name: %s\n' "$SESSION_NAME"; fi
+}
+
+resolve_session_arg() {
+  local name="$1" path fallback result file
+  local -a candidates=() matches=()
+  case "$name" in
+    */*)
+      path="${name/#\~/$HOME}"
+      [ ! -L "$path" ] || { printf 'session path is a symbolic link: %s\n' "$path" >&2; return 1; }
+      printf '%s\n' "$path"; return 0 ;;
+    *.log)
+      if [ -f "$name" ] || [ -L "$name" ]; then path="$name"; else path="$SESSION_DIR/$name"; fi ;;
+    *) path="$SESSION_DIR/$(sanitize_session_name "$name").log" ;;
+  esac
+  [ ! -L "$path" ] || { printf 'session path is a symbolic link: %s\n' "$path" >&2; return 1; }
+  if [ -f "$path" ]; then printf '%s\n' "$path"; return 0; fi
+  fallback="$path"
+  for file in "$SESSION_DIR"/*.log; do
+    [ -f "$file" ] && [ ! -L "$file" ] && [ -r "$file" ] && candidates+=("$file")
+  done
+  if [ "${#candidates[@]}" -gt 0 ]; then
+    result="$(TTYCHATTER_LOOKUP="$name" TTYCHATTER_LOOKUP_STEM="${name%.log}" LC_ALL=C awk '
+      function flush() {
+        if (file!="" && (alias || title==ENVIRON["TTYCHATTER_LOOKUP"] || title==ENVIRON["TTYCHATTER_LOOKUP_STEM"])) print file;
+      }
+      FNR==1 { flush(); file=FILENAME; title=""; alias=0; }
+      /^\[[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\] system: session-title:/ {
+        title=$0; sub(/^\[[^]]*\] system: session-title: ?/,"",title);
+      }
+      /^\[[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\] system: session-alias:/ {
+        value=$0; sub(/^\[[^]]*\] system: session-alias: ?/,"",value);
+        if (value==ENVIRON["TTYCHATTER_LOOKUP"] || value==ENVIRON["TTYCHATTER_LOOKUP_STEM"]) alias=1;
+      }
+      END { flush(); }
+    ' "${candidates[@]}")" || return 1
+    if [ -n "$result" ]; then
+      mapfile -t matches <<< "$result"
+      if [ "${#matches[@]}" -ne 1 ]; then
+        printf 'ambiguous session name: %s; use a filename from --list\n' "$name" >&2; return 2
+      fi
+      printf '%s\n' "${matches[0]}"; return 0
+    fi
+  fi
+  printf '%s\n' "$fallback"
 }
 
 default_session_name_unique() {
-  local base name path n
+  local base name path n=0
   base="session-$(date +%Y-%m-%d-%H-%M-%S)"
   name="$base"
-  path="$(resolve_session_path "$name")"
-  n=1
-  while [ -e "$path" ]; do
-    name="$(printf '%s-%03d' "$base" "$n")"
+  while true; do
     path="$(resolve_session_path "$name")"
-    n=$((n+1))
+    if (set -o noclobber; : > "$path") 2>/dev/null; then printf '%s\n' "$name"; return 0; fi
+    [ -e "$path" ] || [ -L "$path" ] || { printf 'cannot create session in %s\n' "$SESSION_DIR" >&2; return 1; }
+    n=$((n+1)); name="$(printf '%s-%03d' "$base" "$n")"
   done
-  printf '%s\n' "$name"
 }
 
 session_title_clean() {
@@ -2149,24 +2387,34 @@ session_title_clean() {
 }
 
 session_title_from_file() {
-  local path="$1" raw
-  [ -f "$path" ] || return 1
-  raw="$(awk '{ line=$0; if (line ~ /[Ss][Ee][Ss][Ss][Ii][Oo][Nn]-[Tt][Ii][Tt][Ll][Ee][[:space:]]*:/) { sub(/^.*[Ss][Ee][Ss][Ss][Ii][Oo][Nn]-[Tt][Ii][Tt][Ll][Ee][[:space:]]*:[[:space:]]*/, "", line); val=line } } END { if (val != "") print val; else exit 1 }' "$path")" || return 1
-  session_title_clean "$raw" "$SESSION_TITLE_MAX_WORDS"
+  [ -f "$1" ] || return 1
+  LC_ALL=C awk '/^\[[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\] system: session-title:/ { line=$0; sub(/^\[[^]]*\] system: session-title:[[:space:]]*/,"",line); value=line } END { if(value!="") print value; else exit 1 }' "$1"
 }
+write_session_alias_metadata() {
+  local path="$1" alias="$2"
+  [ -n "$alias" ] || return 0
+  if TTYCHATTER_ALIAS="$alias" LC_ALL=C awk '
+    /^\[[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\] system: session-alias:/ {
+      value=$0; sub(/^\[[^]]*\] system: session-alias: ?/,"",value);
+      if (value==ENVIRON["TTYCHATTER_ALIAS"]) found=1;
+    }
+    END { exit !found; }
+  ' "$path"; then return 0; fi
+  printf '[%s] system: session-alias: %s\n' "$(timestamp)" "$alias" >> "$path"
+}
+
 write_session_title_metadata() {
-  local path="$1" title="$2" clean
-  clean="$(session_title_clean "$title" "$SESSION_TITLE_MAX_WORDS")"
+  local clean
+  clean="$(manual_session_title_clean "$2")" || return 1
   [ -n "$clean" ] || return 1
-  mkdir -p "$(dirname "$path")"
-  printf '[%s] system: session-title: %s\n' "$(timestamp)" "$clean" >> "$path"
+  printf '[%s] system: session-title: %s\n' "$(timestamp)" "$clean" >> "$1"
 }
 
 ensure_prechat_line() {
   local path="$1"
   mkdir -p "$(dirname "$path")"
   if [ ! -s "$path" ]; then
-    printf '%s\n' "$TC_PRECHAT_LINE" > "$path"
+    printf '%s\n' "$TC_PRECHAT_LINE" >> "$path"
   fi
 }
 
@@ -2189,20 +2437,16 @@ list_sessions() {
 
 rename_session_command() {
   local target="$1" title="$2" path
-  [ -n "$target" ] && [ -n "$title" ] || { printf '%s\n' "ERROR: --rename-session requires SESSION TITLE" >&2; return 2; }
-  path="$(resolve_session_arg "$target")"
-  [ -f "$path" ] || { printf 'ERROR: session not found: %s\n' "$target" >&2; return 1; }
-  ensure_prechat_line "$path"
-  write_session_title_metadata "$path" "$title" || return 1
-  printf 'session title set: %s\n' "$(session_title_from_file "$path" 2>/dev/null || printf '%s' "$title")"
+  [ -n "$target" ] && [ -n "$title" ] || { printf '%s\n' 'ERROR: --rename-session requires SESSION TITLE' >&2; return 2; }
+  path="$(resolve_session_arg "$target")" || return 1
+  set_session_title "$path" "$title" || return 1
+  printf 'session name: %s\nsession: %s\n' "$(session_title_from_file "$RENAMED_SESSION_PATH")" "$(absolute_session_path "$RENAMED_SESSION_PATH")"
 }
 
 rename_current_session() {
-  local title="$1"
-  [ -n "$title" ] || { printf '%s\n' "usage: :rename NEW_TITLE"; return 1; }
-  ensure_prechat_line "$SESSION"
-  write_session_title_metadata "$SESSION" "$title" || return 1
-  printf 'session title set: %s\n' "$(session_title_from_file "$SESSION" 2>/dev/null || printf '%s' "$title")"
+  [ -n "$1" ] || { printf '%s\n' 'usage: :rename Your session name'; return 1; }
+  set_session_title "$SESSION" "$1" || return 1
+  printf 'session name: %s\nsession: %s\n' "$(session_title_from_file "$SESSION")" "$SESSION"
 }
 
 status_update() {
@@ -2234,7 +2478,7 @@ run_voice_output_command() {
 }
 
 maybe_generate_session_title() {
-  local path="$1" user_text="$2" ai_text="$3" prompt title saved_stream
+  local path="$1" user_text="$2" ai_text="$3" prompt title saved_stream saved_web
   truthy "$SESSION_AUTO_TITLE" || return 0
   [ -n "$path" ] || return 0
   [ -n "$(session_title_from_file "$path" 2>/dev/null || true)" ] && return 0
@@ -2244,59 +2488,51 @@ maybe_generate_session_title() {
     [ -n "$OPENROUTER_API_KEY" ] || return 0
     [ -n "$SESSION_TITLE_MODEL" ] || return 0
     prompt="Generate a concise topical title for this ttychatter session. Reply with only the title, no quotes, no explanation, maximum $SESSION_TITLE_MAX_WORDS words.\n\nUser: $user_text\nAssistant: $ai_text"
-    saved_stream="$STREAM"; STREAM=0
+    saved_stream="$STREAM"; saved_web="$WEB_SEARCH"; STREAM=0; WEB_SEARCH=0
     title="$(call_openrouter_model "$SESSION_TITLE_MODEL" "$prompt" 60 2>/dev/null | head -n 1)"
-    STREAM="$saved_stream"
+    STREAM="$saved_stream"; WEB_SEARCH="$saved_web"
     title="$(session_title_clean "$title" "$SESSION_TITLE_MAX_WORDS")"
   fi
-  [ -n "$title" ] && write_session_title_metadata "$path" "$title"
+  if [ -n "$title" ]; then set_session_title "$path" "$title" "$((1-SESSION_FIXED_PATH))"; fi
 }
 
 call_openrouter_model_stream() {
   local model="$1" prompt="$2" timeout="${3:-120}"; shift 3 || true
-  local attachments=("$@") clean_model payload_file status
+  local attachments=("$@") clean_model payload_file status tty_input=0
+  require_api_key || return 1
   clean_model="$(normalize_model_id "$model")"
   payload_file="$(mktemp "${TMPDIR:-/tmp}/ttychatter.stream.payload.XXXXXX")" || return 1
   printf '%s' "$prompt" | make_openrouter_payload "$clean_model" "${attachments[@]}" > "$payload_file" || { rm -f "$payload_file"; return 1; }
-  python3 - "$OPENROUTER_API_KEY" "$payload_file" "$timeout" <<'PY_STREAM'
-import json, os, select, sys, termios, urllib.request, urllib.error
-api_key, payload_path, timeout = sys.argv[1], sys.argv[2], float(sys.argv[3])
+  [ -t 0 ] && tty_input=1
+  TTYCHATTER_REQUEST_KEY="$OPENROUTER_API_KEY" python3 - "$payload_file" "$timeout" "$tty_input" "${SESSION:-}" <<'PY_STREAM'
+import json, os, queue, select, sys, termios, threading, time, urllib.request, urllib.error
+payload_path, timeout, tty_input, session_path=sys.argv[1],float(sys.argv[2]),sys.argv[3],sys.argv[4]
+api_key=os.environ.pop('TTYCHATTER_REQUEST_KEY','')
 marker='[assistant stream interrupted by user]'
-with open(payload_path, 'r', encoding='utf-8') as fh:
-    payload=json.load(fh)
+with open(payload_path,'r',encoding='utf-8') as fh: payload=json.load(fh)
 payload['stream']=True
-body=json.dumps(payload).encode('utf-8')
-req=urllib.request.Request('https://openrouter.ai/api/v1/chat/completions', data=body, headers={
-    'Content-Type':'application/json',
-    'Authorization':'Bearer '+api_key,
-    'HTTP-Referer':'https://github.com/remfan1994/ttychatter',
-    'X-Title':'ttychatter',
+payload['stream_options']={'include_usage':True}
+req=urllib.request.Request('https://openrouter.ai/api/v1/chat/completions',data=json.dumps(payload).encode('utf-8'),headers={
+    'Content-Type':'application/json','Authorization':'Bearer '+api_key,
+    'HTTP-Referer':'https://github.com/remfan1994/ttychatter','X-Title':'ttychatter',
 })
-parts=[]
-cancelled=False
-tty_fh=None
-tty_fd=None
-old_attrs=None
+parts=[]; annotations=[]; metadata={}; cancelled=False; failure=None
+channel=queue.Queue(); stop=threading.Event(); tty_fh=None; tty_fd=None; old_attrs=None
 
 def open_tty():
-    global tty_fh, tty_fd, old_attrs
+    global tty_fh,tty_fd,old_attrs
+    if tty_input != '1': return
     try:
-        tty_fh=open('/dev/tty','rb', buffering=0)
-        tty_fd=tty_fh.fileno()
-        old_attrs=termios.tcgetattr(tty_fd)
-        attrs=list(old_attrs)
-        attrs[6]=list(old_attrs[6])
-        attrs[3] &= ~(termios.ICANON | termios.ECHO)
-        attrs[6][termios.VMIN]=0
-        attrs[6][termios.VTIME]=0
-        termios.tcsetattr(tty_fd, termios.TCSANOW, attrs)
-    except Exception:
-        close_tty()
+        tty_fh=open('/dev/tty','rb',buffering=0); tty_fd=tty_fh.fileno()
+        old_attrs=termios.tcgetattr(tty_fd); attrs=list(old_attrs); attrs[6]=list(old_attrs[6])
+        attrs[3] &= ~(termios.ICANON|termios.ECHO); attrs[6][termios.VMIN]=0; attrs[6][termios.VTIME]=0
+        termios.tcsetattr(tty_fd,termios.TCSANOW,attrs)
+    except Exception: close_tty()
 
 def close_tty():
-    global tty_fh, tty_fd, old_attrs
+    global tty_fh,tty_fd,old_attrs
     if tty_fd is not None and old_attrs is not None:
-        try: termios.tcsetattr(tty_fd, termios.TCSANOW, old_attrs)
+        try: termios.tcsetattr(tty_fd,termios.TCSANOW,old_attrs)
         except Exception: pass
     if tty_fh is not None:
         try: tty_fh.close()
@@ -2304,82 +2540,93 @@ def close_tty():
     tty_fh=None; tty_fd=None; old_attrs=None
 
 def esc_pressed():
-    if tty_fd is None:
-        return False
+    if tty_fd is None: return False
     try:
-        while True:
-            r,_,_=select.select([tty_fd], [], [], 0)
-            if not r:
-                return False
-            ch=os.read(tty_fd, 1)
-            if not ch:
-                return False
-            if ch == b'\x1b':
-                return True
-    except Exception:
-        return False
+        while select.select([tty_fd],[],[],0)[0]:
+            if os.read(tty_fd,1) == b'\x1b': return True
+    except Exception: pass
+    return False
 
-def response_fd(resp):
-    try: return resp.fileno()
-    except Exception: pass
-    try: return resp.fp.raw.fileno()
-    except Exception: pass
-    return None
+def reader():
+    # A single blocking reader avoids select() losing bytes buffered by TLS.
+    try:
+        with urllib.request.urlopen(req,timeout=timeout) as resp:
+            for raw in resp:
+                if stop.is_set(): break
+                line=raw.decode('utf-8','replace').strip()
+                if not line.startswith('data:'): continue
+                event=line[5:].strip()
+                if event == '[DONE]': channel.put(('done',None)); return
+                if not event: continue
+                try: obj=json.loads(event)
+                except Exception as exc: raise ValueError('invalid streaming JSON: '+str(exc))
+                channel.put(('data',obj))
+        channel.put(('eof',None))
+    except urllib.error.HTTPError as exc:
+        channel.put(('error','OpenRouter HTTP error %s: %s' % (exc.code,exc.read().decode('utf-8','replace'))))
+    except Exception as exc: channel.put(('error','streaming error: '+str(exc)))
+
+def collect(owner):
+    if not isinstance(owner,dict): return
+    if isinstance(owner.get('annotations'),list): annotations.extend(owner['annotations'])
+    for key in ('id','model','usage','provider','service_tier','reasoning_details'):
+        if owner.get(key) is not None: metadata[key]=owner[key]
 
 def append_piece(piece):
-    if isinstance(piece, str) and piece:
-        parts.append(piece)
-        sys.stderr.write(piece)
-        sys.stderr.flush()
+    if isinstance(piece,list):
+        for p in piece:
+            if isinstance(p,dict): append_piece(p.get('text'))
+    elif isinstance(piece,str) and piece:
+        parts.append(piece); sys.stderr.write(piece); sys.stderr.flush()
 
+open_tty(); deadline=time.monotonic()+timeout
+threading.Thread(target=reader,daemon=True).start()
 try:
-    open_tty()
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        fd=response_fd(resp)
-        while True:
-            if esc_pressed():
-                cancelled=True
-                break
-            if fd is not None:
-                r,_,_=select.select([fd], [], [], 0.1)
-                if not r:
-                    continue
-            raw=resp.readline()
-            if not raw:
-                break
-            line=raw.decode('utf-8','replace').strip()
-            if not line or not line.startswith('data:'):
-                continue
-            data=line[5:].strip()
-            if data == '[DONE]':
-                break
-            try:
-                obj=json.loads(data)
-            except Exception:
-                continue
-            for ch in obj.get('choices',[]) or []:
-                delta=ch.get('delta') or {}
-                piece=delta.get('content')
-                if piece is None:
-                    msg=ch.get('message') or {}
-                    piece=msg.get('content')
-                append_piece(piece)
-except urllib.error.HTTPError as exc:
-    sys.stderr.write('OpenRouter HTTP error %s: %s\n' % (exc.code, exc.read().decode('utf-8','replace')))
-    sys.exit(1)
-except Exception as exc:
-    sys.stderr.write('streaming error: %s\n' % exc)
-    sys.exit(1)
+    while True:
+        if esc_pressed(): cancelled=True; break
+        if time.monotonic() >= deadline: failure='stream request timed out'; break
+        try: kind,obj=channel.get(timeout=0.1)
+        except queue.Empty: continue
+        if kind == 'done': break
+        if kind == 'eof': failure='stream ended before [DONE]; partial reply preserved'; break
+        if kind == 'error': failure=obj; break
+        if not isinstance(obj,dict): failure='invalid stream event: expected an object'; break
+        collect(obj)
+        if obj.get('error'):
+            error=obj['error']; failure='OpenRouter API error: '+str(error.get('message',error) if isinstance(error,dict) else error); break
+        for choice in obj.get('choices',[]) or []:
+            if not isinstance(choice,dict): continue
+            delta=choice.get('delta') or choice.get('message') or {}; collect(delta)
+            append_piece(delta.get('content') if isinstance(delta,dict) else None)
 finally:
-    close_tty()
+    stop.set(); close_tty()
+seen=set(); sources=[]
+for item in annotations:
+    if not isinstance(item,dict) or item.get('type') != 'url_citation': continue
+    ref=item.get('url_citation') or item
+    if not isinstance(ref,dict): continue
+    url=ref.get('url')
+    if not isinstance(url,str) or not url.startswith(('https://','http://')) or url in seen: continue
+    seen.add(url); title=' '.join(str(ref.get('title') or url).split())
+    sources.append('[%d] %s - %s' % (len(sources)+1,title,url))
+if sources: append_piece('\n\nSources:\n'+'\n'.join(sources))
+if annotations: metadata['annotations']=annotations
+if cancelled: metadata['interrupted']=True
+if failure: metadata['error']=failure
+if metadata and session_path and os.path.isfile(session_path):
+    try:
+        with open(session_path,'a',encoding='utf-8') as fh:
+            fh.write('[%s] system: openrouter-response: %s\n' % (time.strftime('%H:%M:%S'),json.dumps(metadata,ensure_ascii=True,separators=(',',':'))))
+    except OSError as exc:
+        sys.stderr.write('Response received, but metadata could not be saved: '+str(exc)+'\n')
 if cancelled:
-    if parts and not ''.join(parts).endswith('\n'):
-        parts.append('\n')
-    parts.append(marker + '\n')
-    sys.stderr.write('\n' + marker + '\n')
-elif parts:
-    sys.stderr.write('\n')
-print(''.join(parts))
+    append_piece(('\n' if parts and not ''.join(parts).endswith('\n') else '')+marker+'\n')
+elif failure:
+    append_piece(('\n' if parts else '')+'[response error: '+failure+']\n')
+elif not parts: failure='OpenRouter returned an empty text response'; append_piece(failure+'\n')
+if parts: sys.stderr.write('\n')
+print(''.join(parts),end='')
+sys.exit(1 if failure else 0)
 PY_STREAM
   status=$?
   rm -f "$payload_file"
@@ -2388,10 +2635,10 @@ PY_STREAM
 
 turns_command() {
   local path="$1"
-  path="$(resolve_session_arg "$path")"
+  path="$(resolve_session_arg "$path")" || return 1
   [ -f "$path" ] || { printf 'session not found: %s\n' "$path" >&2; return 1; }
-  python3 - "$path" <<'PY_TURNS'
-import re, sys
+  TTYCHATTER_NOTICE="$TC_PRECHAT_LINE" python3 - "$path" <<'PY_TURNS'
+import os, re, sys
 path=sys.argv[1]
 pat=re.compile(r'^\[([0-9]{2}:[0-9]{2}:[0-9]{2})\] ([^:]+): ?(.*)$')
 entries=[]; speaker=None; buf=[]
@@ -2399,10 +2646,10 @@ def flush():
     global speaker, buf
     if speaker is None: return
     sp=speaker.strip()
-    if sp.lower()=='system' or sp=='remfan1994': return
+    if sp.lower()=='system': return
     role='assistant' if sp in {'AI','OpenRouter','Assistant'} else 'user'
     text='\n'.join(buf)
-    if text.startswith('CONTEXT_'): return
+    if sp=='remfan1994' and text.strip()==os.environ['TTYCHATTER_NOTICE'].strip(): return
     entries.append((role,text))
 with open(path,'r',encoding='utf-8',errors='replace') as fh:
     for raw in fh:
@@ -2425,14 +2672,14 @@ branch_session_command() {
   local source="$1" turn="$2" src branch name
   [ -n "$source" ] && [ -n "$turn" ] || { printf '%s\n' "usage: --branch SESSION TURN" >&2; return 2; }
   case "$turn" in ''|*[!0-9]*) printf '%s\n' "branch turn must be numeric" >&2; return 2 ;; esac
-  src="$(resolve_session_arg "$source")"
+  src="$(resolve_session_arg "$source")" || return 1
   [ -f "$src" ] || { printf 'session not found: %s\n' "$src" >&2; return 1; }
   name="$(default_session_name_unique)"
   branch="$(resolve_session_path "$name")"
   ensure_prechat_line "$branch"
   printf '[%s] system: branch-from: %s\n[%s] system: branch-turn: %s\n[%s] system: branch-reason: manual-branch\n' "$(timestamp)" "$src" "$(timestamp)" "$turn" "$(timestamp)" >> "$branch"
-  python3 - "$src" "$branch" "$turn" <<'PY_BRANCH'
-import re, sys
+  TTYCHATTER_NOTICE="$TC_PRECHAT_LINE" python3 - "$src" "$branch" "$turn" <<'PY_BRANCH'
+import os, re, sys
 src,dst,max_turn=sys.argv[1],sys.argv[2],int(sys.argv[3])
 pat=re.compile(r'^\[[0-9]{2}:[0-9]{2}:[0-9]{2}\] ([^:]+):')
 count=0; copying=False
@@ -2441,7 +2688,7 @@ with open(src,'r',encoding='utf-8',errors='replace') as r, open(dst,'a',encoding
         m=pat.match(line)
         if m:
             sp=m.group(1).strip()
-            real=not (sp.lower()=='system' or sp=='remfan1994')
+            real=not (sp.lower()=='system' or (sp=='remfan1994' and line[m.end():].strip()==os.environ['TTYCHATTER_NOTICE'].strip()))
             if real:
                 count += 1
                 if count > max_turn:
@@ -2453,14 +2700,15 @@ with open(src,'r',encoding='utf-8',errors='replace') as r, open(dst,'a',encoding
             w.write(line)
 PY_BRANCH
   title="$(session_title_from_file "$src" 2>/dev/null || basename "$src" .log)"
-  write_session_title_metadata "$branch" "Branch of $title" >/dev/null 2>&1 || true
+  set_session_title "$branch" "Branch of $title" || return 1
+  branch="$RENAMED_SESSION_PATH"
   printf '%s\n' "$branch"
 }
 
 extract_turn_text_command() {
   local source="$1" turn="$2"
-  python3 - "$source" "$turn" <<'PY_EXTRACT_TURN'
-import re, sys
+  TTYCHATTER_NOTICE="$TC_PRECHAT_LINE" python3 - "$source" "$turn" <<'PY_EXTRACT_TURN'
+import os, re, sys
 path=sys.argv[1]; target=int(sys.argv[2])
 pat=re.compile(r'^\[([0-9]{2}:[0-9]{2}:[0-9]{2})\] ([^:]+): ?(.*)$')
 entries=[]; speaker=None; buf=[]
@@ -2468,10 +2716,10 @@ def flush():
     global speaker, buf
     if speaker is None: return
     sp=speaker.strip()
-    if sp.lower()=='system' or sp=='remfan1994': return
+    if sp.lower()=='system': return
     role='assistant' if sp in {'AI','OpenRouter','Assistant'} else 'user'
     text='\n'.join(buf)
-    if text.startswith('CONTEXT_'): return
+    if sp=='remfan1994' and text.strip()==os.environ['TTYCHATTER_NOTICE'].strip(): return
     entries.append((role,text))
 with open(path,'r',encoding='utf-8',errors='replace') as fh:
     for raw in fh:
@@ -2492,10 +2740,10 @@ PY_EXTRACT_TURN
 }
 
 edit_turn_command() {
-  local source="$1" turn="$2" src tmp editor edited branch old_session old_name output cleaned prompt_text branch_name title model_id status
+  local source="$1" turn="$2" src tmp editor edited branch old_session old_name old_id output cleaned prompt_text branch_name title model_id status
   [ -n "$source" ] && [ -n "$turn" ] || { printf '%s\n' "usage: --edit-turn SESSION TURN" >&2; return 2; }
   case "$turn" in ''|*[!0-9]*|0) printf '%s\n' "edit turn must be a positive number" >&2; return 2 ;; esac
-  src="$(resolve_session_arg "$source")"
+  src="$(resolve_session_arg "$source")" || return 1
   [ -f "$src" ] || { printf 'session not found: %s\n' "$src" >&2; return 1; }
   tmp="$(mktemp)" || return 1
   extract_turn_text_command "$src" "$turn" > "$tmp" || { rm -f "$tmp"; return 1; }
@@ -2512,8 +2760,8 @@ edit_turn_command() {
   branch="$(resolve_session_path "$branch_name")"
   ensure_prechat_line "$branch"
   printf '[%s] system: branch-from: %s\n[%s] system: branch-turn: %s\n[%s] system: branch-reason: edited-user-turn\n' "$(timestamp)" "$src" "$(timestamp)" "$((turn-1))" "$(timestamp)" >> "$branch"
-  python3 - "$src" "$branch" "$((turn-1))" <<'PY_EDIT_BRANCH'
-import re, sys
+  TTYCHATTER_NOTICE="$TC_PRECHAT_LINE" python3 - "$src" "$branch" "$((turn-1))" <<'PY_EDIT_BRANCH'
+import os, re, sys
 src,dst,max_turn=sys.argv[1],sys.argv[2],int(sys.argv[3])
 pat=re.compile(r'^\[[0-9]{2}:[0-9]{2}:[0-9]{2}\] ([^:]+):')
 count=0; copying=False
@@ -2522,7 +2770,7 @@ with open(src,'r',encoding='utf-8',errors='replace') as r, open(dst,'a',encoding
         m=pat.match(line)
         if m:
             sp=m.group(1).strip()
-            real=not (sp.lower()=='system' or sp=='remfan1994')
+            real=not (sp.lower()=='system' or (sp=='remfan1994' and line[m.end():].strip()==os.environ['TTYCHATTER_NOTICE'].strip()))
             if real:
                 count += 1
                 if count > max_turn:
@@ -2534,18 +2782,24 @@ with open(src,'r',encoding='utf-8',errors='replace') as r, open(dst,'a',encoding
             w.write(line)
 PY_EDIT_BRANCH
   title="$(session_title_from_file "$src" 2>/dev/null || basename "$src" .log)"
-  write_session_title_metadata "$branch" "Branch of $title" >/dev/null 2>&1 || true
+  set_session_title "$branch" "Branch of $title" || return 1
+  branch="$RENAMED_SESSION_PATH"
   printf '[%s] system: edit-turn: %s\n' "$(timestamp)" "$turn" >> "$branch"
   printf '[%s] %s: %s\n' "$(timestamp)" "$USER_NAME" "$edited" >> "$branch"
 
-  old_session="${SESSION:-}"; old_name="${SESSION_NAME:-}"
-  SESSION="$branch"; SESSION_NAME="$(basename "$branch" .log)"; CONTEXT_BUFFER=(); rebuild_context_from_session
-  add_to_context "User: $edited"
+  old_session="${SESSION:-}"; old_name="${SESSION_NAME:-}"; old_id="${SESSION_ID:-}"
+  SESSION="$branch"; SESSION_NAME="$(basename "$branch" .log)"; SESSION_ID="$(ensure_session_id "$branch")"; CONTEXT_BUFFER=(); rebuild_context_from_session
   status_update "generating branch response"
   prompt_text="$(build_context)"
   model_id="$(effective_model)"
   output="$(call_openrouter_model "$model_id" "$prompt_text" 120)"; status=$?
-  [ "$status" -ne 0 ] && output="(response error: $output)"
+  if [ "$status" -ne 0 ]; then
+    printf '[%s] system: response-error: %s\n' "$(timestamp)" "$output" >> "$branch"
+    printf '%s\n' "$output" >&2
+    emit_session_path
+    SESSION="$old_session"; SESSION_NAME="$old_name"; SESSION_ID="$old_id"
+    return "$status"
+  fi
   [ -n "$output" ] || output="(empty response or API error)"
   printf '[%s] AI: %s\n' "$(timestamp)" "$output" >> "$branch"
   cleaned="$output"
@@ -2554,17 +2808,17 @@ PY_EDIT_BRANCH
   maybe_generate_session_title "$branch" "$edited" "$cleaned"
   printf 'branched edited session: %s\n' "$branch"
   printf '%s\n' "$cleaned"
-  SESSION="$old_session"; SESSION_NAME="$old_name"
+  SESSION="$old_session"; SESSION_NAME="$old_name"; SESSION_ID="$old_id"
 }
 export_session_command() {
-  local name="$1" fmt="${2:-markdown}" out="$3" path title tmp
-  [ -n "$name" ] || { printf '%s\n' "usage: --export SESSION [--format markdown|text|json] [--output FILE" >&2; return 2; }
-  path="$(resolve_session_arg "$name")"
+  local name="$1" fmt="${2:-markdown}" out="$3" path title tmp status
+  [ -n "$name" ] || { printf '%s\n' "usage: --export SESSION [--format markdown|text|json] [--output FILE]" >&2; return 2; }
+  path="$(resolve_session_arg "$name")" || return 1
   [ -f "$path" ] || { printf 'session not found: %s\n' "$path" >&2; return 1; }
   title="$(session_title_from_file "$path" 2>/dev/null || basename "$path" .log)"
   tmp="$(mktemp)" || return 1
-  python3 - "$path" "$title" "$fmt" > "$tmp" <<'PY_EXPORT'
-import json, re, sys
+  TTYCHATTER_NOTICE="$TC_PRECHAT_LINE" python3 - "$path" "$title" "$fmt" > "$tmp" <<'PY_EXPORT'
+import json, os, re, sys
 path,title,fmt=sys.argv[1],sys.argv[2],sys.argv[3].lower()
 pat=re.compile(r'^\[([0-9]{2}:[0-9]{2}:[0-9]{2})\] ([^:]+): ?(.*)$')
 entries=[]; ts=None; speaker=None; buf=[]
@@ -2572,10 +2826,10 @@ def flush():
     global ts, speaker, buf
     if speaker is None: return
     sp=speaker.strip()
-    if sp.lower()=='system' or sp=='remfan1994': return
+    if sp.lower()=='system': return
     role='assistant' if sp in {'AI','OpenRouter','Assistant'} else 'user'
     text='\n'.join(buf)
-    if text.startswith('CONTEXT_'): return
+    if sp=='remfan1994' and text.strip()==os.environ['TTYCHATTER_NOTICE'].strip(): return
     entries.append({'role':role,'speaker':sp,'text':text,'time':ts})
 with open(path,'r',encoding='utf-8',errors='replace') as fh:
     for raw in fh:
@@ -2599,8 +2853,13 @@ else:
         label='Assistant' if m['role']=='assistant' else 'User'
         print('## '+label); print(); print(m['text']); print()
 PY_EXPORT
-  if [ -n "$out" ]; then cat "$tmp" > "$out"; else cat "$tmp"; fi
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    if [ -n "$out" ]; then cat "$tmp" > "$out"; else cat "$tmp"; fi
+    status=$?
+  fi
   rm -f "$tmp"
+  return "$status"
 }
 
 # ==========================================================
@@ -2688,6 +2947,7 @@ handle_runtime_command() {
 
     list|sessions) list_sessions ;;
     rename) rename_current_session "$rest" ;;
+    web) web_command "$rest" ;;
     turns) turns_command "$SESSION_NAME" ;;
     branch|fork) branch_session_command "$SESSION_NAME" "$rest" ;;
     stream) case "$rest" in on|1|yes|true) STREAM=1; printf '%s
@@ -2806,6 +3066,11 @@ while [ "$#" -gt 0 ]; do
     -s|--session) shift; SESSION_NAME="${1:-}" ;;
     --stream) STREAM=1 ;;
     --no-stream) STREAM=0 ;;
+    --web) WEB_SEARCH=1 ;;
+    --no-web) WEB_SEARCH=0 ;;
+    --web-engine) shift; [ "$#" -gt 0 ] || { printf '%s\n' 'ERROR: --web-engine requires ENGINE' >&2; exit 2; }; WEB_SEARCH_ENGINE="$1"; case "$1" in auto|native|exa|parallel|perplexity|firecrawl) ;; *) printf '%s\n' 'ERROR: unsupported web engine' >&2; exit 2 ;; esac ;;
+    --web-max-results) shift; [ "$#" -gt 0 ] || { printf '%s\n' 'ERROR: --web-max-results requires N' >&2; exit 2; }; case "$1" in ''|*[!0-9]*) printf '%s\n' 'ERROR: results must be 0..25' >&2; exit 2 ;; esac; [ "${#1}" -le 2 ] && [ "$((10#$1))" -ge 0 ] && [ "$((10#$1))" -le 25 ] || { printf '%s\n' 'ERROR: results must be 0..25' >&2; exit 2; }; WEB_SEARCH_MAX_RESULTS="$1" ;;
+    --web-max-uses) shift; [ "$#" -gt 0 ] || { printf '%s\n' 'ERROR: --web-max-uses requires N' >&2; exit 2; }; case "$1" in ''|*[!0-9]*) printf '%s\n' 'ERROR: uses must be 0..25' >&2; exit 2 ;; esac; [ "${#1}" -le 2 ] && [ "$((10#$1))" -ge 0 ] && [ "$((10#$1))" -le 25 ] || { printf '%s\n' 'ERROR: uses must be 0..25' >&2; exit 2; }; WEB_SEARCH_MAX_USES="$1" ;;
     --ai-download) shift; AI_FILE_DOWNLOAD_MODE="${1:-ask}" ;;
     --status|--progress) STATUS_UPDATES=1 ;;
     --no-status|--no-progress) STATUS_UPDATES=0 ;;
@@ -2916,25 +3181,33 @@ if [ "$NEW_SESSION" -eq 1 ] && { [ -n "$SESSION_NAME" ] || [ -n "$OUTPUT_PATH" ]
 fi
 
 SESSION_ARG="$SESSION_NAME"
-if [ -z "$SESSION_ARG" ]; then
-  SESSION_NAME="$(default_session_name_unique)"
-  SESSION="$(resolve_session_path "$SESSION_NAME")"
-elif [ -n "$OUTPUT_PATH" ]; then
-  SESSION_NAME="$(sanitize_session_name "$SESSION_ARG")"
+if [ -n "$OUTPUT_PATH" ]; then
+  SESSION_FIXED_PATH=1
+  SESSION_NAME="$(basename "$OUTPUT_PATH" .log)"
   SESSION="$(expand_path "$OUTPUT_PATH")"
+elif [ -z "$SESSION_ARG" ]; then
+  SESSION_NAME="$(default_session_name_unique)" || exit 1
+  SESSION="$(resolve_session_path "$SESSION_NAME")"
 else
-  case "$SESSION_ARG" in
-    */*|*.log) SESSION="$(resolve_session_arg "$SESSION_ARG")"; SESSION_NAME="$(basename "$SESSION" .log)" ;;
-    *) SESSION_NAME="$(sanitize_session_name "$SESSION_ARG")"; SESSION="$(resolve_session_path "$SESSION_NAME")" ;;
-  esac
+  SESSION="$(resolve_session_arg "$SESSION_ARG")" || exit 1
+  SESSION_NAME="$(basename "$SESSION" .log)"
 fi
 
 SESSION_WAS_EMPTY=1
 [ -s "$SESSION" ] && SESSION_WAS_EMPTY=0
 if [ "$RESUME" -eq 1 ] && [ ! -f "$SESSION" ]; then printf 'ERROR: session not found: %s\n' "$SESSION_NAME" >&2; exit 1; fi
-ensure_prechat_line "$SESSION"
+ensure_prechat_line "$SESSION" || exit 1
+SESSION="$(absolute_session_path "$SESSION")" || exit 1
+SESSION_ID="$(ensure_session_id "$SESSION")" || exit 1
+# A supplied descriptive name is already a naming decision; preserve it.
+if [ "$SESSION_WAS_EMPTY" -eq 1 ] && [ -n "$SESSION_ARG" ] && ! session_needs_name; then
+  write_session_title_metadata "$SESSION" "$(basename "$SESSION_ARG" .log)" || exit 1
+fi
+case "$SESSION" in "$SESSION_DIR"/*) ;; *) SESSION_FIXED_PATH=1 ;; esac
+normalize_web_options
+maybe_prompt_session_name
 
-rebuild_context_from_session
+rebuild_context_from_session || exit 1
 if truthy "$DEMO_MODE" && [ -z "$MODEL" ]; then MODEL="demo/auto"; fi
 ACTIVE_MODEL="$(effective_model)"
 NOTICE_VISIBLE=0
@@ -2949,6 +3222,8 @@ if truthy "$STARTUP_NOTICE" && [ "$SESSION_WAS_EMPTY" -eq 1 ]; then NOTICE_VISIB
 print_chat_header() {
   printf '%s\n' "$PROGRAM"
   printf 'session: %s\n' "$SESSION"
+  show_session_name
+  web_status
   printf 'model: %s\n' "$(model_label)"
   printf 'context turns: %s\n' "$CONTEXT_TURNS"
   [ -f "$SESSION" ] && [ "${#CONTEXT_BUFFER[@]}" -gt 0 ] && printf 'loaded context entries: %s\n' "${#CONTEXT_BUFFER[@]}"
@@ -2974,11 +3249,11 @@ print_project_lead_notice() { printf '[%s] %s: %s\n\n' "$(timestamp)" "$PROJECT_
 # attachments, snapshot memory, and display output.
 # ----------------------------------------------------------
 send_one_message() {
-  local buffer="$1" ts output output_status cleaned_output prompt_text
+  local buffer="$1" ts output output_status cleaned_output prompt_text save_failed=0
   ts="$(timestamp)"
   [ -z "$buffer" ] && { printf '%s\n' "empty message ignored"; return 1; }
-  ensure_prechat_line "$SESSION"
-  printf '[%s] %s: %s\n' "$ts" "$USER_NAME" "$buffer" >> "$SESSION"
+  ensure_prechat_line "$SESSION" || return 1
+  printf '[%s] %s: %s\n' "$ts" "$USER_NAME" "$buffer" >> "$SESSION" || { printf '%s\n' 'Cannot save prompt; no request was sent.' >&2; return 1; }
   add_to_context "User: $buffer"
   printf '\n________________________________________\nEND INPUT\n________________________________________\n'
   status_update "preparing request for $ACTIVE_MODEL"
@@ -2986,14 +3261,19 @@ send_one_message() {
   printf '________________________________________\nBEGIN OUTPUT\n________________________________________\n\n'
   prompt_text="$(build_context)"
   output="$(call_openrouter_model "$ACTIVE_MODEL" "$prompt_text" 120 "${ATTACH_FILES[@]}")"; output_status=$?
+  if [ "$output_status" -ne 0 ]; then
+    printf '[%s] system: response-error: %s\n' "$(timestamp)" "$output" >> "$SESSION"
+    printf '%s\n' "${output:-OpenRouter request failed; pending attachments preserved.}" >&2
+    emit_session_path
+    return "$output_status"
+  fi
   ATTACH_FILES=()
-  [ "$output_status" -ne 0 ] && output="(response error: $output)"
   [ -z "$output" ] && output="(empty response or API error)"
-  printf '[%s] AI: %s\n' "$(timestamp)" "$output" >> "$SESSION"
-  cleaned_output="$(printf '%s' "$output" | extract_attachments)"
+  printf '[%s] AI: %s\n' "$(timestamp)" "$output" >> "$SESSION" || { save_failed=1; printf '%s\n' 'Response received, but the log write failed. Copy the displayed reply before closing.' >&2; }
+  cleaned_output="$(printf '%s' "$output" | extract_attachments)" || { cleaned_output="$output"; save_failed=1; printf '%s\n' 'Attachment extraction failed; showing the complete original reply.' >&2; }
   add_to_context "Assistant: $cleaned_output"
-  write_context_snapshot "$(timestamp)"
-  maybe_generate_session_title "$SESSION" "$buffer" "$cleaned_output"
+  write_context_snapshot "$(timestamp)" || { save_failed=1; printf '%s\n' 'The response is displayed, but its memory snapshot could not be saved.' >&2; }
+  if [ "$save_failed" -eq 0 ]; then maybe_generate_session_title "$SESSION" "$buffer" "$cleaned_output"; fi
   LAST_AI_OUTPUT="$cleaned_output"
   if truthy "$VOICE_OUTPUT"; then run_voice_output_command "$cleaned_output" || true; fi
   if [ "$LOOPBACK" -eq 1 ]; then
@@ -3003,6 +3283,8 @@ send_one_message() {
     printf '%s\n' "$cleaned_output" >> "$LOOPBACK_FILE"
   fi
   printf '%s\n\n' "$cleaned_output"
+  emit_session_path
+  return "$save_failed"
 }
 # ----------------------------------------------------------
 # MAINTAINER COMMENTARY: loopback output routing
@@ -3048,7 +3330,11 @@ fi
 while true; do
   TS="$(timestamp)"
   printf '[%s] %s> ' "$TS" "$USER_NAME"
-  buffer="$(cat)"
+  if [ "$SEND_INPUT" = enter ]; then
+    if ! IFS= read -r buffer; then [ -t 0 ] || exit 0; continue; fi
+  else
+    buffer="$(cat)"
+  fi
   if [ -z "$buffer" ]; then
     [ -t 0 ] || exit 0
     continue

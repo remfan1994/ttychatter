@@ -1,4 +1,4 @@
-.TH TTYCHATTER.PYTHON 1 "June 2026" "ttychatter.python 3.17-ai-files" "User Commands"
+.TH TTYCHATTER.PYTHON 1 "November 2026" "ttychatter.python 3.19-web-limits" "User Commands"
 .SH NAME
 ttychatter.python \- Bash plus Python helper OpenRouter terminal chat client
 .SH SYNOPSIS
@@ -52,9 +52,28 @@ New logs begin with the shared pre-chat line:
 Everyone is encouraged to get the cruelty-free vegetarian alternatives and remember the bloodguilt curse from the Bible... http://bloodguiltcurse.net
 .fi
 .PP
-Automatic filenames remain timestamped and machine-stable. Friendly names are
-stored as session-title metadata.  --list displays that metadata when present.
---rename-session changes metadata, not the filename.
+Unnamed logs initially use timestamped filenames. Interactive new or unnamed
+sessions prominently ask for a name when PROMPT_SESSION_NAME=1 (the default).
+Enter defers naming. Piped input and batch prompts are never consumed for a name.
+.PP
+Naming with :rename or --rename-session changes both session-title metadata and
+the actual filename to TITLE--ID.log. TITLE is a safe, at most 80-character ASCII
+slug; ID is the first 12 characters of a separate stable 32-character session ID.
+A numeric suffix resolves collisions without replacing another file.
+Manual titles preserve up to 200 characters and are not limited by the automatic
+title word limit. Existing timestamped and explicitly named logs still open.
+The client reports the current log path after every generation attempt.
+.PP
+The current human title and recorded previous titles or filename stems can be
+used to resume, export, or manage a renamed session. An exact existing filename
+takes priority. If a title or alias matches multiple logs, choose the filename
+shown by --list. Alias searches only inspect regular, nonsymlink session logs.
+.PP
+--output FILE remains the chosen path during naming prompts and automatic title
+generation. An explicit :rename or --rename-session can rename it in place.
+Symbolic-link logs are not renamed. Log renaming needs ln with -T support and a
+filesystem that supports hard links; an unsupported rename leaves the original.
+New logs are private to the current user.
 .SH OPTIONS
 .TP
 .BR -h , " --help"
@@ -94,7 +113,7 @@ List saved sessions with metadata titles.
 Alias for --list.
 .TP
 .BR --rename-session " SESSION TITLE"
-Set session-title metadata without renaming the file.
+Set the friendly title and safely rename the actual log file.
 .TP
 .BR --search " QUERY"
 Search session logs. Use --all-sessions to search every saved log.
@@ -103,13 +122,15 @@ Search session logs. Use --all-sessions to search every saved log.
 List user/assistant message numbers.
 .TP
 .BR --branch " SESSION TURN"
-Create a timestamped branch after TURN.
+Create an independently identified, named branch after TURN.
 .TP
 .BR --edit-turn " SESSION TURN"
 Open a user turn in the external editor, create a branch, and continue from the edited prompt.
 .TP
 .BR --export " SESSION"
 Export a session in markdown, text, or json.
+Multiline messages and code fences are preserved; internal metadata is omitted.
+An output-file write failure returns a nonzero status.
 .TP
 .BR --format " markdown|text|json"
 Choose export format.
@@ -169,6 +190,19 @@ Attach FILE to the next request.
 .BR --stream , " --no-stream"
 Stream provider token deltas while still saving the final complete response. Press ESC during an active stream to stop it; the partial reply is saved with an interruption marker.
 .TP
+.BR --web , " --no-web"
+Enable or disable the OpenRouter web-search server tool. The default is off.
+The model decides when to search. Sources are appended to the answer and log.
+.TP
+.BR --web-engine " ENGINE"
+Select auto, native, exa, parallel, perplexity, or firecrawl. Default: auto.
+.TP
+.BR --web-max-results " N"
+Set results per search, from 0 to 25 (default 5). Zero leaves the provider default. Perplexity is capped at 20 when nonzero.
+.TP
+.BR --web-max-uses " N"
+Set search rounds from 0 to 25 (default 3). Zero omits ttychatter's max_tool_calls cap.
+.TP
 .BR --ai-download " ask|auto|metadata|off"
 Control provider-returned file attachments. The default ask mode prompts before saving when a terminal can answer and records metadata only in noninteractive use. auto saves all returned files under ATTACHMENT_DIR/received, metadata lists them without saving, and off ignores them.
 .TP
@@ -216,18 +250,44 @@ All implementations use these shared paths and still read the old
 file as a compatibility fallback when the provider-specific config is absent.
 Important keys include MODEL, CONTEXT_TURNS, SESSION_DIR, ATTACHMENT_DIR,
 MODEL_TEST_PROMPT, STARTUP_NOTICE, SESSION_AUTO_TITLE, SESSION_TITLE_MODEL,
-SESSION_TITLE_MAX_WORDS, STREAM, AI_FILE_DOWNLOAD_MODE, STATUS_UPDATES, VOICE_INPUT_CMD,
+SESSION_TITLE_MAX_WORDS, PROMPT_SESSION_NAME, WEB_SEARCH, WEB_SEARCH_ENGINE,
+WEB_SEARCH_MAX_RESULTS, WEB_SEARCH_MAX_USES, STREAM, AI_FILE_DOWNLOAD_MODE, STATUS_UPDATES, VOICE_INPUT_CMD,
 VOICE_OUTPUT_CMD, TTS_CMD, VOICE_OUTPUT, MODEL_CACHE_FILE,
 MODEL_FAVORITES_FILE, SEND_INPUT, THEME, CODE_ATTACHMENT_MIN_LINES,
 MAX_ATTACHMENT_BYTES, and API_KEY_GPG_FILE.
 .PP
 SESSION_AUTO_TITLE defaults to 0. When enabled, SESSION_TITLE_MODEL is a
-secondary model used only for title metadata. The normal chat model remains MODEL.
+secondary model used only for a title and its corresponding managed filename.
+The normal chat model remains MODEL; title generation never requests web search.
+.PP
+Session memory restores the latest complete JSON or legacy text snapshot, then
+replays newer messages. Explicit memory edits and empty snapshots are preserved.
+New snapshots use JSON so embedded newlines and role-looking text remain exact.
 .SH RUNTIME COMMANDS
 Interactive colon commands include :help, :rename TITLE, :turns, :branch N,
-:stream on|off, :ai-download MODE, :status on|off, :voice FILE, :speak on|off|last, :models,
+:web [on|off|status], :stream on|off, :ai-download MODE, :status on|off, :voice FILE, :speak on|off|last, :models,
 :update-models, :select-model, :test-model MODEL, :config, :set KEY VALUE,
 :memory, :edit-memory, :search TEXT, :search-all TEXT, :attach FILE, :editor,
 and :credits.
+.SH WEB SEARCH AND RESPONSE HANDLING
+WEB_SEARCH=0 is the default. --web and :web on enable OpenRouter's current
+openrouter:web_search server tool; :web shows its current state.
+The deprecated web plugin and model :online suffix are not used automatically.
+Searches may add provider charges. The result and use settings are bounds sent
+to the provider, not a strict cost cap; native search may ignore some limits.
+The request caps tool calls at five and total search results at fifteen. No local command execution is delegated to the model.
+.PP
+Sources remain human-readable in responses and session logs, including streamed
+annotation events after text has ended. Available usage, response identifiers,
+and annotations are also saved as system: openrouter-response: JSON metadata.
+Session IDs are opaque and stable across title changes; titles and local paths
+are not sent as request identifiers.
+.PP
+Streaming runs until [DONE], retains newline-only deltas and final usage, and
+preserves partial output when stopped with ESC. API and transport errors are
+reported as failures, never inserted into memory as assistant claims. Batch
+commands return a nonzero status on failure. No automatic paid retries occur. If a reply has arrived but log or code-file
+saving fails, its original text stays visible and the command reports failure.
+Extracted code files use exclusive creation so previous replies are not overwritten.
 .SH SEE ALSO
 ttychatter.bash(1), ttychatter.ncurses(1)

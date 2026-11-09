@@ -13,9 +13,10 @@
 #   old or constrained systems that can still run curl over HTTPS.
 #
 # REQUIRED TOOLS
-#   bash, curl, sed, awk, grep, tr, printf, mktemp
+#   bash, curl, sed, awk, grep, tr, printf, mktemp, od, ln (with -T)
 #
 # OPTIONAL TOOLS
+#   jq      - required for web search and lossless streaming; recommended for JSON
 #   base64  - needed for binary/media file attachment support
 #   file    - improves MIME type detection
 #
@@ -60,9 +61,10 @@
 # ==========================================================
 
 set -o pipefail
+umask 077
 
 PROGRAM="ttychatter.bash"
-VERSION="0.14.2-bash-only-ai-files"
+VERSION="3.19-web-limits"
 XDG_CONFIG_ROOT="${XDG_CONFIG_HOME:-$HOME/.config}"
 XDG_DATA_ROOT="${XDG_DATA_HOME:-$HOME/.local/share}"
 XDG_CACHE_ROOT="${XDG_CACHE_HOME:-$HOME/.cache}"
@@ -125,6 +127,13 @@ VOICE_INPUT_CMD=""
 VOICE_OUTPUT_CMD=""
 VOICE_OUTPUT=0
 AI_FILE_DOWNLOAD_MODE="ask"
+WEB_SEARCH=0
+WEB_SEARCH_ENGINE="auto"
+WEB_SEARCH_MAX_RESULTS=5
+WEB_SEARCH_MAX_USES=3
+PROMPT_SESSION_NAME=1
+SESSION_ID=""
+SESSION_FIXED_PATH=0
 PROMPT_TEXT=""
 INPUT_FILE=""
 OUTPUT_PATH=""
@@ -186,7 +195,7 @@ model_label() { if [ -n "$MODEL" ]; then normalize_model_id "$MODEL"; else print
 # Changes should preserve old-system usability and update docs/comments if
 # behavior changes.
 # ----------------------------------------------------------
-json_escape_stream() { awk 'BEGIN{first=1;ORS=""}{gsub(/\\/,"\\\\");gsub(/\"/,"\\\"");gsub(/\r/,"");if(!first)printf "\\n";printf "%s",$0;first=0}'; }
+json_escape_stream() { LC_ALL=C awk 'BEGIN { for(i=1;i<32;i++) esc[sprintf("%c",i)]=sprintf("\\u%04x",i) } { if(NR>1) printf "\\n"; for(i=1;i<=length($0);i++) { c=substr($0,i,1); if(c=="\\") printf "\\\\"; else if(c=="\"") printf "\\\""; else if(c in esc) printf "%s",esc[c]; else printf "%s",c; } }'; }
 # ----------------------------------------------------------
 # MAINTAINER COMMENTARY: function json_unescape_basic
 # json_unescape_basic is part of the dependency-light client behavior.
@@ -267,7 +276,12 @@ load_config() {
       SESSION_DIR) SESSION_DIR="${value/#\~/$HOME}" ;;
       ATTACHMENT_DIR) ATTACHMENT_DIR="${value/#\~/$HOME}"; ATTACHMENT_DIR_CONFIGURED=1 ;;
       AI_FILE_DOWNLOAD_MODE|AI_DOWNLOAD) AI_FILE_DOWNLOAD_MODE="$value" ;;
-      MODEL_TEST_PROMPT) [ -n "$value" ] && MODEL_TEST_PROMPT="$value" ;;
+      WEB_SEARCH) WEB_SEARCH="$value" ;;
+    WEB_SEARCH_ENGINE) WEB_SEARCH_ENGINE="$value" ;;
+    WEB_SEARCH_MAX_RESULTS) WEB_SEARCH_MAX_RESULTS="$value" ;;
+    WEB_SEARCH_MAX_USES) WEB_SEARCH_MAX_USES="$value" ;;
+    PROMPT_SESSION_NAME) PROMPT_SESSION_NAME="$value" ;;
+    MODEL_TEST_PROMPT) [ -n "$value" ] && MODEL_TEST_PROMPT="$value" ;;
       MODEL_TYPE_FILTER) MODEL_TYPE_FILTER="$value" ;;
       MODEL_SORT_ORDER) MODEL_SORT_ORDER="$value" ;;
       MODEL_MIN_INPUT_TOKENS) MODEL_MIN_INPUT_TOKENS="$value" ;;
@@ -469,6 +483,8 @@ USAGE
     $PROGRAM --forget-api-key
     $PROGRAM --attach FILE [session]
     $PROGRAM --stream | --no-stream
+    $PROGRAM --web | --no-web
+    $PROGRAM --web-engine ENGINE --web-max-results N --web-max-uses N
     $PROGRAM --ai-download ask|auto|metadata|off
     ESC during streaming stops the active streamed response and saves the partial reply.
     --ai-download controls provider-returned files: ask, auto, metadata, or off.
@@ -502,9 +518,10 @@ INPUT
     SEND_INPUT=enter reads one line per message.
 
 SESSION TITLES
-    Logs keep timestamped filenames. --list shows session-title metadata when present.
-    --rename-session changes title metadata, not the filename.
-    Optional AI title metadata is off by default: SESSION_AUTO_TITLE=0.
+    Named logs use TITLE--ID.log; --list shows the friendly name and actual filename.
+    --rename-session updates the title and the actual log filename without overwriting another session.
+    PROMPT_SESSION_NAME=1 asks for names in interactive unnamed sessions.
+    Optional AI title generation is off by default: SESSION_AUTO_TITLE=0.
 
 OPENROUTER HELP
     Model docs:      https://openrouter.ai/docs/models
@@ -606,7 +623,22 @@ fetch_models_json() { if truthy "$DEMO_MODE"; then demo_models_json; return 0; f
 # Changes should preserve old-system usability and update docs/comments if
 # behavior changes.
 # ----------------------------------------------------------
-update_models_cache() { local json; mkdir -p "$(dirname "$MODEL_CACHE_FILE")" 2>/dev/null || true; json="$(fetch_models_json)" || return 1; printf '%s' "$json" > "$MODEL_CACHE_FILE"; chmod 600 "$MODEL_CACHE_FILE" 2>/dev/null || true; printf 'updated model cache: %s\n' "$MODEL_CACHE_FILE"; }
+update_models_cache() {
+  local tmp
+  mkdir -p "$(dirname "$MODEL_CACHE_FILE")" || return 1
+  tmp="$(mktemp "${MODEL_CACHE_FILE}.tmp.XXXXXX")" || return 1
+  if ! fetch_models_json > "$tmp"; then rm -f "$tmp"; return 1; fi
+  if command -v jq >/dev/null 2>&1; then
+    jq -e 'type=="object" and (.data|type=="array") and (.error|not)' "$tmp" >/dev/null 2>&1
+  else
+    grep -Eq '"data"[[:space:]]*:[[:space:]]*\[' "$tmp"
+  fi
+  if [ "$?" -ne 0 ]; then
+    rm -f "$tmp"; printf '%s\n' 'Invalid model catalog; existing cache preserved.' >&2; return 1
+  fi
+  mv "$tmp" "$MODEL_CACHE_FILE" || { rm -f "$tmp"; return 1; }
+  printf 'updated model cache: %s\n' "$MODEL_CACHE_FILE" >&2
+}
 # ----------------------------------------------------------
 # MAINTAINER COMMENTARY: function models_json_source
 # models_json_source is part of the dependency-light client behavior.
@@ -798,19 +830,32 @@ build_prompt_with_attachments() {
 # is used.
 # ----------------------------------------------------------
 build_openrouter_payload() {
-  local model="$1" prompt="$2" stream_flag="${3:-0}"
+  local model="$1" prompt="$2" stream_flag="${3:-0}" web=0 stream=0 count
+  normalize_web_options
+  truthy "$WEB_SEARCH" && web=1
+  truthy "$stream_flag" && stream=1
+  count="$WEB_SEARCH_MAX_RESULTS"
+  [ "$WEB_SEARCH_ENGINE" = perplexity ] && [ "$count" -gt 20 ] && count=20
   if command -v jq >/dev/null 2>&1; then
-    if truthy "$stream_flag"; then
-      jq -n --arg model "$model" --arg text "$prompt" '{model:$model, stream:true, messages:[{role:"user", content:$text}]}'
-    else
-      jq -n --arg model "$model" --arg text "$prompt" '{model:$model, messages:[{role:"user", content:$text}]}'
-    fi
+    printf '%s' "$prompt" | jq -Rs --arg model "$model" --arg sid "${SESSION_ID:-}" \
+      --arg engine "$WEB_SEARCH_ENGINE" --argjson count "$count" --argjson uses "$WEB_SEARCH_MAX_USES" \
+      --argjson web "$web" --argjson stream "$stream" '
+      . as $text | {model:$model,messages:[{role:"user",content:$text}]} +
+      (if $sid != "" then {session_id:$sid} else {} end) +
+      (if $stream==1 then {stream:true,stream_options:{include_usage:true}} else {} end) +
+      (if $web==1 then
+        ({tools:[{type:"openrouter:web_search",parameters:({engine:$engine} + (if $count>0 then {max_results:$count} else {} end))}]} +
+         (if $uses>0 then {max_tool_calls:$uses} else {} end))
+       else {} end)'
   else
-    if truthy "$stream_flag"; then
-      printf '{"model":"%s","stream":true,"messages":[{"role":"user","content":"%s"}]}' "$(printf '%s' "$model" | json_escape_stream)" "$(printf '%s' "$prompt" | json_escape_stream)"
-    else
-      printf '{"model":"%s","messages":[{"role":"user","content":"%s"}]}' "$(printf '%s' "$model" | json_escape_stream)" "$(printf '%s' "$prompt" | json_escape_stream)"
+    if [ "$web" -eq 1 ]; then
+      printf '%s\n' 'Web search in ttychatter.bash requires jq for reliable sources and API errors. Install jq or use ttychatter.python.' >&2
+      return 1
     fi
+    printf '{"model":"%s","messages":[{"role":"user","content":"%s"}]' "$(printf '%s' "$model" | json_escape_stream)" "$(printf '%s' "$prompt" | json_escape_stream)"
+    [ -z "${SESSION_ID:-}" ] || printf ',"session_id":"%s"' "$(printf '%s' "$SESSION_ID" | json_escape_stream)"
+    [ "$stream" -eq 0 ] || printf ',"stream":true'
+    printf '}\n'
   fi
 }
 
@@ -919,11 +964,48 @@ ai_save_record() {
   return 1
 }
 
+openrouter_sources() {
+  jq -r '
+    [(.annotations[]?), (.choices[]? | (.message.annotations[]?),(.delta.annotations[]?))]
+    | map(select(type=="object" and .type=="url_citation") | (.url_citation // .)
+      | select(type=="object") | select((.url|type)=="string") | select(.url|test("^https?://")))
+    | unique_by(.url) | to_entries[] | "[\(.key+1)] \((.value.title // .value.url)|tostring|gsub("[\\r\\n\\t]";" ")) - \(.value.url)"'
+}
+
+save_openrouter_metadata() {
+  local meta
+  [ -n "${SESSION:-}" ] && [ -f "$SESSION" ] || return 0
+  command -v jq >/dev/null 2>&1 || return 0
+  meta="$(jq -c '
+    {id,model,usage,provider,service_tier,
+      annotations:[(.annotations[]?),(.choices[]? | (.message.annotations[]?),(.delta.annotations[]?))],
+      reasoning_details:[.choices[]? | .message.reasoning_details? // .delta.reasoning_details? // empty]}
+    | with_entries(select(.value != null and .value != []))' "$1" 2>/dev/null)" || return 0
+  [ -z "$meta" ] || [ "$meta" = '{}' ] || printf '[%s] system: openrouter-response: %s\n' "$(timestamp)" "$meta" >> "$SESSION"
+}
+
+validate_openrouter_response() {
+  if command -v jq >/dev/null 2>&1; then
+    jq -e 'if type != "object" then error("expected a JSON object") elif .error then error("OpenRouter API error: " + (.error.message // .error | tostring)) else true end' "$1" >/dev/null
+  else
+    # This reduced-dependency mode is best effort; jq is recommended.
+    if grep -Eq '"error"[[:space:]]*:[[:space:]]*[^n]' "$1"; then
+      printf '%s\n' 'OpenRouter reported an error; install jq for full error details.' >&2; return 1
+    fi
+  fi
+}
+
 extract_openrouter_text_and_ai_files() {
-  local tmp text records idx name mime url data file_id source loc saved
+  local tmp text records idx name mime url data file_id source loc saved sources
   tmp="$(mktemp "${TMPDIR:-/tmp}/ttychatter.response.XXXXXX")" || return 1
   cat > "$tmp"
-  text="$(cat "$tmp" | extract_openrouter_text)"
+  validate_openrouter_response "$tmp" || { rm -f "$tmp"; return 1; }
+  save_openrouter_metadata "$tmp"
+  text="$(extract_openrouter_text < "$tmp")" || { rm -f "$tmp"; return 1; }
+  if command -v jq >/dev/null 2>&1; then
+    sources="$(openrouter_sources < "$tmp")"
+    [ -z "$sources" ] || text="$text"$'\n\nSources:\n'"$sources"
+  fi
   printf '%s
 ' "$text"
   if [ "$AI_FILE_DOWNLOAD_MODE" = "off" ] || ! command -v jq >/dev/null 2>&1; then
@@ -998,11 +1080,12 @@ EOF_AI_FILES
 }
 
 extract_openrouter_stream_piece() {
-  if command -v jq >/dev/null 2>&1; then
-    jq -r '[.choices[]? | (.delta.content // .message.content // .text // empty)] | map(select(type=="string")) | join("")' 2>/dev/null
-  else
-    tr '\n' ' ' | sed -n 's/^.*"content"[[:space:]]*:[[:space:]]*"\([^"\\]*\).*$/\1/p' | json_unescape_basic
-  fi
+  jq -j '
+    if type != "object" then error("invalid stream event")
+    elif .error then error("OpenRouter API error: " + (.error.message // .error | tostring))
+    else [.choices[]? | (.delta.content // .message.content // .text // empty)
+      | if type=="string" then . elif type=="array" then .[]? | .text? // empty else empty end]
+      | map(select(type=="string")) | join("") end'
 }
 
 stream_keyboard_watcher() {
@@ -1018,76 +1101,71 @@ stream_keyboard_watcher() {
 }
 
 call_model_stream() {
-  local model="$1" prompt="$2" full_prompt payload fifo err_file flag_file text line data piece curl_pid watcher_pid old_stty status
+  local model="$1" prompt="$2" full_prompt payload work fifo err_file flag_file text line data piece curl_pid watcher_pid old_stty status piece_status sources http_code failure="" done_seen=0
   require_api_key || return 1
-  full_prompt="$(build_prompt_with_attachments "$prompt")"
-  payload="$(build_openrouter_payload "$(normalize_model_id "$model")" "$full_prompt" 1)"
-  fifo="$(mktemp -u "${TMPDIR:-/tmp}/ttychatter.stream.fifo.XXXXXX")" || return 1
-  err_file="$(mktemp "${TMPDIR:-/tmp}/ttychatter.stream.err.XXXXXX")" || return 1
-  flag_file="$(mktemp "${TMPDIR:-/tmp}/ttychatter.stream.cancel.XXXXXX")" || { rm -f "$err_file"; return 1; }
-  rm -f "$flag_file"
-  mkfifo "$fifo" || { rm -f "$err_file" "$flag_file"; return 1; }
-
-  printf '%s' "$payload" | curl -sS --no-buffer --max-time 120 \
-    -H 'Content-Type: application/json' \
-    -H "Authorization: Bearer $OPENROUTER_API_KEY" \
-    -H 'HTTP-Referer: https://github.com/remfan1994/ttychatter' \
-    -H 'X-Title: ttychatter' \
-    -d @- 'https://openrouter.ai/api/v1/chat/completions' >"$fifo" 2>"$err_file" &
+  full_prompt="$(build_prompt_with_attachments "$prompt")" || return 1
+  payload="$(build_openrouter_payload "$(normalize_model_id "$model")" "$full_prompt" 1)" || return 1
+  work="$(mktemp -d "${TMPDIR:-/tmp}/ttychatter.stream.XXXXXX")" || return 1
+  fifo="$work/events.fifo"; err_file="$work/curl.err"; flag_file="$work/cancelled"
+  mkfifo "$fifo" || { rmdir "$work"; return 1; }
+  : > "$work/events.jsonl"
+  printf '%s' "$payload" > "$work/request.json"
+  curl -sS --no-buffer --max-time 120 -D "$work/headers" \
+    -H 'Content-Type: application/json' -H "Authorization: Bearer $OPENROUTER_API_KEY" \
+    -H 'HTTP-Referer: https://github.com/remfan1994/ttychatter' -H 'X-Title: ttychatter' \
+    -d "@$work/request.json" 'https://openrouter.ai/api/v1/chat/completions' >"$fifo" 2>"$err_file" &
   curl_pid=$!
-
   if [ -t 0 ] && [ -r /dev/tty ]; then
     old_stty="$(stty -g </dev/tty 2>/dev/null || true)"
-    [ -n "$old_stty" ] && stty -icanon -echo min 0 time 0 </dev/tty 2>/dev/null || true
-    stream_keyboard_watcher "$curl_pid" "$flag_file" &
-    watcher_pid=$!
-  else
-    watcher_pid=""
-    old_stty=""
-  fi
-
+    [ -z "$old_stty" ] || stty -icanon -echo min 0 time 0 </dev/tty 2>/dev/null || true
+    stream_keyboard_watcher "$curl_pid" "$flag_file" & watcher_pid=$!
+  else watcher_pid=""; old_stty=""; fi
   text=""
   while IFS= read -r line; do
+    line="${line%$'\r'}"
     case "$line" in
       data:*)
-        data="${line#data:}"
-        data="${data# }"
-        [ "$data" = "[DONE]" ] && break
-        piece="$(printf '%s' "$data" | extract_openrouter_stream_piece)"
-        if [ -n "$piece" ]; then
-          text="$text$piece"
-          printf '%s' "$piece" >&2
-        fi
+        data="${line#data:}"; data="${data# }"
+        if [ "$data" = '[DONE]' ]; then done_seen=1; continue; fi
+        [ -n "$data" ] || continue
+        printf '%s\n' "$data" >> "$work/events.jsonl"
+        piece="$(printf '%s' "$data" | extract_openrouter_stream_piece 2>&1; piece_status=$?; printf '.'; exit "$piece_status")"; piece_status=$?
+        piece="${piece%.}"
+        if [ "$piece_status" -ne 0 ]; then failure="$piece"; kill "$curl_pid" 2>/dev/null || true; break; fi
+        if [ -n "$piece" ]; then text="$text$piece"; printf '%s' "$piece" >&2; fi
         ;;
     esac
-  done <"$fifo"
-
-  wait "$curl_pid" 2>/dev/null
-  status=$?
-  [ -n "$watcher_pid" ] && kill "$watcher_pid" 2>/dev/null || true
-  [ -n "$old_stty" ] && stty "$old_stty" </dev/tty 2>/dev/null || true
-
+  done < "$fifo"
+  wait "$curl_pid" 2>/dev/null; status=$?
+  [ -z "$watcher_pid" ] || { kill "$watcher_pid" 2>/dev/null || true; wait "$watcher_pid" 2>/dev/null || true; }
+  [ -z "$old_stty" ] || stty "$old_stty" </dev/tty 2>/dev/null || true
+  # Continue beyond finish_reason: the final event may hold usage and citations.
+  jq -s '
+    reduce .[] as $event ({};
+      . * ($event | {id,model,usage,provider,service_tier} | with_entries(select(.value!=null))) |
+      .annotations=((.annotations // []) + [$event.annotations[]?,($event.choices[]? | (.message.annotations[]?),(.delta.annotations[]?))]))' \
+    "$work/events.jsonl" > "$work/metadata.json" 2>/dev/null || printf '{}' > "$work/metadata.json"
+  save_openrouter_metadata "$work/metadata.json"
+  sources="$(openrouter_sources < "$work/metadata.json")"
+  if [ -n "$sources" ]; then text="$text"$'\n\nSources:\n'"$sources"; printf '\n\nSources:\n%s\n' "$sources" >&2; fi
   if [ -f "$flag_file" ]; then
     case "$text" in *$'\n'|"") ;; *) text="$text"$'\n' ;; esac
-    text="$text$STREAM_INTERRUPT_MARKER"
-    printf '\n%s\n' "$STREAM_INTERRUPT_MARKER" >&2
-    rm -f "$fifo" "$err_file" "$flag_file"
-    printf '%s\n' "$text"
-    return 0
+    text="$text$STREAM_INTERRUPT_MARKER"; printf '\n%s\n' "$STREAM_INTERRUPT_MARKER" >&2
+    status=0
+  else
+    http_code="$(awk '/^HTTP\// {code=$2} END {print code}' "$work/headers" 2>/dev/null)"
+    if [ -z "$failure" ] && [ "$status" -ne 0 ]; then failure="curl error: $(cat "$err_file" 2>/dev/null)"; fi
+    case "$http_code" in 2??|'') ;; *) [ -n "$failure" ] || failure="OpenRouter HTTP error $http_code" ;; esac
+    if [ -z "$failure" ] && [ "$done_seen" -ne 1 ]; then failure='stream ended before [DONE]; partial reply preserved'; fi
+    if [ -z "$failure" ] && [ -z "$text" ]; then failure='OpenRouter returned an empty text response'; fi
+    if [ -n "$failure" ]; then
+      text="$text"$'\n'"[response error: $failure]"; printf '\n%s\n' "$failure" >&2; status=1
+    fi
   fi
-
-  rm -f "$fifo" "$flag_file"
-  if [ "$status" -ne 0 ]; then
-    printf 'curl error: %s\n' "$(cat "$err_file" 2>/dev/null)"
-    rm -f "$err_file"
-    return 1
-  fi
-  rm -f "$err_file"
-  [ -n "$text" ] || text="(stream ended without extractable text)"
-  printf '\n' >&2
-  printf '%s\n' "$text"
+  rm -f "$fifo" "$err_file" "$flag_file" "$work/request.json" "$work/events.jsonl" "$work/metadata.json" "$work/headers"
+  rmdir "$work" 2>/dev/null || true
+  printf '\n' >&2; printf '%s\n' "$text"; return "$status"
 }
-
 
 # ----------------------------------------------------------
 # MAINTAINER COMMENTARY: function call_model
@@ -1096,20 +1174,33 @@ call_model_stream() {
 # do not get scattered across the interactive loop and colon commands.
 # ----------------------------------------------------------
 call_model() {
-  local model="$1" prompt="$2" full_prompt payload response text status
+  local model="$1" prompt="$2" full_prompt payload response text status work http_code
   if truthy "$DEMO_MODE"; then demo_ai_response "$prompt"; return 0; fi
-  if truthy "$STREAM"; then call_model_stream "$model" "$prompt"; return $?; fi
+  if truthy "$STREAM"; then
+    if command -v jq >/dev/null 2>&1; then call_model_stream "$model" "$prompt"; return $?; fi
+    printf '%s\n' 'Streaming requires jq for lossless text; using a buffered response.' >&2
+  fi
   require_api_key || return 1
-  full_prompt="$(build_prompt_with_attachments "$prompt")"
-  payload="$(build_openrouter_payload "$(normalize_model_id "$model")" "$full_prompt")"
-  response="$(printf '%s' "$payload" | curl -sS --max-time 120 -H 'Content-Type: application/json' -H "Authorization: Bearer $OPENROUTER_API_KEY" -H 'HTTP-Referer: https://github.com/remfan1994/ttychatter' -H 'X-Title: ttychatter' -d @- 'https://openrouter.ai/api/v1/chat/completions' 2>&1)"
-  status=$?; [ "$status" -eq 0 ] || { printf 'curl error: %s
-' "$response"; return 1; }
-  text="$(printf '%s' "$response" | extract_openrouter_text_and_ai_files)"
-  [ -n "$text" ] || text="(could not extract text response; raw response follows)
-$response"
-  printf '%s
-' "$text"
+  full_prompt="$(build_prompt_with_attachments "$prompt")" || return 1
+  payload="$(build_openrouter_payload "$(normalize_model_id "$model")" "$full_prompt")" || return 1
+  work="$(mktemp -d "${TMPDIR:-/tmp}/ttychatter.request.XXXXXX")" || return 1
+  printf '%s' "$payload" > "$work/request.json"
+  http_code="$(curl -sS --max-time 120 -o "$work/response.json" -w '%{http_code}' \
+    -H 'Content-Type: application/json' -H "Authorization: Bearer $OPENROUTER_API_KEY" \
+    -H 'HTTP-Referer: https://github.com/remfan1994/ttychatter' -H 'X-Title: ttychatter' \
+    -d "@$work/request.json" 'https://openrouter.ai/api/v1/chat/completions' 2> "$work/curl.err")"; status=$?
+  if [ "$status" -ne 0 ]; then
+    printf 'curl error: %s\n' "$(cat "$work/curl.err")" >&2
+  else
+    case "$http_code" in
+      2??) text="$(extract_openrouter_text_and_ai_files < "$work/response.json")"; status=$?
+        if [ "$status" -eq 0 ] && [ -z "$text" ]; then printf '%s\n' 'OpenRouter returned an empty text response' >&2; status=1; fi
+        [ -z "$text" ] || printf '%s\n' "$text" ;;
+      *) printf 'OpenRouter HTTP error %s: %s\n' "$http_code" "$(head -c 4096 "$work/response.json")" >&2; status=1 ;;
+    esac
+  fi
+  rm -f "$work/request.json" "$work/response.json" "$work/curl.err"; rmdir "$work" 2>/dev/null || true
+  return "$status"
 }
 
 # ----------------------------------------------------------
@@ -1132,28 +1223,198 @@ test_model() { local model="$1"; printf 'Model: %s\nPrompt: %s\n\n' "$model" "$M
 resolve_session_path() { printf '%s/%s.log
 ' "$SESSION_DIR" "$1"; }
 
-resolve_session_arg() {
+
+# Web search uses OpenRouter's server tool. No local tool execution is needed.
+normalize_web_options() {
+  case "$WEB_SEARCH_ENGINE" in auto|native|exa|parallel|perplexity|firecrawl) ;; *) WEB_SEARCH_ENGINE=auto ;; esac
+  case "$WEB_SEARCH_MAX_RESULTS" in ''|*[!0-9]*) WEB_SEARCH_MAX_RESULTS=5 ;; esac
+  case "$WEB_SEARCH_MAX_USES" in ''|*[!0-9]*) WEB_SEARCH_MAX_USES=3 ;; esac
+  [ "${#WEB_SEARCH_MAX_RESULTS}" -le 2 ] || WEB_SEARCH_MAX_RESULTS=5
+  [ "${#WEB_SEARCH_MAX_USES}" -le 2 ] || WEB_SEARCH_MAX_USES=3
+  WEB_SEARCH_MAX_RESULTS=$((10#$WEB_SEARCH_MAX_RESULTS))
+  WEB_SEARCH_MAX_USES=$((10#$WEB_SEARCH_MAX_USES))
+  [ "$WEB_SEARCH_MAX_RESULTS" -ge 0 ] && [ "$WEB_SEARCH_MAX_RESULTS" -le 25 ] || WEB_SEARCH_MAX_RESULTS=5
+  [ "$WEB_SEARCH_MAX_USES" -ge 0 ] && [ "$WEB_SEARCH_MAX_USES" -le 25 ] || WEB_SEARCH_MAX_USES=3
+}
+
+web_status() {
+  if truthy "$WEB_SEARCH"; then
+    printf 'web search: on (engine=%s, results=%s, uses=%s; provider charges may apply)\n' "$WEB_SEARCH_ENGINE" "$WEB_SEARCH_MAX_RESULTS" "$WEB_SEARCH_MAX_USES"
+  else
+    printf '%s\n' 'web search: off; use :web on to enable'
+  fi
+}
+
+web_command() {
   case "$1" in
-    */*|*.log) printf '%s
-' "$1" ;;
-    *) printf '%s/%s.log
-' "$SESSION_DIR" "$(sanitize_session_name "$1")" ;;
+    on|1|yes|true) WEB_SEARCH=1 ;;
+    off|0|no|false) WEB_SEARCH=0 ;;
+    ''|status) ;;
+    *) printf '%s\n' 'usage: :web [on|off|status]'; return 1 ;;
   esac
+  normalize_web_options
+  web_status
+}
+
+# Titles and IDs are separate. A rename never changes request session_id.
+manual_session_title_clean() {
+  printf '%s' "$1" | LC_ALL=C tr '\r\n\t' '   ' | LC_ALL=C tr -d '\000-\010\013\014\016-\037\177' | awk '{gsub(/[[:space:]]+/," "); sub(/^ /,""); sub(/ $/,""); if(length($0)>200) $0=substr($0,1,200); if(length($0)) print}'
+}
+
+absolute_session_path() {
+  local dir
+  dir="$(cd "$(dirname "$1")" && pwd -P)" || return 1
+  printf '%s/%s\n' "$dir" "$(basename "$1")"
+}
+
+emit_session_path() { printf 'session: %s\n' "$(absolute_session_path "$SESSION")" >&2; }
+
+session_id_from_file() {
+  [ -f "$1" ] || return 1
+  LC_ALL=C awk '/^\[[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\] system: session-id: [0-9a-f]+$/ { id=$NF; if(length(id)==32) { print id; found=1; exit } } END { if(!found) exit 1 }' "$1"
+}
+
+ensure_session_id() {
+  local path="$1" id
+  id="$(session_id_from_file "$path" 2>/dev/null)"
+  if [ -z "$id" ]; then
+    id="$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')"
+    [ "${#id}" -eq 32 ] || { printf '%s\n' 'cannot generate a private session ID' >&2; return 1; }
+    if [ -s "$path" ] && [ "$(tail -c 1 "$path" | od -An -tu1 | tr -d ' ')" != 10 ]; then printf '\n' >> "$path" || return 1; fi
+    printf '[%s] system: session-id: %s\n' "$(timestamp)" "$id" >> "$path" || return 1
+  fi
+  printf '%s\n' "$id"
+}
+
+# Reserve with a hard link so an existing destination is never overwritten.
+# Both paths are in the same directory; symlink sources are left untouched.
+set_session_title() {
+  local path="$1" title="$2" rename_file="${3:-1}" clean id slug dir target old_title old_stem n=0
+  clean="$(manual_session_title_clean "$title")"
+  [ -n "$clean" ] || { printf '%s\n' 'session name must contain visible text' >&2; return 1; }
+  [ -f "$path" ] || { printf 'session not found: %s\n' "$path" >&2; return 1; }
+  [ ! -L "$path" ] || { printf '%s\n' 'rename refused: session path is a symbolic link' >&2; return 1; }
+  id="$(ensure_session_id "$path")" || return 1
+  old_title="$(session_title_from_file "$path" 2>/dev/null || true)"
+  old_stem="$(basename "$path" .log)"
+  target="$path"
+  if [ "$rename_file" -eq 1 ]; then
+    slug="$(sanitize_session_name "$clean")"; slug="${slug:0:80}"
+    dir="$(dirname "$path")"
+    target="$dir/$slug--${id:0:12}.log"
+    if [ "$target" != "$path" ]; then
+      while ! ln -T "$path" "$target" 2>/dev/null; do
+        if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+          printf 'cannot rename session to %s; original preserved\n' "$target" >&2; return 1
+        fi
+        n=$((n+1))
+        [ "$n" -le 9999 ] || { printf '%s\n' 'no free session filename' >&2; return 1; }
+        target="$(printf '%s/%s--%s-%03d.log' "$dir" "$slug" "${id:0:12}" "$n")"
+        [ "$target" = "$path" ] && break
+      done
+    fi
+  fi
+  if { [ "$old_stem" != "$clean" ] && ! write_session_alias_metadata "$target" "$old_stem"; } ||
+     { [ -n "$old_title" ] && [ "$old_title" != "$clean" ] && [ "$old_title" != "$old_stem" ] && ! write_session_alias_metadata "$target" "$old_title"; }; then
+    [ "$target" = "$path" ] || rm -f "$target"
+    return 1
+  fi
+  if ! write_session_title_metadata "$target" "$clean"; then
+    [ "$target" = "$path" ] || rm -f "$target"
+    return 1
+  fi
+  if [ "$target" != "$path" ]; then
+    if ! rm "$path"; then
+      printf 'could not remove old log name; saved log is also at %s\n' "$target" >&2
+      return 1
+    fi
+  fi
+  RENAMED_SESSION_PATH="$target"
+  if [ "${SESSION:-}" = "$path" ]; then
+    SESSION="$target"; SESSION_NAME="$(basename "$target" .log)"; SESSION_ID="$id"
+  fi
+}
+
+session_needs_name() {
+  [ -z "$(session_title_from_file "$SESSION" 2>/dev/null)" ] || return 1
+  case "$(basename "$SESSION" .log)" in session|session-[0-9]*|[0-9][0-9][0-9][0-9]-[0-9]*|[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]*) return 0 ;; *) return 1 ;; esac
+}
+
+maybe_prompt_session_name() {
+  truthy "$PROMPT_SESSION_NAME" || return 0
+  [ -t 0 ] && [ -t 2 ] || return 0
+  [ -z "$PROMPT_TEXT" ] && [ -z "$INPUT_FILE" ] && [ -z "$VOICE_INPUT_PATH" ] || return 0
+  session_needs_name || return 0
+  local answer
+  printf '\nSESSION NAME NEEDED: %s\nName this conversation [Enter to defer]: ' "$(basename "$SESSION")" >&2
+  IFS= read -r answer || return 0
+  [ -n "$(manual_session_title_clean "$answer")" ] || return 0
+  set_session_title "$SESSION" "$answer" "$((1-SESSION_FIXED_PATH))" || return 0
+  printf 'Session saved as: %s\n\n' "$SESSION" >&2
+}
+
+show_session_name() {
+  local title
+  title="$(session_title_from_file "$SESSION" 2>/dev/null)"
+  if [ -n "$title" ]; then printf 'session name: %s\n' "$title"
+  elif session_needs_name; then printf '%s\n' 'SESSION NAME: unnamed. Use :rename Your session name.'
+  else printf 'session name: %s\n' "$SESSION_NAME"; fi
+}
+
+resolve_session_arg() {
+  local name="$1" path fallback result file
+  local -a candidates=() matches=()
+  case "$name" in
+    */*)
+      path="${name/#\~/$HOME}"
+      [ ! -L "$path" ] || { printf 'session path is a symbolic link: %s\n' "$path" >&2; return 1; }
+      printf '%s\n' "$path"; return 0 ;;
+    *.log)
+      if [ -f "$name" ] || [ -L "$name" ]; then path="$name"; else path="$SESSION_DIR/$name"; fi ;;
+    *) path="$SESSION_DIR/$(sanitize_session_name "$name").log" ;;
+  esac
+  [ ! -L "$path" ] || { printf 'session path is a symbolic link: %s\n' "$path" >&2; return 1; }
+  if [ -f "$path" ]; then printf '%s\n' "$path"; return 0; fi
+  fallback="$path"
+  for file in "$SESSION_DIR"/*.log; do
+    [ -f "$file" ] && [ ! -L "$file" ] && [ -r "$file" ] && candidates+=("$file")
+  done
+  if [ "${#candidates[@]}" -gt 0 ]; then
+    result="$(TTYCHATTER_LOOKUP="$name" TTYCHATTER_LOOKUP_STEM="${name%.log}" LC_ALL=C awk '
+      function flush() {
+        if (file!="" && (alias || title==ENVIRON["TTYCHATTER_LOOKUP"] || title==ENVIRON["TTYCHATTER_LOOKUP_STEM"])) print file;
+      }
+      FNR==1 { flush(); file=FILENAME; title=""; alias=0; }
+      /^\[[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\] system: session-title:/ {
+        title=$0; sub(/^\[[^]]*\] system: session-title: ?/,"",title);
+      }
+      /^\[[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\] system: session-alias:/ {
+        value=$0; sub(/^\[[^]]*\] system: session-alias: ?/,"",value);
+        if (value==ENVIRON["TTYCHATTER_LOOKUP"] || value==ENVIRON["TTYCHATTER_LOOKUP_STEM"]) alias=1;
+      }
+      END { flush(); }
+    ' "${candidates[@]}")" || return 1
+    if [ -n "$result" ]; then
+      mapfile -t matches <<< "$result"
+      if [ "${#matches[@]}" -ne 1 ]; then
+        printf 'ambiguous session name: %s; use a filename from --list\n' "$name" >&2; return 2
+      fi
+      printf '%s\n' "${matches[0]}"; return 0
+    fi
+  fi
+  printf '%s\n' "$fallback"
 }
 
 default_session_name_unique() {
-  local base name path n
+  local base name path n=0
   base="session-$(date +%Y-%m-%d-%H-%M-%S)"
   name="$base"
-  path="$(resolve_session_path "$name")"
-  n=1
-  while [ -e "$path" ]; do
-    name="$(printf '%s-%03d' "$base" "$n")"
+  while true; do
     path="$(resolve_session_path "$name")"
-    n=$((n+1))
+    if (set -o noclobber; : > "$path") 2>/dev/null; then printf '%s\n' "$name"; return 0; fi
+    [ -e "$path" ] || [ -L "$path" ] || { printf 'cannot create session in %s\n' "$SESSION_DIR" >&2; return 1; }
+    n=$((n+1)); name="$(printf '%s-%03d' "$base" "$n")"
   done
-  printf '%s
-' "$name"
 }
 
 session_title_clean() {
@@ -1171,21 +1432,28 @@ session_title_clean() {
 }
 
 session_title_from_file() {
-  local path="$1" raw
-  [ -f "$path" ] || return 1
-  raw="$(awk 'BEGIN{IGNORECASE=1} /session-title:/ { line=$0; sub(/^.*session-title:[[:space:]]*/,"",line); val=line } END{ if(val!="") print val }' "$path")"
-  [ -n "$raw" ] || return 1
-  session_title_clean "$raw" "$SESSION_TITLE_MAX_WORDS"
+  [ -f "$1" ] || return 1
+  LC_ALL=C awk '/^\[[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\] system: session-title:/ { line=$0; sub(/^\[[^]]*\] system: session-title:[[:space:]]*/,"",line); value=line } END { if(value!="") print value; else exit 1 }' "$1"
+}
+
+write_session_alias_metadata() {
+  local path="$1" alias="$2"
+  [ -n "$alias" ] || return 0
+  if TTYCHATTER_ALIAS="$alias" LC_ALL=C awk '
+    /^\[[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\] system: session-alias:/ {
+      value=$0; sub(/^\[[^]]*\] system: session-alias: ?/,"",value);
+      if (value==ENVIRON["TTYCHATTER_ALIAS"]) found=1;
+    }
+    END { exit !found; }
+  ' "$path"; then return 0; fi
+  printf '[%s] system: session-alias: %s\n' "$(timestamp)" "$alias" >> "$path"
 }
 
 write_session_title_metadata() {
-  local path="$1" title clean
-  title="$2"
-  clean="$(session_title_clean "$title" "$SESSION_TITLE_MAX_WORDS")"
+  local clean
+  clean="$(manual_session_title_clean "$2")" || return 1
   [ -n "$clean" ] || return 1
-  mkdir -p "$(dirname "$path")"
-  printf '[%s] system: session-title: %s
-' "$(timestamp)" "$clean" >> "$path"
+  printf '[%s] system: session-title: %s\n' "$(timestamp)" "$clean" >> "$1"
 }
 
 ensure_prechat_line() {
@@ -1193,7 +1461,7 @@ ensure_prechat_line() {
   mkdir -p "$(dirname "$path")"
   if [ ! -s "$path" ]; then
     printf '%s
-' "$TC_PRECHAT_LINE" > "$path"
+' "$TC_PRECHAT_LINE" >> "$path"
   fi
 }
 
@@ -1234,64 +1502,123 @@ build_context() { local item out=""; for item in "${CONTEXT_BUFFER[@]}"; do [ -n
 # should preserve old-system usability and update docs/comments if behavior
 # changes.
 # ----------------------------------------------------------
-load_context() { [ -f "$SESSION" ] || return 0; mapfile -t CONTEXT_BUFFER < <(grep -E '^(User|Assistant): ' "$SESSION" | tail -n $((CONTEXT_TURNS*2))); }
+load_context() {
+  [ -f "$SESSION" ] || return 0
+  CONTEXT_BUFFER=()
+  local entry max_entries=$((CONTEXT_TURNS*2)) tmp
+  [ "$max_entries" -ge 2 ] || max_entries=2
+  tmp="$(mktemp "${TMPDIR:-/tmp}/ttychatter.memory.XXXXXX")" || return 1
+  if command -v jq >/dev/null 2>&1; then
+    if ! jq -jRs --argjson limit "$max_entries" --arg notice "$TC_PRECHAT_LINE" '
+      def legacy:
+        split("\n") | .[1:] | reduce .[] as $line ([];
+          if ($line|test("^(User|Assistant): ")) then .+[$line]
+          elif length>0 then .[-1]+="\n"+$line else . end);
+      (reduce (split("\n")[]) as $line ([];
+        if ($line|test("^\\[[0-9]{2}:[0-9]{2}:[0-9]{2}\\] [^:]+:")) then
+          .+[$line|capture("^\\[[^]]*\\] (?<speaker>[^:]+): ?(?<text>.*)$")]
+        elif length>0 then .[-1].text+="\n"+$line else . end)) |
+      reduce .[] as $entry ({context:[],pending:null};
+        if ($entry.speaker|ascii_downcase)=="system" then
+          if ($entry.text|startswith("CONTEXT_SNAPSHOT_JSON ")) then
+            (try ($entry.text|ltrimstr("CONTEXT_SNAPSHOT_JSON ")|fromjson) catch null) as $snapshot |
+            if ($snapshot|type)=="array" and all($snapshot[];type=="string") then .context=$snapshot | .pending=null else . end
+          elif ($entry.text|test("^CONTEXT_BEGIN(\\n|$)")) then .pending=($entry.text|legacy)
+          elif ($entry.text|test("^CONTEXT_END\\s*$")) and .pending!=null then .context=.pending | .pending=null
+          else . end
+        elif $entry.speaker=="remfan1994" and ($entry.text|rtrimstr("\n"))==$notice then .
+        else .pending=null | .context += [(if (["AI","OpenRouter","Assistant"]|index($entry.speaker))!=null then "Assistant: " else "User: " end)+($entry.text|rtrimstr("\n"))]
+        end | .context=.context[-$limit:]) | .context[] | .+"\u0000"' "$SESSION" > "$tmp"; then
+      rm -f "$tmp"; printf '%s\n' 'Could not restore session context.' >&2; return 1
+    fi
+  else
+    # Refuse to bypass an intentional JSON memory clear/edit without a parser.
+    if grep -Eq '^\[[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\] system: CONTEXT_SNAPSHOT_JSON ' "$SESSION"; then
+      rm -f "$tmp"; printf '%s\n' 'This session uses JSON memory snapshots. Install jq to resume its saved memory accurately.' >&2; return 1
+    fi
+    awk -v max="$max_entries" -v notice="$TC_PRECHAT_LINE" '
+      function flush( role,i,linecount,lines,line) {
+        if(speaker=="system") {
+          if(content=="CONTEXT_BEGIN" || index(content,"CONTEXT_BEGIN\n")==1) {
+            pending=1; sn=0; linecount=split(content,lines,"\n");
+            for(i=2;i<=linecount;i++) {
+              line=lines[i]; if(line ~ /^(User|Assistant): /) snapshot[++sn]=line;
+              else if(sn>0) snapshot[sn]=snapshot[sn] "\n" line;
+            }
+          } else if(content=="CONTEXT_END" && pending) {
+            n=0; for(i=1;i<=sn;i++) entries[++n]=snapshot[i]; pending=0;
+          }
+        } else if(speaker!="" && content!="" && !(speaker=="remfan1994" && content==notice)) {
+          pending=0; role=(speaker=="AI" || speaker=="OpenRouter" || speaker=="Assistant")?"Assistant":"User";
+          entries[++n]=role ": " content;
+        }
+        while(n>max) { for(i=2;i<=n;i++) entries[i-1]=entries[i]; n--; }
+        speaker=""; content="";
+      }
+      /^\[[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\] [^:]+:/ {
+        flush(); line=$0; sub(/^\[[^]]*\] /,"",line); speaker=line; sub(/:.*/,"",speaker); sub(/^[^:]*:[[:space:]]*/,"",line); content=line; next;
+      }
+      { if(speaker!="") content=content "\n" $0 }
+      END { flush(); for(i=1;i<=n;i++) printf "%s%c",entries[i],0; }' "$SESSION" > "$tmp" || { rm -f "$tmp"; return 1; }
+  fi
+  while IFS= read -r -d '' entry; do CONTEXT_BUFFER+=("$entry"); done < "$tmp"
+  rm -f "$tmp"
+}
 # ----------------------------------------------------------
 # MAINTAINER COMMENTARY: function write_context_snapshot
 # write_context_snapshot is part of the dependency-light client behavior.
 # Changes should preserve old-system usability and update docs/comments if
 # behavior changes.
 # ----------------------------------------------------------
-write_context_snapshot() { local item ts="$1"; printf '[%s] system: CONTEXT_BEGIN\n' "$ts" >> "$SESSION"; for item in "${CONTEXT_BUFFER[@]}"; do printf '%s\n' "$item" >> "$SESSION"; done; printf '[%s] system: CONTEXT_END\n' "$ts" >> "$SESSION"; }
+write_context_snapshot() {
+  local item ts="$1" snapshot
+  if command -v jq >/dev/null 2>&1; then
+    snapshot="$(if [ "${#CONTEXT_BUFFER[@]}" -gt 0 ]; then printf '%s\0' "${CONTEXT_BUFFER[@]}"; fi | jq -cRs 'if .=="" then [] else split("\u0000")[:-1] end')" || return 1
+    printf '[%s] system: CONTEXT_SNAPSHOT_JSON %s\n' "$ts" "$snapshot" >> "$SESSION"
+  else
+    printf '[%s] system: CONTEXT_BEGIN\n' "$ts" >> "$SESSION" || return 1
+    for item in "${CONTEXT_BUFFER[@]}"; do printf '%s\n' "$item" >> "$SESSION" || return 1; done
+    printf '[%s] system: CONTEXT_END\n' "$ts" >> "$SESSION"
+  fi
+}
 # ----------------------------------------------------------
 # MAINTAINER COMMENTARY: function extract_code_blocks
 # Saves generated fenced code to files when possible, keeping terminal
 # output readable.
 # ----------------------------------------------------------
 extract_code_blocks() {
-  awk -v dir="$ATTACHMENT_DIR" -v session="$SESSION_NAME" -v min_lines="$CODE_ATTACHMENT_MIN_LINES" '
-    BEGIN { inblock=0; count=0; content=""; linecount=0; lang="text" }
-    /^```/ {
-      if (!inblock) {
-        inblock=1
-        lang=$0
-        sub(/^```/, "", lang)
-        if (lang == "") lang="text"
-        content=""
-        linecount=0
-        next
-      }
-      if (linecount < min_lines) {
-        print "```" lang
-        printf "%s", content
-        print "```"
-      } else {
-        count++
-        file=dir "/" session "-" lang "-" sprintf("%02d", count) ".txt"
-        printf "%s", content > file
-        close(file)
-        print "[attachment saved]"
-        print "file: " file
-      }
-      inblock=0
-      content=""
-      linecount=0
-      next
-    }
-    {
-      if (inblock) {
-        content = content $0 ORS
-        if (length($0) > 0) linecount++
-      } else {
-        print
-      }
-    }
-    END {
-      if (inblock) {
-        print "```" lang
-        printf "%s", content
-      }
-    }
-  '
+  local line opening="" content="" inblock=0 lines=0 lang ext tag path n
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [[ "$line" == '```'* ]]; then
+      if [ "$inblock" -eq 0 ]; then
+        opening="$line"; lang="${line#'```'}"; content=""; lines=0; inblock=1
+      else
+        if [ "$lines" -ge "$CODE_ATTACHMENT_MIN_LINES" ]; then
+          mkdir -p "$ATTACHMENT_DIR" || return 1
+          tag="$(printf '%s' "${lang:-text}" | LC_ALL=C tr -c 'A-Za-z0-9_+-' '_')"
+          case "$lang" in sh|bash|shell) ext=.sh ;; python|py) ext=.py ;; json) ext=.json ;; yaml|yml) ext=.yml ;; javascript|js) ext=.js ;; html|css|sql|c|h) ext=".$lang" ;; cpp|c++) ext=.cpp ;; *) ext=.txt ;; esac
+          n=1
+          while true; do
+            path="$(printf '%s/%s-%s-%02d%s' "$ATTACHMENT_DIR" "$SESSION_NAME" "$tag" "$n" "$ext")"
+            if (set -o noclobber; printf '%s' "$content" > "$path") 2>/dev/null; then break; fi
+            [ -e "$path" ] || [ -L "$path" ] || { printf 'Cannot write code attachment: %s\n' "$path" >&2; return 1; }
+            n=$((n+1)); [ "$n" -le 99999 ] || return 1
+          done
+          printf '\n[code attachment saved]\nfile: %s\nlocation: %s\n' "$(basename "$path")" "$ATTACHMENT_DIR"
+        else
+          printf '%s\n%s%s\n' "$opening" "$content" "$line"
+        fi
+        inblock=0; content=""
+      fi
+    elif [ "$inblock" -eq 1 ]; then
+      content="$content$line"$'\n'
+      [[ "$line" =~ [^[:space:]] ]] && lines=$((lines+1))
+    else
+      printf '%s\n' "$line"
+    fi
+  done
+  if [ "$inblock" -eq 1 ]; then printf '%s\n%s' "$opening" "$content"; fi
+  return 0
 }
 
 
@@ -1373,7 +1700,7 @@ General:
 
 Sessions:
   :list                   List saved sessions with friendly titles
-  :rename TITLE           Set friendly session-title metadata
+  :rename TITLE           Name the session and rename its log file
 
 Models:
   :models                 Show model list
@@ -1405,6 +1732,7 @@ Files and editor:
   :branch N               Branch current session after message N
   :search TEXT            Search current session
   :search-all TEXT        Search all saved sessions
+  :web [on|off|status]                 Show/toggle OpenRouter web search
   :stream on|off          Toggle requested streaming mode
   :ai-download MODE       AI file receipt: ask, auto, metadata, off
   :status on|off          Toggle local status updates
@@ -1427,6 +1755,7 @@ print_config_summary() {
   printf 'SESSION_AUTO_TITLE=%s\n' "$SESSION_AUTO_TITLE"
   printf 'SESSION_TITLE_MODEL=%s\n' "$SESSION_TITLE_MODEL"
   printf 'SESSION_TITLE_MAX_WORDS=%s\n' "$SESSION_TITLE_MAX_WORDS"
+  printf 'WEB_SEARCH=%s\nWEB_SEARCH_ENGINE=%s\nWEB_SEARCH_MAX_RESULTS=%s\nWEB_SEARCH_MAX_USES=%s\nPROMPT_SESSION_NAME=%s\n' "$WEB_SEARCH" "$WEB_SEARCH_ENGINE" "$WEB_SEARCH_MAX_RESULTS" "$WEB_SEARCH_MAX_USES" "$PROMPT_SESSION_NAME"
   printf 'STREAM=%s\n' "$STREAM"
   printf 'STATUS_UPDATES=%s\n' "$STATUS_UPDATES"
   printf 'VOICE_INPUT_CMD=%s\n' "$VOICE_INPUT_CMD"
@@ -1462,25 +1791,17 @@ compose_with_editor_basic() {
 }
 
 rename_current_session() {
-  local new_title="$1"
-  [ -n "$new_title" ] || { printf '%s
-' "usage: :rename NEW_TITLE"; return 1; }
-  ensure_prechat_line "$SESSION"
-  write_session_title_metadata "$SESSION" "$new_title" || return 1
-  printf 'session title set: %s
-' "$(session_title_from_file "$SESSION" 2>/dev/null || printf '%s' "$new_title")"
+  [ -n "$1" ] || { printf '%s\n' 'usage: :rename Your session name'; return 1; }
+  set_session_title "$SESSION" "$1" || return 1
+  printf 'session name: %s\nsession: %s\n' "$(session_title_from_file "$SESSION")" "$SESSION"
 }
 
 rename_session_command() {
-  local target="$1" new_title="$2" path
-  [ -n "$target" ] && [ -n "$new_title" ] || { printf '%s
-' "ERROR: --rename-session requires SESSION TITLE" >&2; return 2; }
-  path="$(resolve_session_arg "$target")"
-  [ -f "$path" ] || { printf 'ERROR: session not found: %s
-' "$target" >&2; return 1; }
-  write_session_title_metadata "$path" "$new_title" || return 1
-  printf 'session title set: %s
-' "$(session_title_from_file "$path" 2>/dev/null || printf '%s' "$new_title")"
+  local target="$1" title="$2" path
+  [ -n "$target" ] && [ -n "$title" ] || { printf '%s\n' 'ERROR: --rename-session requires SESSION TITLE' >&2; return 2; }
+  path="$(resolve_session_arg "$target")" || return 1
+  set_session_title "$path" "$title" || return 1
+  printf 'session name: %s\nsession: %s\n' "$(session_title_from_file "$RENAMED_SESSION_PATH")" "$(absolute_session_path "$RENAMED_SESSION_PATH")"
 }
 
 show_current_memory_runtime() {
@@ -1510,7 +1831,16 @@ ACTIVE_MODEL="$(effective_model)" ;;
     SESSION_DIR) SESSION_DIR="${value/#\~/$HOME}"; mkdir -p "$SESSION_DIR" ;;
     ATTACHMENT_DIR) ATTACHMENT_DIR="${value/#\~/$HOME}"; mkdir -p "$ATTACHMENT_DIR" ;;
     AI_FILE_DOWNLOAD_MODE|AI_DOWNLOAD) AI_FILE_DOWNLOAD_MODE="$value" ;;
+    WEB_SEARCH) WEB_SEARCH="$value" ;;
+    WEB_SEARCH_ENGINE) WEB_SEARCH_ENGINE="$value" ;;
+    WEB_SEARCH_MAX_RESULTS) WEB_SEARCH_MAX_RESULTS="$value" ;;
+    WEB_SEARCH_MAX_USES) WEB_SEARCH_MAX_USES="$value" ;;
+    PROMPT_SESSION_NAME) PROMPT_SESSION_NAME="$value" ;;
     MODEL_TEST_PROMPT) MODEL_TEST_PROMPT="$value" ;;
+    STREAM) STREAM="$value" ;;
+    SESSION_AUTO_TITLE) SESSION_AUTO_TITLE="$value" ;;
+    SESSION_TITLE_MODEL) SESSION_TITLE_MODEL="$value" ;;
+    SESSION_TITLE_MAX_WORDS) SESSION_TITLE_MAX_WORDS="$value" ;;
     STARTUP_NOTICE) STARTUP_NOTICE="$value" ;;
     THEME) THEME="$value" ;;
     SEND_INPUT) SEND_INPUT="$value" ;;
@@ -1553,7 +1883,7 @@ run_voice_output_command() {
 }
 
 generate_session_title() {
-  local user_text="$1" ai_text="$2" prompt title saved
+  local user_text="$1" ai_text="$2" prompt title saved saved_stream saved_web
   truthy "$SESSION_AUTO_TITLE" || return 0
   [ -n "$(session_title_from_file "$SESSION" 2>/dev/null || true)" ] && return 0
   if truthy "$DEMO_MODE"; then
@@ -1563,66 +1893,97 @@ generate_session_title() {
     [ -n "$SESSION_TITLE_MODEL" ] || return 0
     prompt="Generate a concise topical title for this ttychatter session. Reply with only the title, no quotes, no explanation, maximum $SESSION_TITLE_MAX_WORDS words.\n\nUser: $user_text\nAssistant: $ai_text"
     saved=("${ATTACH_FILES[@]}")
+    saved_stream="$STREAM"; saved_web="$WEB_SEARCH"; STREAM=0; WEB_SEARCH=0
     ATTACH_FILES=()
     title="$(call_model "$SESSION_TITLE_MODEL" "$prompt" 2>/dev/null | head -n 1)"
     ATTACH_FILES=("${saved[@]}")
+    STREAM="$saved_stream"; WEB_SEARCH="$saved_web"
     title="$(session_title_clean "$title" "$SESSION_TITLE_MAX_WORDS")"
   fi
-  [ -n "$title" ] && write_session_title_metadata "$SESSION" "$title"
+  if [ -n "$title" ]; then set_session_title "$SESSION" "$title" "$((1-SESSION_FIXED_PATH))"; fi
 }
 
 turns_command() {
   local path="$1"
-  path="$(resolve_session_arg "$path")"
+  path="$(resolve_session_arg "$path")" || return 1
   [ -f "$path" ] || { printf 'session not found: %s\n' "$path" >&2; return 1; }
   printf '%-5s %-10s %s\n' "MSG" "ROLE" "PREVIEW"
-  awk '
+  TTYCHATTER_NOTICE="$TC_PRECHAT_LINE" awk '
     /^\[[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\] / {
       line=$0; sub(/^\[[^]]*\] /,"",line); speaker=line; sub(/:.*/,"",speaker);
-      if (speaker=="system" || speaker=="remfan1994") next;
-      role=(speaker=="AI" || speaker=="OpenRouter") ? "assistant" : "user";
-      content=line; sub(/^[^:]*:[[:space:]]*/,"",content); gsub(/[[:space:]]+/," ",content);
+      if (tolower(speaker)=="system") next;
+      role=(speaker=="AI" || speaker=="OpenRouter" || speaker=="Assistant") ? "assistant" : "user";
+      content=line; sub(/^[^:]*: ?/,"",content);
+      if (speaker=="remfan1994" && content==ENVIRON["TTYCHATTER_NOTICE"]) next;
+      gsub(/[[:space:]]+/," ",content);
       n++; if(length(content)>78) content=substr(content,1,75)"...";
       printf "%-5d %-10s %s\n", n, role, content;
     }' "$path"
 }
 
 branch_session_command() {
-  local source="$1" turn="$2" src branch
+  local source="$1" turn="$2" src branch title
   [ -n "$source" ] && [ -n "$turn" ] || { printf '%s\n' "usage: --branch SESSION TURN" >&2; return 2; }
-  src="$(resolve_session_arg "$source")"
+  case "$turn" in ''|*[!0-9]*) printf '%s\n' 'branch turn must be numeric' >&2; return 2 ;; esac
+  src="$(resolve_session_arg "$source")" || return 1
   [ -f "$src" ] || { printf 'session not found: %s\n' "$src" >&2; return 1; }
   branch="$(resolve_session_path "$(default_session_name_unique)")"
   ensure_prechat_line "$branch"
   printf '[%s] system: branch-from: %s\n[%s] system: branch-turn: %s\n[%s] system: branch-reason: manual-branch\n' "$(timestamp)" "$src" "$(timestamp)" "$turn" "$(timestamp)" >> "$branch"
-  awk -v max="$turn" '
-    function ismsg(line, speaker) { if (line !~ /^\[[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\] /) return 0; speaker=line; sub(/^\[[^]]*\] /,"",speaker); sub(/:.*/,"",speaker); return !(speaker=="system" || speaker=="remfan1994"); }
-    { if (ismsg($0)) { count++; keep=(count<=max) } if (keep && count<=max) print }
+  TTYCHATTER_NOTICE="$TC_PRECHAT_LINE" awk -v max="$turn" '
+    function ismsg(line, speaker, content) {
+      if (line !~ /^\[[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\] /) return 0;
+      sub(/^\[[^]]*\] /,"",line); speaker=line; sub(/:.*/,"",speaker);
+      content=line; sub(/^[^:]*: ?/,"",content);
+      return !(tolower(speaker)=="system" || (speaker=="remfan1994" && content==ENVIRON["TTYCHATTER_NOTICE"]));
+    }
+    /^\[[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\] / { if(ismsg($0)) { count++; keep=(count<=max) } else keep=0 }
+    { if (keep && count<=max) print }
   ' "$src" >> "$branch"
-  printf '%s\n' "$branch"
+  title="$(session_title_from_file "$src" 2>/dev/null || basename "$src" .log)"
+  set_session_title "$branch" "Branch of $title" || return 1
+  printf '%s\n' "$RENAMED_SESSION_PATH"
 }
 
 export_session_command() {
-  local name="$1" fmt="${2:-markdown}" out="$3" path title tmp
+  local name="$1" fmt="${2:-markdown}" out="$3" path title tmp status
   [ -n "$name" ] || { printf '%s\n' "usage: --export SESSION [--format markdown|text] [--output FILE]" >&2; return 2; }
-  path="$(resolve_session_arg "$name")"
+  path="$(resolve_session_arg "$name")" || return 1
   [ -f "$path" ] || { printf 'session not found: %s\n' "$path" >&2; return 1; }
   title="$(session_title_from_file "$path" 2>/dev/null || basename "$path" .log)"
   tmp="$(mktemp)" || return 1
   case "$fmt" in
     text)
       printf 'Title: %s\nSession: %s\n\n' "$title" "$path" > "$tmp"
-      awk '/^\[[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\] / { line=$0; sub(/^\[[^]]*\] /,"",line); speaker=line; sub(/:.*/,"",speaker); if(speaker=="system"||speaker=="remfan1994") next; sub(/^[^:]*:[[:space:]]*/,"",line); print speaker ":\n" line "\n" }' "$path" >> "$tmp"
       ;;
     json)
       printf '%s\n' "bash-only JSON export is intentionally omitted; use ttychatter.python or the C edition." >&2; rm -f "$tmp"; return 2 ;;
     *)
       printf '# %s\n\nSource: `%s`\n\n' "$title" "$path" > "$tmp"
-      awk '/^\[[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\] / { line=$0; sub(/^\[[^]]*\] /,"",line); speaker=line; sub(/:.*/,"",speaker); if(speaker=="system"||speaker=="remfan1994") next; sub(/^[^:]*:[[:space:]]*/,"",line); label=(speaker=="AI"?"Assistant":"User"); print "## " label "\n\n" line "\n" }' "$path" >> "$tmp"
       ;;
   esac
-  if [ -n "$out" ]; then cat "$tmp" > "$out"; else cat "$tmp"; fi
+  TTYCHATTER_NOTICE="$TC_PRECHAT_LINE" awk -v fmt="$fmt" '
+    function flush(    label) {
+      if (speaker=="" || tolower(speaker)=="system") return;
+      if (speaker=="remfan1994" && content==ENVIRON["TTYCHATTER_NOTICE"]) return;
+      label=(speaker=="AI" || speaker=="OpenRouter" || speaker=="Assistant") ? "Assistant" : "User";
+      if (fmt=="text") print label ":\n" content "\n";
+      else print "## " label "\n\n" content "\n";
+    }
+    /^\[[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\] [^:]+:/ {
+      flush(); line=$0; sub(/^\[[^]]*\] /,"",line); speaker=line; sub(/:.*/,"",speaker);
+      sub(/^[^:]*: ?/,"",line); content=line; next;
+    }
+    { if (speaker!="") content=content "\n" $0; }
+    END { flush(); }
+  ' "$path" >> "$tmp"
+  status=$?
+  if [ "$status" -eq 0 ]; then
+    if [ -n "$out" ]; then cat "$tmp" > "$out"; else cat "$tmp"; fi
+    status=$?
+  fi
   rm -f "$tmp"
+  return "$status"
 }
 
 search_session_file() {
@@ -1678,6 +2039,7 @@ handle_runtime_command() {
     doctor) doctor_command ;;
     list|sessions) list_sessions ;;
     rename) rename_current_session "$rest" ;;
+    web) web_command "$rest" ;;
     turns) turns_command "$SESSION_NAME" ;;
     branch|fork) branch_session_command "$SESSION_NAME" "$rest" ;;
     search) [ -n "$rest" ] && search_command "$rest" 0 "$SESSION" || printf '%s
@@ -1751,6 +2113,10 @@ while [ "$#" -gt 0 ]; do
     -o|--output) shift; OUTPUT_PATH="${1:-}";;
     -s|--session) shift; SESSION_NAME="${1:-}";;
     --stream) STREAM=1;; --no-stream) STREAM=0;;
+    --web) WEB_SEARCH=1;; --no-web) WEB_SEARCH=0;;
+    --web-engine) shift; [ "$#" -gt 0 ] || { printf '%s\n' 'ERROR: --web-engine requires ENGINE' >&2; exit 2; }; WEB_SEARCH_ENGINE="$1"; case "$1" in auto|native|exa|parallel|perplexity|firecrawl) ;; *) printf '%s\n' 'ERROR: unsupported web engine' >&2; exit 2 ;; esac ;;
+    --web-max-results) shift; [ "$#" -gt 0 ] || { printf '%s\n' 'ERROR: --web-max-results requires N' >&2; exit 2; }; case "$1" in ''|*[!0-9]*) printf '%s\n' 'ERROR: results must be 0..25' >&2; exit 2 ;; esac; [ "${#1}" -le 2 ] && [ "$((10#$1))" -ge 0 ] && [ "$((10#$1))" -le 25 ] || { printf '%s\n' 'ERROR: results must be 0..25' >&2; exit 2; }; WEB_SEARCH_MAX_RESULTS="$1" ;;
+    --web-max-uses) shift; [ "$#" -gt 0 ] || { printf '%s\n' 'ERROR: uses must be 0..25' >&2; exit 2; }; case "$1" in ''|*[!0-9]*) printf '%s\n' 'ERROR: uses must be 0..25' >&2; exit 2 ;; esac; [ "${#1}" -le 2 ] && [ "$((10#$1))" -ge 0 ] && [ "$((10#$1))" -le 25 ] || { printf '%s\n' 'ERROR: uses must be 0..25' >&2; exit 2; }; WEB_SEARCH_MAX_USES="$1" ;;
     --ai-download) shift; AI_FILE_DOWNLOAD_MODE="${1:-ask}";;
     --status|--progress) STATUS_UPDATES=1;; --no-status|--no-progress) STATUS_UPDATES=0;;
     --voice-input|--transcribe) shift; VOICE_INPUT_PATH="${1:-}";;
@@ -1796,7 +2162,7 @@ case "$ACTION" in
   export) export_session_command "$EXPORT_SESSION" "$EXPORT_FORMAT" "$OUTPUT_PATH"; exit $?;;
   search) if [ -z "$SESSION_NAME" ]; then SEARCH_ALL=1; fi; search_command "$SEARCH_QUERY" "$SEARCH_ALL" "$( [ -n "$SESSION_NAME" ] && resolve_session_arg "$SESSION_NAME" || true )"; exit $?;;
   rename) rename_session_command "$RENAME_OLD" "$RENAME_NEW"; exit $?;;
-  help) help_menu; exit 0;; version) printf '%s version %s\n' "$PROGRAM" "$VERSION"; exit 0;; doctor) doctor_command; exit 0;; credits) credits; exit 0;; list) list_sessions; exit 0;; models) list_models; exit $?;; favorites) list_favorite_models; exit $?;; favorite) favorite_model_command "$TEST_MODEL"; exit $?;; unfavorite) unfavorite_model_command "$TEST_MODEL"; exit $?;; config) print_config_summary; exit 0;; set-config) [ -n "$SET_KEY" ] || { printf 'ERROR: --set requires KEY VALUE\n' >&2; exit 2; }; save_config_value "$SET_KEY" "$SET_VALUE"; exit $?;; unset-config) [ -n "$UNSET_KEY" ] || { printf 'ERROR: --unset requires KEY\n' >&2; exit 2; }; remove_config_key "$UNSET_KEY"; exit $?;; update-models) update_models_cache; exit $?;; select) select_model; exit $?;; test) [ -n "$TEST_MODEL" ] || { printf 'ERROR: --test-model requires a model\n' >&2; exit 2; }; test_model "$TEST_MODEL"; [ "$SAVE" -eq 1 ] && save_config_value MODEL "$TEST_MODEL"; exit $?;; set-key) set_api_key_command; exit $?;; forget-key) forget_api_key_command; exit $?;;
+  help) help_menu; exit 0;; version) printf '%s version %s\n' "$PROGRAM" "$VERSION"; exit 0;; doctor) doctor_command; exit 0;; credits) credits; exit 0;; list) list_sessions; exit 0;; models) list_models; exit $?;; favorites) list_favorite_models; exit $?;; favorite) favorite_model_command "$TEST_MODEL"; exit $?;; unfavorite) unfavorite_model_command "$TEST_MODEL"; exit $?;; config) print_config_summary; exit 0;; set-config) [ -n "$SET_KEY" ] || { printf 'ERROR: --set requires KEY VALUE\n' >&2; exit 2; }; save_config_value "$SET_KEY" "$SET_VALUE"; exit $?;; unset-config) [ -n "$UNSET_KEY" ] || { printf 'ERROR: --unset requires KEY\n' >&2; exit 2; }; remove_config_key "$UNSET_KEY"; exit $?;; update-models) update_models_cache; exit $?;; select) select_model; exit $?;; test) [ -n "$TEST_MODEL" ] || { printf 'ERROR: --test-model requires a model\n' >&2; exit 2; }; test_model "$TEST_MODEL"; test_status=$?; if [ "$test_status" -eq 0 ] && [ "$SAVE" -eq 1 ]; then save_config_value MODEL "$TEST_MODEL" || test_status=$?; fi; exit "$test_status";; set-key) set_api_key_command; exit $?;; forget-key) forget_api_key_command; exit $?;;
 esac
 
 # ==========================================================
@@ -1810,24 +2176,32 @@ if [ "$FORCE_NEW" -eq 1 ] && { [ -n "$SESSION_NAME" ] || [ -n "$OUTPUT_PATH" ] |
   exit 2
 fi
 SESSION_ARG="$SESSION_NAME"
-if [ -z "$SESSION_ARG" ]; then
-  SESSION_NAME="$(default_session_name_unique)"
-  SESSION="$(resolve_session_path "$SESSION_NAME")"
-elif [ -n "$OUTPUT_PATH" ]; then
-  SESSION_NAME="$(sanitize_session_name "$SESSION_ARG")"
+if [ -n "$OUTPUT_PATH" ]; then
+  SESSION_FIXED_PATH=1
+  SESSION_NAME="$(basename "$OUTPUT_PATH" .log)"
   SESSION="$OUTPUT_PATH"
+elif [ -z "$SESSION_ARG" ]; then
+  SESSION_NAME="$(default_session_name_unique)" || exit 1
+  SESSION="$(resolve_session_path "$SESSION_NAME")"
 else
-  case "$SESSION_ARG" in
-    */*|*.log) SESSION="$(resolve_session_arg "$SESSION_ARG")"; SESSION_NAME="$(basename "$SESSION" .log)" ;;
-    *) SESSION_NAME="$(sanitize_session_name "$SESSION_ARG")"; SESSION="$(resolve_session_path "$SESSION_NAME")" ;;
-  esac
+  SESSION="$(resolve_session_arg "$SESSION_ARG")" || exit 1
+  SESSION_NAME="$(basename "$SESSION" .log)"
 fi
 SESSION_WAS_EMPTY=1
 [ -s "$SESSION" ] && SESSION_WAS_EMPTY=0
 [ "$RESUME" -eq 1 ] && [ ! -f "$SESSION" ] && { printf 'session not found: %s
 ' "$SESSION_NAME" >&2; exit 1; }
-ensure_prechat_line "$SESSION"
-load_context
+ensure_prechat_line "$SESSION" || exit 1
+SESSION="$(absolute_session_path "$SESSION")" || exit 1
+SESSION_ID="$(ensure_session_id "$SESSION")" || exit 1
+# A supplied descriptive name is already a naming decision; preserve it.
+if [ "$SESSION_WAS_EMPTY" -eq 1 ] && [ -n "$SESSION_ARG" ] && ! session_needs_name; then
+  write_session_title_metadata "$SESSION" "$(basename "$SESSION_ARG" .log)" || exit 1
+fi
+case "$SESSION" in "$SESSION_DIR"/*) ;; *) SESSION_FIXED_PATH=1 ;; esac
+normalize_web_options
+maybe_prompt_session_name
+load_context || exit 1
 if truthy "$DEMO_MODE" && [ -z "$MODEL" ]; then MODEL="demo/auto"; fi
 ACTIVE_MODEL="$(effective_model)"
 NOTICE_VISIBLE=0
@@ -1847,25 +2221,31 @@ if [ "$LOOPBACK" -eq 1 ]; then
   exec 1>&2
 fi
 
+show_session_name
+web_status
 printf '%s (bash-only)\n' "$PROGRAM"; printf 'session: %s\n' "$SESSION"; printf 'model: %s\n' "$(model_label)"; printf 'Ctrl+D to send, :help for commands, Ctrl+C to exit\n\n'
 if [ "$NOTICE_VISIBLE" -eq 1 ]; then printf '%s\n\n' "$TC_PRECHAT_LINE"; fi
 send_one_message() {
-  local buffer="$1" ts context output cleaned
+  local buffer="$1" ts context output cleaned output_status save_failed=0
   ts="$(timestamp)"
   [ -z "$buffer" ] && { printf '%s
 ' "empty message ignored"; return 1; }
-  printf '[%s] %s: %s
-' "$ts" "$USER_NAME" "$buffer" >> "$SESSION"
+  printf '[%s] %s: %s\n' "$ts" "$USER_NAME" "$buffer" >> "$SESSION" || { printf '%s\n' 'Cannot save prompt; no request was sent.' >&2; return 1; }
   add_context "User: $buffer"
   context="$(build_context)"
   status_update "preparing request for $ACTIVE_MODEL"
-  output="$(call_model "$ACTIVE_MODEL" "$context")"
-  printf '[%s] AI: %s
-' "$(timestamp)" "$output" >> "$SESSION"
-  cleaned="$(printf '%s
-' "$output" | extract_code_blocks)"
+  output="$(call_model "$ACTIVE_MODEL" "$context")"; output_status=$?
+  if [ "$output_status" -ne 0 ]; then
+    printf '[%s] system: response-error: %s\n' "$(timestamp)" "${output:-OpenRouter request failed}" >> "$SESSION"
+    [ -z "$output" ] || printf '%s\n' "$output" >&2
+    emit_session_path
+    return "$output_status"
+  fi
+  ATTACH_FILES=()
+  printf '[%s] AI: %s\n' "$(timestamp)" "$output" >> "$SESSION" || { save_failed=1; printf '%s\n' 'Response received, but the log write failed. Copy the displayed reply before closing.' >&2; }
+  cleaned="$(printf '%s\n' "$output" | extract_code_blocks)" || { cleaned="$output"; save_failed=1; printf '%s\n' 'Attachment extraction failed; showing the complete original reply.' >&2; }
   add_context "Assistant: $cleaned"
-  write_context_snapshot "$(timestamp)"
+  write_context_snapshot "$(timestamp)" || { save_failed=1; printf '%s\n' 'The response is displayed, but its memory snapshot could not be saved.' >&2; }
   if [ "$LOOPBACK" -eq 1 ]; then
     printf '%s\n' "$cleaned" >&3
   fi
@@ -1874,10 +2254,12 @@ send_one_message() {
 ' "$cleaned" >> "$LOOPBACK_FILE"
   fi
   LAST_AI_OUTPUT="$cleaned"
-  generate_session_title "$buffer" "$cleaned"
+  if [ "$save_failed" -eq 0 ]; then generate_session_title "$buffer" "$cleaned"; fi
   if truthy "$VOICE_OUTPUT" || [ "$SPEAK_OVERRIDE" = "1" ]; then run_voice_output_command "$cleaned" || true; fi
   if [ "$LOOPBACK" -eq 1 ]; then printf '%s
 ' "$cleaned"; else print_ai_output "$cleaned"; fi
+  emit_session_path
+  return "$save_failed"
 }
 
 # ----------------------------------------------------------
