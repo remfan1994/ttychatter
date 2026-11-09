@@ -1,0 +1,141 @@
+TTYCHATTER UPDATE - 2026-11-03
+
+This package contains ttychatter.ncurses 0.17.0 plus coordinated web-search
+limit fixes in the C, Bash, Python-helper, and mailbot clients.
+
+1. CHECK THE NCURSES VERSION
+
+From the extracted package directory:
+
+    python3 ./nonc/ttychatter.ncurses --version
+
+Expected:
+
+    ttychatter.ncurses version 0.17.0
+
+To exercise the UI without a paid/network model request:
+
+    python3 ./nonc/ttychatter.ncurses --demo --new
+
+2. NCURSES UI CHANGES
+
+- Escape is the primary full command menu. F1 remains only an optional alias.
+- Ctrl+P, Ctrl+W, Ctrl+K, Ctrl+L, Ctrl+N, and Ctrl+O are not application
+  shortcuts. Attachment operations are under F7 Files. Web settings are under
+  F5 Options. Session naming is in the Escape menu. F11 toggles draft/read.
+- Enter remains the default send behavior. Ctrl+G is captured only when
+  SEND_INPUT=ctrl_g is explicitly configured.
+- The empty draft placeholder renders the complete text "Type here...",
+  including its first T at the cursor cell.
+- Read mode supports Up/Down and vim-like k/j, u/d, g/G in addition to
+  PgUp/PgDn.
+- A response automatically enters read mode when output begins rendering.
+- OpenRouter generation runs in a background worker. The curses UI continues
+  accepting navigation and function-key screen changes while a request is in
+  flight. Settings changed during a request affect the next request.
+- Modal screens poll the background worker without treating poll timeouts as
+  key presses.
+- F4 Sessions sorts newest activity first by default. Press s for sort choices,
+  / for title/filename search, f for case-insensitive full-text log search,
+  and x to clear searches.
+- Session switching, renaming, and deletion are blocked only while a response
+  is in flight, so the completed reply cannot be written to the wrong log.
+
+3. WEB SEARCH COMPATIBILITY
+
+Ncurses F5 Options now contains all web settings, including Web compatibility:
+
+    auto
+    server-tool
+    plugin
+
+Auto prefers OpenRouter's openrouter:web_search server tool. If cached model
+metadata explicitly lacks tool support, auto uses the older OpenRouter web
+plugin instead. If a server-tool request receives OpenRouter's specific HTTP
+404 saying no endpoints support tool use, auto retries once with the web
+plugin. Explicit server-tool mode does not silently fall back and reports a
+friendly explanation instead.
+
+This addresses models/routes such as a Grok Multi-Agent route that can reject
+server tool use while still allowing ttychatter to obtain web context through
+OpenRouter's model-independent web plugin.
+
+WEB_SEARCH_MAX_RESULTS and WEB_SEARCH_MAX_USES now accept 0..25 across the
+client family. Zero means ttychatter omits that limit from the request:
+
+- results = 0: omit max_results and leave the provider default.
+- search rounds = 0: omit max_tool_calls and impose no ttychatter round cap.
+
+Provider/model/context/rate/account limits still apply. Zero is not literal
+infinite compute and is not a spending cap.
+
+4. MAIN NCURSES KEYS
+
+    Esc                 Full command menu
+    F2                  Models
+    F3                  API key
+    F4                  Sessions
+    F5                  Options, including web settings
+    F6                  Memory
+    F7                  Files and attachments
+    F8                  External editor options
+    F9                  About
+    F10                 Close confirmation
+    F11                 Draft/read toggle
+    PgUp/PgDn           Transcript page scrolling
+    Up/Down or k/j      Read-mode line scrolling
+    u/d                 Read-mode half-page scrolling
+    g/G                 Oldest/latest transcript position
+
+There are intentionally no dedicated control-key shortcuts for attachment,
+web-option, menu, naming, or draft/read operations.
+
+5. EXACT NCURSES SOURCE CHECKSUM
+
+    sha256sum nonc/ttychatter.ncurses
+
+Expected SHA256:
+
+    0b9ad0ec03a0cdb4b2aa7cf5f071de15bab5bf29a4538beb921f2057adcf213f
+
+6. CURRENT PROGRAM VERSIONS
+
+    ttychatter C:        0.7.1-c-cli
+    ttychatter.python:   3.19-web-limits
+    ttychatter.bash:     3.19-web-limits
+    ttychatter.ncurses:  0.17.0
+    ttychatter.mailbot:  0.7.1-web-limits
+
+7. VERIFICATION
+
+The current update passed:
+
+- 46 ncurses unit/regression tests.
+- Real pseudoterminal smoke checks at 80x24 and 40x12 covering Escape menu,
+  F5 Options, sending, automatic read mode, and F10 close confirmation.
+- The complete C make check, including C protocol/session/attachment checks and
+  C CLI/PTY regressions.
+- Targeted Bash/Python-helper web payload and CLI tests, including zero limits.
+- Targeted mailbot web validation/forwarding tests, including zero limits.
+- Bash syntax checks and Python bytecode compilation for the Python programs.
+
+The long cross-client permutation suites are intentionally separate because
+they are slow; the previous maintenance release ran those suites in full.
+This update preserves their session/log formats while adding targeted tests for
+the changed paths.
+
+8. INSTALLATION
+
+Build/install the complete family:
+
+    make
+    make install PREFIX="$HOME/.local"
+
+Install script clients only:
+
+    make install-scripts PREFIX="$HOME/.local"
+
+A bare ttychatter.ncurses command may resolve to an older installed copy. Check
+all command locations with:
+
+    type -a ttychatter.ncurses
