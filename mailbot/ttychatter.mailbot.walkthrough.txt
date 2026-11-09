@@ -75,7 +75,48 @@ when needed.
 The mailbot chat subprocess form is intentionally portable across the current
 C, ttychatter.python, and ttychatter.bash clients:
 
-    COMMAND [TTYCHATTER_EXTRA_ARGS] --loopback --input - --attach FILE --session PATH
+    COMMAND [TTYCHATTER_EXTRA_ARGS] [WEB_FLAGS] --loopback --input - --attach FILE --session PATH
+
+Use the matching current backends: this mailbot passes the shared web option
+flags. TTYCHATTER_EXTRA_ARGS now applies to utility commands too, so --demo
+remains active during model-list and diagnostic smoke tests.
+
+Web search
+----------
+
+Mailbot defaults:
+
+    WEB_SEARCH=0
+    WEB_SEARCH_ENGINE=auto
+    WEB_SEARCH_MAX_RESULTS=5
+    WEB_SEARCH_MAX_USES=3
+
+The sender's ttychatter configuration overrides these defaults. Operator flags
+--web, --no-web, --web-engine, --web-max-results, and --web-max-uses override
+both for the current mailbot process. Use web status to see effective settings.
+
+Enable search for your own future messages:
+
+    Subject: MAILBOT
+
+    web on
+
+Disable it again with web off. Other preferences can be set through:
+
+    tty-set WEB_SEARCH_ENGINE exa
+    tty-set WEB_SEARCH_MAX_RESULTS 5
+    tty-set WEB_SEARCH_MAX_USES 3
+
+Engines: auto, native, exa, parallel, perplexity, firecrawl. Result and search-
+round ranges are 0..25; zero omits ttychatter's limit. Perplexity clamps a
+nonzero result limit to 20. The four
+WEB_SEARCH keys are in the default USER_TTYCONFIG_ALLOWED_KEYS; add them to any
+custom allowlist if users should control search themselves.
+
+The C, Python-compatible, and Bash backends use OpenRouter's web server tool.
+The model decides whether to search, and search fees plus result tokens add to
+chat cost, even on free models. Some native providers ignore result and search
+limits. These controls are not a dollar spending cap.
 
 Install files
 -------------
@@ -390,6 +431,11 @@ Start a new timestamped session:
 
     Draft a short note about the build.
 
+The first reply includes the created session selector in its subject. Replying
+to that message resumes it. It also asks for a readable session name until you
+provide one. An ordinary descriptive subject supplies a name automatically,
+without another model request.
+
 Use an ordinary subject as the session name when SUBJECT_SESSIONS=1:
 
     Subject: build notes
@@ -406,8 +452,8 @@ List sessions:
 
     Subject: tc:sessions
 
-The session list displays friendly session-title metadata when present.  The log
-filenames remain stable.
+The session list displays friendly names, actual log filenames, and readable
+chat previews. Internal session IDs and response metadata are not preview text.
 
 Search sessions:
 
@@ -417,7 +463,16 @@ Rename a session title:
 
     Subject: tc:rename-session worklog Build Notes and Cron Setup
 
-This changes session-title metadata.  It does not rename the log file.
+This changes the session title and the physical log filename. Managed filenames
+contain a safe title (up to 80 characters) and a stable session identity suffix,
+for example Build_Notes_and_Cron_Setup--0123456789ab.log. The precise title
+sanitization is supplied by the selected backend.
+
+Replies using the original worklog subject still resume the renamed log. The
+mailbot stores a private .mailbot-session-aliases.json file beside each sender's
+logs. Copy it together with those logs when moving an installation. It also
+recovers backend renames performed outside the mailbot by looking up session IDs.
+Missing or ambiguous targets produce an error instead of a new empty session.
 
 Rename the actual session file only when you deliberately want the legacy file
 rename operation:
@@ -765,7 +820,7 @@ Unset a mailbot config key:
 
     /home/r94/bin/ttychatter.mailbot --config-file /home/r94/.config/ttychatter/mailbot/config --unset TTYCHATTER_EXTRA_ARGS
 
-Rename session title metadata:
+Rename a session and its physical log:
 
     /home/r94/bin/ttychatter.mailbot --config-file /home/r94/.config/ttychatter/mailbot/config --rename-session worklog "Build Notes and Cron Setup"
 
@@ -808,6 +863,53 @@ For compatibility with older private deployments, the default remains:
 
     USER_API_KEY_MODE=persistent
     USER_API_KEY_FALLBACK_TO_OPERATOR=1
+
+Delivery recovery and timeouts
+-----------------------------
+
+Completed chat replies are saved before mail delivery in pending-chat-replies/
+next to PROCESSED_DB. If SMTP or sendmail fails, the next poll resends that saved
+reply with the same Message-ID. It does not ask the model again or append a
+second generated response to the session. A corrupt pending record is kept for
+operator inspection, rather than discarded and regenerated.
+
+Keep pending-chat-replies/, the processed-message database, and each session
+directory's .mailbot-session-aliases.json with the installation's state during
+upgrades or moves. These private files contain replies and session references.
+
+The queue does not guarantee exactly-once delivery if the process stops after
+the SMTP server accepts an email but before the mailbot records success. It
+also cannot recover an unfinished generation if the process stops before a
+reply has been queued. Inspect the session log before manually retrying that
+case. Utility/control replies do not yet use the completed-chat reply queue.
+
+The default limits are:
+
+    TTYCHATTER_CHAT_TIMEOUT=600
+    TTYCHATTER_CONTROL_TIMEOUT=180
+
+A backend timeout stops its process group, including shell child processes,
+and preserves partial output in an explicitly incomplete error reply. IMAP,
+SMTP, and sendmail use the control timeout. IMAP over TLS verifies server
+certificates and hostnames against the system trust store; SMTP TLS and
+STARTTLS do the same. Install the correct local CA when using a private CA.
+
+Polls that share PROCESSED_DB also share a process lock. An overlapping cron
+or daemon poll is skipped. The unread-message scan continues past rejected
+senders and irrelevant subjects; MAX_MESSAGES_PER_RUN counts processed mail.
+
+Offline regression tests
+------------------------
+
+From the source tree, run:
+
+    python3 -m unittest discover -s mailbot/tests -v
+
+The tests use temporary directories and simulated mail/backend calls. They
+cover web-setting precedence, all three backend argument conventions, physical
+session renames and old email subjects, naming reminders, private user state,
+partial timeout output, overlapping polls, and mail-delivery retry recovery.
+No mailbox, SMTP server, or OpenRouter account is contacted.
 
 Troubleshooting
 ---------------

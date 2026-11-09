@@ -27,6 +27,7 @@ import argparse
 from collections import deque
 import email
 import email.policy
+import fcntl
 import getpass
 import gzip
 import hashlib
@@ -37,6 +38,7 @@ import mimetypes
 import os
 import re
 import shlex
+import signal
 import smtplib
 import ssl
 import subprocess
@@ -52,7 +54,7 @@ from pathlib import Path
 from typing import Any, Iterable, List, Optional, Tuple
 
 PROGRAM = "ttychatter.mailbot"
-VERSION = "0.6.4-ai-file-receipt"
+VERSION = "0.7.1-web-limits"
 AUTOMATED_MAILBOT_NOTICE = "I strongly encourage everyone to get cruelty-free vegetarian food and fear the AVENGER OF DEATH.  --BLOODGUILTCURSE.NET"
 
 
@@ -197,6 +199,12 @@ class Config:
     ai_file_download_mode_configured: bool = False
     mailbot_send_ai_files: bool = True
     ttychatter_control_timeout: int = 180
+    ttychatter_chat_timeout: int = 600
+    web_search: bool = False
+    web_search_engine: str = "auto"
+    web_search_max_results: int = 5
+    web_search_max_uses: int = 3
+    web_cli_overrides: dict = field(default_factory=dict)
     session_dir: Path = DEFAULT_SESSION_DIR
     attachment_dir: Path = DEFAULT_ATTACHMENT_DIR
     model_cache_file: Path = DEFAULT_MODEL_CACHE_FILE
@@ -251,6 +259,8 @@ class Config:
         "STREAM", "STATUS_UPDATES", "SESSION_AUTO_TITLE",
         "SESSION_TITLE_MODEL", "SESSION_TITLE_MAX_WORDS",
         "AI_FILE_DOWNLOAD_MODE",
+        "WEB_SEARCH", "WEB_SEARCH_ENGINE", "WEB_SEARCH_MAX_RESULTS",
+        "WEB_SEARCH_MAX_USES",
     ])
 
     # Anti-abuse defaults are conservative and cheap: reject common mail-loop
@@ -357,7 +367,7 @@ KNOWN_CONFIG_KEYS = {
     "PUBLIC_SESSION_MAX_TURNS", "PUBLIC_SESSION_INDEX_FILE",
     "PUBLIC_SESSION_ARCHIVE_ON_DELETE", "PUBLIC_SESSION_ARCHIVE_USER_TOGGLE",
     "PUBLIC_SESSION_ARCHIVE_FAILURE_POLICY", "PUBLIC_SESSION_ARCHIVE_MAX_BYTES",
-    "TTYCHATTER_CONTROL_TIMEOUT", "SESSION_LIST_HEAD_LINES",
+    "TTYCHATTER_CONTROL_TIMEOUT", "TTYCHATTER_CHAT_TIMEOUT", "SESSION_LIST_HEAD_LINES",
     "SESSION_LIST_TAIL_LINES", "SESSION_LIST_MAX_SESSIONS",
     "SESSION_PREVIEW_LINE_CHARS", "SESSION_SEARCH_MAX_MATCHES",
     "MODEL_SEARCH_MAX_MATCHES", "COMMAND_OUTPUT_MODE", "MODEL_CACHE_OUTPUT",
@@ -383,7 +393,12 @@ KNOWN_CONFIG_KEYS = {
     "DAILY_QUOTA_GLOBAL_MESSAGES", "MAX_SESSIONS_PER_SENDER",
     "API_COST_PROTECTION", "API_MAX_INPUT_CHARS", "API_MAX_ESTIMATED_TOKENS",
     "API_MAX_ATTACHMENT_BYTES",
+    "AI_FILE_DOWNLOAD_MODE", "AI_DOWNLOAD", "MAILBOT_SEND_AI_FILES",
+    "WEB_SEARCH", "WEB_SEARCH_ENGINE", "WEB_SEARCH_MAX_RESULTS", "WEB_SEARCH_MAX_USES",
 }
+
+WEB_SEARCH_ENGINES = {"auto", "native", "exa", "parallel", "perplexity", "firecrawl"}
+WEB_SEARCH_KEYS = {"WEB_SEARCH", "WEB_SEARCH_ENGINE", "WEB_SEARCH_MAX_RESULTS", "WEB_SEARCH_MAX_USES"}
 
 SECRET_CONFIG_KEYS = {"IMAP_PASSWORD", "SMTP_PASSWORD", "OPENROUTER_API_KEY", "API_KEY", "TTYCHATTER_API_KEY"}
 
@@ -527,6 +542,10 @@ def normalize_output_mode(value: str, default: str = "auto") -> str:
 
 
 def set_config_value(config_file: Path, key: str, value: str) -> None:
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", key) or "\n" in value or "\r" in value:
+        raise ValueError("configuration requires a simple key and a single-line value")
+    if key.upper() in WEB_SEARCH_KEYS:
+        validate_web_setting(key.upper(), value)
     config_file.parent.mkdir(parents=True, exist_ok=True)
     lines: List[str] = []
     replaced = False
@@ -542,11 +561,8 @@ def set_config_value(config_file: Path, key: str, value: str) -> None:
             out.append(line)
     if not replaced:
         out.append(f"{key.upper()}={value}")
-    config_file.write_text("\n".join(out) + "\n", encoding="utf-8")
-    try:
-        os.chmod(config_file, 0o600)
-    except OSError:
-        pass
+    if out != lines or not config_file.exists():
+        write_private_text(config_file, "\n".join(out) + "\n")
 
 
 
@@ -567,7 +583,8 @@ def unset_config_value(config_file: Path, key: str) -> None:
     wanted = key.upper()
     lines = config_file.read_text(encoding="utf-8", errors="replace").splitlines()
     out = [line for line in lines if config_line_key(line) != wanted]
-    config_file.write_text("\n".join(out) + ("\n" if out else ""), encoding="utf-8")
+    if out != lines:
+        write_private_text(config_file, "\n".join(out) + ("\n" if out else ""))
 
 
 def load_config(path: Path = DEFAULT_CONFIG_FILE) -> Config:
@@ -657,6 +674,11 @@ def load_config(path: Path = DEFAULT_CONFIG_FILE) -> Config:
             cfg.ttychatter_command = value
             cfg.ttychatter_command_configured = True
         elif key == "TTYCHATTER_EXTRA_ARGS": cfg.ttychatter_extra_args = value
+        elif key == "WEB_SEARCH": cfg.web_search = parse_bool(value, cfg.web_search)
+        elif key == "WEB_SEARCH_ENGINE": cfg.web_search_engine = normalize_keyword(value)
+        elif key == "WEB_SEARCH_MAX_RESULTS": cfg.web_search_max_results = parse_int(value, cfg.web_search_max_results)
+        elif key == "WEB_SEARCH_MAX_USES": cfg.web_search_max_uses = parse_int(value, cfg.web_search_max_uses)
+        elif key == "TTYCHATTER_CHAT_TIMEOUT": cfg.ttychatter_chat_timeout = max(1, parse_int(value, cfg.ttychatter_chat_timeout))
         elif key in {"AI_FILE_DOWNLOAD_MODE", "AI_DOWNLOAD"}:
             val = normalize_keyword(value)
             if val in {"ask", "auto", "metadata", "off"}:
@@ -952,17 +974,18 @@ def chmod_private_file(path: Path) -> None:
 
 def write_private_text(path: Path, text: str, mode: int = 0o600) -> None:
     chmod_private_dir(path.parent)
-    tmp = path.with_name(f"{path.name}.tmp-{os.getpid()}-{int(time.time() * 1000)}")
-    tmp.write_text(text, encoding="utf-8")
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    tmp = Path(name)
     try:
-        os.chmod(tmp, mode)
-    except OSError:
-        pass
-    tmp.replace(path)
-    try:
-        os.chmod(path, mode)
-    except OSError:
-        pass
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            os.fchmod(fh.fileno(), mode)
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        tmp.replace(path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
 
 
 def read_json_file(path: Path, default: Any) -> Any:
@@ -1252,6 +1275,7 @@ def initial_user_config_text(profile: UserProfile) -> str:
         # API keys are injected by mailbot; persistent keys use chmod 600 secret files and temporary keys use runtime storage.
         CONTEXT_TURNS=12
         MODEL=openrouter/auto
+        SESSION_AUTO_TITLE=0
         SESSION_DIR={profile.session_dir}
         ATTACHMENT_DIR={profile.attachment_dir}
         MODEL_CACHE_FILE={profile.model_cache_file}
@@ -1287,6 +1311,8 @@ def ensure_user_profile(cfg: Config, profile: UserProfile) -> None:
         write_private_text(profile.config_file, initial_user_config_text(profile), mode=0o600)
     if not config_key_present(profile.config_file, "MODEL"):
         set_config_value(profile.config_file, "MODEL", "openrouter/auto")
+    if not config_key_present(profile.config_file, "SESSION_AUTO_TITLE"):
+        set_config_value(profile.config_file, "SESSION_AUTO_TITLE", "0")
     # Enforce per-user paths while preserving user-editable preferences.
     set_config_value(profile.config_file, "SESSION_DIR", str(profile.session_dir))
     set_config_value(profile.config_file, "ATTACHMENT_DIR", str(profile.attachment_dir))
@@ -1393,6 +1419,11 @@ def ttychatter_environment(cfg: Config) -> dict:
         env["XDG_CONFIG_HOME"] = str(home / ".config")
         env["XDG_DATA_HOME"] = str(home / ".local" / "share")
         env["XDG_CACHE_HOME"] = str(home / ".cache")
+        env["XDG_STATE_HOME"] = str(home / ".local" / "state")
+        # A missing/expired user key must not inherit the operator's credentials
+        # after resolve_openrouter_api_key() refused operator fallback.
+        for key in ("OPENROUTER_API_KEY", "TTYCHATTER_API_KEY", "API_KEY"):
+            env.pop(key, None)
     else:
         config_root = xdg_root_from_tail(cfg.legacy_openrouter_config_file, ("ttychatter", "openrouter", "config"))
         data_root = xdg_root_from_tail(cfg.session_dir, ("ttychatter", "openrouter", "sessions"))
@@ -1407,6 +1438,57 @@ def ttychatter_environment(cfg: Config) -> dict:
         env["OPENROUTER_API_KEY"] = cfg.runtime_openrouter_api_key
         env["TTYCHATTER_API_KEY"] = cfg.runtime_openrouter_api_key
     return env
+
+
+def effective_web_settings(cfg: Config) -> dict:
+    """Mailbot defaults < sender/shared ttychatter preferences < CLI overrides."""
+    values = {
+        "WEB_SEARCH": str(int(cfg.web_search)),
+        "WEB_SEARCH_ENGINE": cfg.web_search_engine,
+        "WEB_SEARCH_MAX_RESULTS": str(cfg.web_search_max_results),
+        "WEB_SEARCH_MAX_USES": str(cfg.web_search_max_uses),
+    }
+    path = cfg.runtime_ttychatter_config_file or cfg.legacy_openrouter_config_file
+    if path.exists():
+        for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            pair = parse_config_line(raw)
+            if pair and pair[0] in WEB_SEARCH_KEYS:
+                values[pair[0]] = pair[1]
+    values.update(cfg.web_cli_overrides)
+    for key in WEB_SEARCH_KEYS:
+        validate_web_setting(key, str(values[key]))
+    values["WEB_SEARCH"] = parse_bool(str(values["WEB_SEARCH"]))
+    values["WEB_SEARCH_ENGINE"] = normalize_keyword(str(values["WEB_SEARCH_ENGINE"]))
+    values["WEB_SEARCH_MAX_RESULTS"] = int(values["WEB_SEARCH_MAX_RESULTS"])
+    values["WEB_SEARCH_MAX_USES"] = int(values["WEB_SEARCH_MAX_USES"])
+    if values["WEB_SEARCH_ENGINE"] == "perplexity":
+        values["WEB_SEARCH_MAX_RESULTS"] = min(20, values["WEB_SEARCH_MAX_RESULTS"])
+    return values
+
+
+def validate_web_setting(key: str, value: str) -> None:
+    if key == "WEB_SEARCH" and normalize_keyword(value) not in {"0", "1", "on", "off", "yes", "no", "true", "false"}:
+        raise ValueError("WEB_SEARCH must be 0 or 1 (off or on)")
+    if key == "WEB_SEARCH_ENGINE" and normalize_keyword(value) not in WEB_SEARCH_ENGINES:
+        raise ValueError("WEB_SEARCH_ENGINE must be auto, native, exa, parallel, perplexity, or firecrawl")
+    if key in {"WEB_SEARCH_MAX_RESULTS", "WEB_SEARCH_MAX_USES"}:
+        maximum = 25
+        try:
+            number = int(value)
+        except ValueError:
+            raise ValueError(f"{key} must be an integer from 0 to {maximum}") from None
+        if number < 0 or number > maximum:
+            raise ValueError(f"{key} must be an integer from 0 to {maximum}")
+
+
+def ttychatter_web_args(cfg: Config) -> List[str]:
+    values = effective_web_settings(cfg)
+    return [
+        "--web" if values["WEB_SEARCH"] else "--no-web",
+        "--web-engine", values["WEB_SEARCH_ENGINE"],
+        "--web-max-results", str(values["WEB_SEARCH_MAX_RESULTS"]),
+        "--web-max-uses", str(values["WEB_SEARCH_MAX_USES"]),
+    ]
 
 
 def save_runtime_user_api_key(cfg: Config, secret: str) -> str:
@@ -1910,6 +1992,7 @@ def known_mailbot_command_words() -> set[str]:
         "forget-session-api-key",
         "tty-set",
         "tty-unset",
+        "web",
     }
 
 
@@ -2401,9 +2484,12 @@ def imap_connect(cfg: Config) -> imaplib.IMAP4:
     password = load_password(cfg.imap_password, cfg.imap_password_gpg_file)
     reject_imap_login_value("IMAP password", password)
     if cfg.imap_ssl:
-        conn: imaplib.IMAP4 = imaplib.IMAP4_SSL(cfg.imap_host, cfg.imap_port)
+        conn: imaplib.IMAP4 = imaplib.IMAP4_SSL(
+            cfg.imap_host, cfg.imap_port, ssl_context=ssl.create_default_context(),
+            timeout=cfg.ttychatter_control_timeout,
+        )
     else:
-        conn = imaplib.IMAP4(cfg.imap_host, cfg.imap_port)
+        conn = imaplib.IMAP4(cfg.imap_host, cfg.imap_port, timeout=cfg.ttychatter_control_timeout)
     try:
         conn.login(cfg.imap_user, password)
     except imaplib.IMAP4.error as exc:
@@ -2412,7 +2498,12 @@ def imap_connect(cfg: Config) -> imaplib.IMAP4:
         except Exception:
             pass
         raise imap_login_failure(exc, cfg)
-    conn.select(cfg.imap_mailbox)
+    status, _data = conn.select(cfg.imap_mailbox)
+    if status != "OK":
+        try:
+            conn.logout()
+        finally:
+            raise RuntimeError(f"could not select IMAP mailbox: {cfg.imap_mailbox}")
     return conn
 
 
@@ -2529,7 +2620,51 @@ def remember_processed(path: Path, message_id: str) -> None:
         return
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fh:
+        os.fchmod(fh.fileno(), 0o600)
         fh.write(message_id + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def pending_chat_reply_path(cfg: Config, message_id: str, sender: str) -> Path:
+    identity = sender_address(sender) + "\0" + str(message_id)
+    token = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+    return cfg.processed_db.parent / "pending-chat-replies" / f"{token}.json"
+
+
+def save_pending_chat_reply(cfg: Config, original: Message, reply: EmailMessage, message_id: str) -> None:
+    sender = message_sender(original)
+    path = pending_chat_reply_path(cfg, message_id, sender)
+    if path.exists() or path.is_symlink():
+        raise ValueError("a pending reply already exists; refusing to replace generated output")
+    write_json_file(path, {
+        "version": 1, "sender": sender_address(sender), "message_id": str(message_id),
+        "message": reply.as_string(policy=email.policy.default),
+    })
+
+
+def deliver_pending_chat_reply(cfg: Config, conn: imaplib.IMAP4, uid: bytes, original: Message, message_id: str, dry_run: bool = False) -> bool:
+    """Retry transport from a durable message, without repeating model work."""
+    sender = message_sender(original)
+    path = pending_chat_reply_path(cfg, message_id, sender)
+    if not path.exists() and not path.is_symlink():
+        return False
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("pending chat reply is not a regular file")
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(saved, dict) or saved.get("sender") != sender_address(sender) or saved.get("message_id") != str(message_id) or not isinstance(saved.get("message"), str):
+        raise ValueError("pending chat reply identity mismatch; record was preserved")
+    reply = email.message_from_string(saved["message"], policy=email.policy.default)
+    if dry_run:
+        print("[dry-run] would deliver previously generated reply; no model request")
+        print(reply.as_string())
+        return True
+    send_reply(cfg, reply)
+    remember_processed(cfg.processed_db, str(message_id))
+    path.unlink()
+    if cfg.mark_seen:
+        conn.uid("STORE", uid, "+FLAGS", "(\\Seen)")
+    return True
 
 
 def send_reply_sendmail(cfg: Config, reply: EmailMessage) -> None:
@@ -2539,6 +2674,7 @@ def send_reply_sendmail(cfg: Config, reply: EmailMessage) -> None:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        timeout=cfg.ttychatter_control_timeout,
     )
     if proc.returncode != 0:
         raise RuntimeError(proc.stderr.strip() or "sendmail failed")
@@ -2548,9 +2684,9 @@ def send_reply_smtp(cfg: Config, reply: EmailMessage) -> None:
     password = load_password(cfg.smtp_password, cfg.smtp_password_gpg_file)
     context = ssl.create_default_context()
     if cfg.smtp_ssl:
-        smtp: smtplib.SMTP = smtplib.SMTP_SSL(cfg.smtp_host, cfg.smtp_port, context=context)
+        smtp: smtplib.SMTP = smtplib.SMTP_SSL(cfg.smtp_host, cfg.smtp_port, context=context, timeout=cfg.ttychatter_control_timeout)
     else:
-        smtp = smtplib.SMTP(cfg.smtp_host, cfg.smtp_port)
+        smtp = smtplib.SMTP(cfg.smtp_host, cfg.smtp_port, timeout=cfg.ttychatter_control_timeout)
     try:
         smtp.ehlo()
         if cfg.smtp_starttls:
@@ -2560,7 +2696,13 @@ def send_reply_smtp(cfg: Config, reply: EmailMessage) -> None:
             smtp.login(cfg.smtp_user, password)
         smtp.send_message(reply)
     finally:
-        smtp.quit()
+        # The server has already accepted the message once send_message()
+        # returns. A lost QUIT response must not turn that success into a
+        # queued delivery retry, nor replace the original send exception.
+        try:
+            smtp.quit()
+        except (OSError, smtplib.SMTPException):
+            smtp.close()
 
 
 def send_reply(cfg: Config, reply: EmailMessage) -> None:
@@ -2581,20 +2723,149 @@ def send_reply(cfg: Config, reply: EmailMessage) -> None:
 
 
 def session_log_path(cfg: Config, session: str) -> Path:
-    session = sanitize_session_name(session)
-    if session.endswith(".log"):
-        return cfg.session_dir / session
-    return cfg.session_dir / f"{session}.log"
+    name = sanitize_session_name((session or "").removesuffix(".log"))
+    direct = checked_session_path(cfg, f"{name}.log")
+    entry = load_session_aliases(cfg).get(name)
+    if isinstance(entry, dict):
+        target = session_path_from_alias(cfg, entry)
+        if target is not None:
+            if direct.is_file() and direct != target:
+                raise ValueError(f"ambiguous session reference: {name}; use the current filename from sessions")
+            return target
+        raise FileNotFoundError(f"session {name} was moved or removed; use sessions to select an existing log")
+    # A reply containing an old managed filename can recover after a rename
+    # performed by another ttychatter interface, even without an alias entry.
+    match = re.search(r"--([0-9a-f]{12})(?:-[0-9]{3,})?$", name)
+    if not direct.exists() and match:
+        matches = session_paths_for_id(cfg, match.group(1))
+        if len(matches) > 1:
+            raise ValueError(f"ambiguous session ID in {name}; use the exact current filename")
+        if matches:
+            return matches[0]
+    return direct
 
 
 def sanitize_session_name(session: str) -> str:
-    return re.sub(r"[^A-Za-z0-9._-]+", "_", (session or "").strip()).strip("._-") or "session"
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", (session or "").strip()).strip("._-")[:240].rstrip("._-") or "session"
+
+
+def checked_session_path(cfg: Config, value: str) -> Path:
+    """Accept only a direct, non-symlink .log child of this sender's root."""
+    root = cfg.session_dir.resolve()
+    path = Path(value)
+    if not path.is_absolute():
+        if path.name != value:
+            raise ValueError("nested session paths are not accepted")
+        path = root / path
+    if path.parent != root or path.suffix != ".log" or path.is_symlink():
+        raise ValueError("session path must be a regular .log file inside SESSION_DIR")
+    if path.exists() and not path.is_file():
+        raise ValueError("session path is not a regular file")
+    return path
+
+
+def session_id_from_file(path: Path) -> str:
+    if path.is_symlink():
+        return ""
+    found = ""
+    try:
+        with path.open("r", encoding="utf-8", errors="replace") as fh:
+            for raw in fh:
+                match = re.fullmatch(r"\[[^\]]+\]\s+system:\s*session-id:\s*([0-9a-f]{32})\s*", raw.strip())
+                if match:
+                    found = match.group(1)
+    except OSError:
+        return ""
+    return found
+
+
+def load_session_aliases(cfg: Config) -> dict:
+    path = cfg.session_dir / ".mailbot-session-aliases.json"
+    if path.is_symlink():
+        raise ValueError("session alias index must not be a symlink")
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ValueError("session alias index is unreadable; preserve it and repair it before resuming mail") from exc
+    aliases = data.get("aliases") if isinstance(data, dict) else None
+    if not isinstance(aliases, dict):
+        raise ValueError("invalid session alias index")
+    return aliases
+
+
+def session_paths_for_id(cfg: Config, session_id: str) -> List[Path]:
+    if not re.fullmatch(r"(?:[0-9a-f]{12}|[0-9a-f]{32})", session_id or ""):
+        return []
+    return [path for path in session_files_newest_first(cfg) if session_id_from_file(path).startswith(session_id)]
+
+
+def session_path_from_alias(cfg: Config, entry: dict) -> Optional[Path]:
+    name, identity = str(entry.get("file", "")), str(entry.get("session_id", ""))
+    if not name or Path(name).name != name:
+        raise ValueError("unsafe path in session alias index")
+    path = checked_session_path(cfg, name)
+    if path.is_file() and (not identity or session_id_from_file(path) == identity):
+        return path
+    matches = session_paths_for_id(cfg, identity)
+    if len(matches) > 1:
+        raise ValueError("duplicate session IDs; select an exact filename after resolving the duplicate")
+    return matches[0] if matches else None
+
+
+def remember_session_reference(cfg: Config, requested: str, path: Path) -> None:
+    path = checked_session_path(cfg, str(path))
+    if not path.is_file():
+        return
+    aliases = load_session_aliases(cfg)
+    identity = session_id_from_file(path)
+    entry = {"file": path.name, "session_id": identity}
+    old_names = []
+    for name, old_entry in list(aliases.items()):
+        if isinstance(old_entry, dict) and identity and old_entry.get("session_id") == identity:
+            old_names.append(str(old_entry.get("file", "")).removesuffix(".log"))
+            aliases[name] = entry.copy()
+    requested = (requested or "").strip().removesuffix(".log")
+    if requested and requested.casefold() != "new":
+        aliases[sanitize_session_name(requested)] = entry.copy()
+        old_names.append(sanitize_session_name(requested))
+    aliases[path.stem] = entry.copy()
+    write_json_file(cfg.session_dir / ".mailbot-session-aliases.json", {"version": 1, "aliases": aliases})
+    # Public ownership and retention follow the file, never its title. Registry
+    # profiles have separate roots and must not update the global public index.
+    if cfg.open_to_public and not cfg.runtime_user_id:
+        data = load_public_session_index(cfg)
+        sessions = data.get("sessions", {})
+        changed = False
+        for old_name in set(old_names):
+            if old_name != path.stem and isinstance(sessions.get(old_name), dict):
+                sessions[path.stem] = sessions.pop(old_name)
+                changed = True
+        if changed:
+            save_public_session_index(cfg, data)
+
+
+def forget_session_references(cfg: Config, path: Path, identity: str = "") -> None:
+    aliases = load_session_aliases(cfg)
+    remaining = {
+        name: entry for name, entry in aliases.items()
+        if not (isinstance(entry, dict) and (entry.get("file") == path.name or (identity and entry.get("session_id") == identity)))
+    }
+    if remaining != aliases:
+        write_json_file(cfg.session_dir / ".mailbot-session-aliases.json", {"version": 1, "aliases": remaining})
+    if cfg.open_to_public and not cfg.runtime_user_id:
+        data = load_public_session_index(cfg)
+        sessions = data.get("sessions", {})
+        if path.stem in sessions:
+            sessions.pop(path.stem)
+            save_public_session_index(cfg, data)
 
 
 def session_files_newest_first(cfg: Config) -> List[Path]:
     if not cfg.session_dir.exists():
         return []
-    paths = [p for p in cfg.session_dir.glob("*.log") if p.is_file()]
+    paths = [p.resolve() for p in cfg.session_dir.glob("*.log") if not p.is_symlink() and p.is_file()]
 
     def mtime(path: Path) -> float:
         try:
@@ -2618,20 +2889,28 @@ def read_session_head_tail(path: Path, head_lines: int, tail_lines: int, line_ch
     head: List[Tuple[int, str]] = []
     tail = deque(maxlen=max(0, tail_lines))
     total = 0
+    visible = 0
     try:
         with path.open("r", encoding="utf-8", errors="replace") as fh:
             for idx, raw in enumerate(fh):
-                line = trim_preview_line(raw, line_chars)
-                if idx < head_lines:
-                    head.append((idx, line))
-                if tail_lines > 0:
-                    tail.append((idx, line))
                 total = idx + 1
+                if session_internal_metadata(raw):
+                    continue
+                line = trim_preview_line(raw, line_chars)
+                if visible < head_lines:
+                    head.append((visible, line))
+                if tail_lines > 0:
+                    tail.append((visible, line))
+                visible += 1
     except OSError as exc:
         return [f"[could not read: {exc}]"], [], 0
     head_out = [line for _, line in head]
     tail_out = [line for idx, line in tail if idx >= head_lines]
     return head_out, tail_out, total
+
+
+def session_internal_metadata(line: str) -> bool:
+    return bool(re.match(r"^\[[^\]]+\]\s+system:\s*(session-id|session-title|session-alias|openrouter-response):", line))
 
 
 def session_title_clean(value: str, max_chars: int = 96) -> str:
@@ -2687,8 +2966,22 @@ def append_session_title_metadata(path: Path, title: str) -> str:
 
 def set_session_title_metadata(cfg: Config, session: str, title: str) -> str:
     path = session_log_path(cfg, session)
-    clean = append_session_title_metadata(path, title)
-    return f"session title set: {path.stem} -> {clean}\n"
+    clean = session_title_clean(title)
+    if not clean:
+        raise ValueError("empty session title")
+    if not path.is_file():
+        raise FileNotFoundError(f"session not found: {session}")
+    remember_session_reference(cfg, session, path)
+    identity = session_id_from_file(path)
+    rc, stdout, stderr_text = run_ttychatter_cli(cfg, ["--rename-session", str(path), clean])
+    final_path = backend_session_path(cfg, "\n".join([stdout, stderr_text]), path, identity)
+    if final_path is not None:
+        remember_session_reference(cfg, session, final_path)
+    if rc != 0:
+        raise RuntimeError(stderr_text or stdout or f"backend exited {rc}")
+    if final_path is None:
+        raise RuntimeError("backend did not report a valid renamed session path")
+    return f"session name: {session_display_title(final_path)}\nfile: {final_path.name}\nPrevious subject/session references still resume this log.\nsession: {final_path.stem}\n"
 
 
 def format_session_list_with_previews(cfg: Config) -> str:
@@ -2763,6 +3056,8 @@ def search_session_logs(cfg: Config, query: str, session: Optional[str] = None) 
         try:
             with path.open("r", encoding="utf-8", errors="replace") as fh:
                 for lineno, raw in enumerate(fh, 1):
+                    if session_internal_metadata(raw):
+                        continue
                     if needle in raw.casefold():
                         file_matches.append(f"{lineno}: {trim_preview_line(raw, cfg.session_preview_line_chars)}")
                         found += 1
@@ -2788,13 +3083,21 @@ def rename_session_file_legacy(cfg: Config, old: str, new: str) -> str:
     old_name = sanitize_session_name(old)
     new_name = sanitize_session_name(new)
     old_path = session_log_path(cfg, old_name)
-    new_path = session_log_path(cfg, new_name)
+    new_path = checked_session_path(cfg, new_name if new_name.endswith(".log") else f"{new_name}.log")
     if not old_path.exists():
         raise FileNotFoundError(f"session not found: {old_name}")
     if new_path.exists():
         raise FileExistsError(f"target session already exists: {new_name}")
     new_path.parent.mkdir(parents=True, exist_ok=True)
-    old_path.rename(new_path)
+    remember_session_reference(cfg, old, old_path)
+    # link+unlink is an atomic no-clobber destination claim on this filesystem.
+    os.link(old_path, new_path)
+    try:
+        old_path.unlink()
+    except OSError:
+        new_path.unlink()
+        raise
+    remember_session_reference(cfg, old, new_path)
     return f"renamed session: {old_name} -> {new_name}\n"
 
 
@@ -2809,14 +3112,7 @@ def validated_session_log_target(cfg: Config, session: str) -> Tuple[str, Path]:
         raise ValueError("empty session name after sanitizing")
     if name != raw:
         raise ValueError(f"unsafe session name {session!r}; use exact sanitized session name {name!r}")
-    root = cfg.session_dir.resolve()
-    target = (root / f"{name}.log").resolve()
-    try:
-        target.relative_to(root)
-    except ValueError as exc:
-        raise ValueError("session path escapes SESSION_DIR") from exc
-    if target.parent != root:
-        raise ValueError("nested session paths are not accepted")
+    target = session_log_path(cfg, name)
     return name, target
 
 
@@ -2826,7 +3122,9 @@ def delete_session_file(cfg: Config, session: str) -> str:
         raise FileNotFoundError(f"session not found: {name}")
     if not target.is_file():
         raise ValueError(f"session path is not a regular file: {target}")
+    identity = session_id_from_file(target)
     target.unlink()
+    forget_session_references(cfg, target, identity)
     return f"deleted session: {name}\npath: {target}\n"
 
 
@@ -2860,7 +3158,7 @@ def public_session_name_for_message(cfg: Config, msg: Message, uid: bytes) -> st
 
 
 def public_resume_session_allowed(cfg: Config, candidate: str) -> Optional[str]:
-    name = sanitize_session_name(candidate)
+    name = sanitize_session_name((candidate or "").removesuffix(".log"))
     if not name or name != (candidate or "").strip().removesuffix(".log"):
         return None
     prefix = public_session_prefix(cfg) + "-"
@@ -2868,6 +3166,12 @@ def public_resume_session_allowed(cfg: Config, candidate: str) -> Optional[str]:
         return name
     if name.startswith(prefix):
         return name
+    try:
+        actual = session_log_path(cfg, name)
+    except (OSError, ValueError):
+        return None
+    if actual.stem in load_public_session_index(cfg).get("sessions", {}):
+        return actual.stem
     return None
 
 
@@ -2881,7 +3185,9 @@ def public_session_from_request(cfg: Config, request: SubjectRequest, msg: Messa
         requested = sanitize_session_name(request.value)
         if requested.casefold() == "new":
             return public_session_name_for_message(cfg, msg, uid)
-        return f"{public_session_prefix(cfg)}-{requested}"
+        named = f"{public_session_prefix(cfg)}-{requested}"
+        if public_session_owner_allows(cfg, named, message_sender(msg)):
+            return named
     return public_session_name_for_message(cfg, msg, uid)
 
 
@@ -2934,6 +3240,8 @@ def is_public_session_name(cfg: Config, name: str) -> bool:
     prefix = public_session_prefix(cfg) + "-"
     if name.startswith(prefix):
         return True
+    if name in load_public_session_index(cfg).get("sessions", {}):
+        return True
     return name == sanitize_session_name(cfg.public_shared_session) and normalize_keyword(cfg.public_session_mode) == "shared"
 
 
@@ -2975,7 +3283,11 @@ def public_session_owner_allows(cfg: Config, session: str, sender: str) -> bool:
     if not owner:
         return False
     data = load_public_session_index(cfg)
-    entry = data.get("sessions", {}).get(sanitize_session_name(session), {})
+    try:
+        name = session_log_path(cfg, session).stem
+    except (OSError, ValueError):
+        return False
+    entry = data.get("sessions", {}).get(name, {})
     if not isinstance(entry, dict):
         return True
     known_owner = public_owner_address(str(entry.get("owner", "")))
@@ -3057,9 +3369,10 @@ def set_public_archive_preference(cfg: Config, sender: str, enabled: bool, dry_r
 
 def trim_public_session_log(cfg: Config, path: Path, dry_run: bool = False) -> str:
     max_turns = int(cfg.public_session_max_turns)
-    if max_turns <= 0 or not path.is_file():
+    if max_turns <= 0 or path.is_symlink() or not path.is_file():
         return ""
     try:
+        original_stat = path.stat()
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError as exc:
         return f"failed to inspect {path.name} for trimming: {exc}"
@@ -3077,11 +3390,36 @@ def trim_public_session_log(cfg: Config, path: Path, dry_run: bool = False) -> s
     first_keep_idx = chat_line_indices[-keep_entries]
     removed = first_keep_idx
     header = f"[ttychatter.mailbot] public session trimmed to last {max_turns} input/output cycles at {time.strftime('%Y-%m-%d %H:%M:%S %z')}"
-    new_text = header + "\n" + "\n".join(lines[first_keep_idx:]).rstrip() + "\n"
+    identity_metadata = {}
+    alias_metadata = {}
+    alias_pattern = re.compile(r"^\[[^\]]+\]\s+system:\s*session-alias:\s*(.*?)\s*$")
+    for index, line in enumerate(lines):
+        match = re.match(r"^\[[^\]]+\]\s+system:\s*(session-id|session-title):", line)
+        if match:
+            identity_metadata[match.group(1)] = (index, line)
+        match = alias_pattern.match(line)
+        if match and match.group(1):
+            alias_metadata[match.group(1)] = (index, line)
+    # Unlike the current title, every distinct old name remains a valid
+    # selector. Preserve one occurrence even when its original turn expires.
+    metadata = list(identity_metadata.values()) + list(alias_metadata.values())
+    preserved = [line for index, line in sorted(metadata) if index < first_keep_idx]
+    alias_indices = {index for index, _line in alias_metadata.values()}
+    kept = []
+    for index in range(first_keep_idx, len(lines)):
+        match = alias_pattern.match(lines[index])
+        if match and match.group(1) and index not in alias_indices:
+            continue
+        kept.append(lines[index])
+    new_text = "\n".join([header] + preserved + kept).rstrip() + "\n"
     if dry_run:
         return f"[dry-run] would trim {path.name}: remove {removed} leading lines"
     try:
-        path.write_text(new_text, encoding="utf-8")
+        latest = path.stat()
+        if (latest.st_ino, latest.st_size, latest.st_mtime_ns) != (original_stat.st_ino, original_stat.st_size, original_stat.st_mtime_ns):
+            return f"kept {path.name}: session changed during cleanup"
+        write_private_text(path, new_text)
+        os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
     except OSError as exc:
         return f"failed to trim {path.name}: {exc}"
     return f"trimmed {path.name}: removed {removed} leading lines"
@@ -3192,7 +3530,14 @@ def public_cleanup_session_candidates(cfg: Config) -> List[Path]:
     prefix = public_session_prefix(cfg) + "-"
     if not cfg.session_dir.exists():
         return []
-    paths = [p for p in cfg.session_dir.glob(f"{prefix}*.log") if p.is_file()]
+    paths = [p.resolve() for p in cfg.session_dir.glob(f"{prefix}*.log") if not p.is_symlink() and p.is_file()]
+    for name in load_public_session_index(cfg).get("sessions", {}):
+        try:
+            path = session_log_path(cfg, name)
+        except (OSError, ValueError):
+            continue
+        if path.is_file() and path not in paths:
+            paths.append(path)
     if normalize_keyword(cfg.public_session_mode) == "shared":
         shared = session_log_path(cfg, cfg.public_shared_session)
         if shared.is_file() and shared not in paths:
@@ -3263,7 +3608,9 @@ def cleanup_public_sessions(cfg: Config, dry_run: bool = False) -> str:
         if not may_delete:
             continue
         try:
+            identity = session_id_from_file(path)
             path.unlink()
+            forget_session_references(cfg, path, identity)
             lines.append(f"deleted {path.name}: {reason}")
             sessions = index.get("sessions", {})
             if isinstance(sessions, dict) and session in sessions:
@@ -3372,11 +3719,17 @@ def run_ttychatter(cfg: Config, session: str, body: str, attachments: List[Path]
     try:
         cmd = resolved_ttychatter_tokens(cfg)
         extra_args = shlex.split(cfg.ttychatter_extra_args)
-    except ValueError as exc:
+        target_path = mailbot_session_target_path(cfg, session)
+        web_args = ttychatter_web_args(cfg)
+        identity = session_id_from_file(target_path)
+        target_existed = target_path.is_file()
+        if target_existed:
+            remember_session_reference(cfg, session, target_path)
+    except (ValueError, OSError) as exc:
         return 2, "", str(exc)
 
-    target_path = mailbot_session_target_path(cfg, session)
     cmd.extend(extra_args)
+    cmd.extend(web_args)
     if cfg.ai_file_download_mode_configured and cfg.ai_file_download_mode:
         cmd.extend(["--ai-download", cfg.ai_file_download_mode])
     cmd.extend(["--loopback", "--input", "-"])
@@ -3384,22 +3737,92 @@ def run_ttychatter(cfg: Config, session: str, body: str, attachments: List[Path]
         cmd.extend(["--attach", str(path)])
     cmd.extend(["--session", str(target_path)])
 
+    rc, stdout, stderr_text = run_backend_process(cfg, cmd, body, cfg.ttychatter_chat_timeout)
     try:
-        proc = subprocess.run(
-            cmd,
-            input=body,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env=ttychatter_environment(cfg),
+        final_path = backend_session_path(cfg, stderr_text, target_path, identity)
+        if final_path is not None:
+            # The subject already supplies a human title; do not spend another
+            # model request deriving one. Leave explicitly unnamed sessions for
+            # the prominent naming reminder in the reply.
+            existing_title = session_title_from_file(final_path)
+            title_is_placeholder = not existing_title or (not target_existed and existing_title == target_path.stem)
+            if title_is_placeholder and session and session.casefold() != "new" and not re.fullmatch(r"session-\d{4}-.*", session):
+                append_session_title_metadata(final_path, session.removesuffix(".log"))
+            remember_session_reference(cfg, session, final_path)
+            stderr_text = (stderr_text + "\n" if stderr_text else "") + f"session: {final_path}"
+    except (ValueError, OSError) as exc:
+        stderr_text = (stderr_text + "\n" if stderr_text else "") + f"session tracking failed: {exc}"
+        rc = rc or 1
+    return rc, stdout, stderr_text
+
+
+def run_backend_process(cfg: Config, cmd: List[str], input_text: str, timeout: int) -> Tuple[int, str, str]:
+    """Bound model/control calls and stop descendants, including shell curl jobs."""
+    try:
+        proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace", env=ttychatter_environment(cfg),
+            start_new_session=True,
         )
-        return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
     except FileNotFoundError:
         return 127, "", f"command not found: {cmd[0]}"
+    except OSError as exc:
+        return 126, "", f"could not start backend: {exc}"
+    try:
+        stdout, stderr_text = proc.communicate(input_text, timeout=timeout)
+        return proc.returncode, stdout.strip(), stderr_text.strip()
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            stdout, stderr_text = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            stdout, stderr_text = proc.communicate()
+        stderr_text = (stderr_text + "\n" if stderr_text else "") + f"command timed out after {timeout} seconds; partial output preserved"
+        return 124, stdout.strip(), stderr_text.strip()
+    except BaseException:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.communicate()
+        raise
+
+
+def backend_session_path(cfg: Config, output: str, fallback: Path, identity: str = "") -> Optional[Path]:
+    for raw in reversed((output or "").splitlines()):
+        line = raw.strip()
+        value = ""
+        if line.lower().startswith("session:"):
+            value = line.split(":", 1)[1].strip()
+        else:
+            match = re.search(r"\bappended response to\s+(.+?\.log)\s*$", line, flags=re.IGNORECASE)
+            if match:
+                value = match.group(1)
+        if value:
+            path = checked_session_path(cfg, value)
+            if path.is_file():
+                actual_id = session_id_from_file(path)
+                if identity and actual_id and actual_id != identity:
+                    raise ValueError("backend reported a different session identity")
+                return path
+    fallback = checked_session_path(cfg, str(fallback))
+    if fallback.is_file():
+        return fallback
+    matches = session_paths_for_id(cfg, identity)
+    if len(matches) > 1:
+        raise ValueError("backend session has duplicate identities")
+    return matches[0] if matches else None
 
 
 def ttychatter_session_from_stderr(stderr_text: str) -> str:
-    for raw in (stderr_text or "").splitlines():
+    for raw in reversed((stderr_text or "").splitlines()):
         line = raw.strip()
         value = ""
         if line.lower().startswith("session:"):
@@ -3417,36 +3840,24 @@ def ttychatter_session_from_stderr(stderr_text: str) -> str:
 
 def display_session_name(requested_session: str, stderr_text: str) -> str:
     requested = (requested_session or "").strip()
+    detected = ttychatter_session_from_stderr(stderr_text)
+    if detected:
+        return detected
     if not requested or requested.casefold() == "new":
-        detected = ttychatter_session_from_stderr(stderr_text)
-        return detected or "new timestamped session"
+        return "new unnamed session"
     return sanitize_session_name(requested)
 
 
 def run_ttychatter_cli(cfg: Config, args: List[str], input_text: str = "", timeout: Optional[int] = None) -> Tuple[int, str, str]:
     """Run a noninteractive ttychatter utility command."""
     try:
-        cmd = resolved_ttychatter_tokens(cfg) + [str(arg) for arg in args]
-    except ValueError as exc:
+        cmd = resolved_ttychatter_tokens(cfg) + shlex.split(cfg.ttychatter_extra_args)
+        if "--test-model" in args:
+            cmd.extend(ttychatter_web_args(cfg))
+        cmd.extend(str(arg) for arg in args)
+    except (ValueError, OSError) as exc:
         return 2, "", str(exc)
-    try:
-        proc = subprocess.run(
-            cmd,
-            input=input_text,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            timeout=timeout or cfg.ttychatter_control_timeout,
-            env=ttychatter_environment(cfg),
-        )
-        return proc.returncode, proc.stdout.strip(), proc.stderr.strip()
-    except FileNotFoundError:
-        return 127, "", f"command not found: {cmd[0] if cmd else resolved_ttychatter_command(cfg)}"
-    except subprocess.TimeoutExpired as exc:
-        stdout = exc.stdout if isinstance(exc.stdout, str) else ""
-        stderr = exc.stderr if isinstance(exc.stderr, str) else ""
-        stderr = (stderr + "\n" if stderr else "") + f"command timed out after {timeout or cfg.ttychatter_control_timeout} seconds"
-        return 124, stdout.strip(), stderr.strip()
+    return run_backend_process(cfg, cmd, input_text, timeout or cfg.ttychatter_control_timeout)
 
 def truncate_text_bytes(text: str, max_bytes: int) -> str:
     raw = (text or "").encode("utf-8", errors="replace")
@@ -3773,6 +4184,12 @@ def build_reply(cfg: Config, original: Message, session: str, body: str, stderr_
         # Public-demo replies advertise the actual public session name so a
         # normal mail reply with "Re: session_name" can resume the session.
         subject = session
+    else:
+        request = parse_subject_request(str(subject), cfg, "")
+        if request and request.kind == "session" and request.value.casefold() == "new" and session not in {"new", "new unnamed session"}:
+            # Replying to tc:{new} used to start another new session each time.
+            subject = f"{subject_marker(cfg)}{cfg.session_open_delim}{session}{cfg.session_close_delim}"
+    subject, _ = strip_reply_prefixes(str(subject))
 
     msg = EmailMessage()
     msg["From"] = cfg.mail_from or cfg.smtp_user or cfg.imap_user
@@ -3784,7 +4201,7 @@ def build_reply(cfg: Config, original: Message, session: str, body: str, stderr_
         msg["References"] = original.get("Message-ID")
 
     status = "success" if ok else "error"
-    text = [body or "(empty response)"]
+    text = [session_reply_heading(cfg, session), body or "(empty response)"]
     if cfg.include_ttychatter_stderr and stderr_text:
         text.extend(["", "--- ttychatter stderr ---", stderr_text])
     msg.set_content(mailbot_reply_body(cfg, "\n".join(text), status, session=session))
@@ -3796,6 +4213,22 @@ def build_reply(cfg: Config, original: Message, session: str, body: str, stderr_
             filename=attachment.filename,
         )
     return msg
+
+
+def session_reply_heading(cfg: Config, session: str) -> str:
+    try:
+        path = session_log_path(cfg, session)
+        title = session_title_from_file(path)
+    except (OSError, ValueError):
+        return f"Session: {session}\n"
+    lines = [f"Session: {title or path.stem}", f"Log: {path.name}"]
+    if not title:
+        lines.extend([
+            "Please give this session a name so you can find it later.",
+            f"Send Subject: {footer_command_subject(cfg)}",
+            f'Body: rename-session {shlex.quote(path.stem)} "Your session name"',
+        ])
+    return "\n".join(lines) + "\n"
 
 
 def redact_api_key_literals(text: str) -> str:
@@ -3869,6 +4302,8 @@ def mailbot_reply_footer(cfg: Config, status: str, session: str = "", command: s
         "help                  Email the help response.",
         "manpage | manual      Email the plain-text manual as an attachment.",
         "sessions              List saved conversation sessions.",
+        "rename-session S NAME Name the session and its saved log file.",
+        "web on | off | status Control web search for this sender.",
         "models [flags]        List available models using safe model-list flags.",
         "model-cache           Email cached model data without refreshing it.",
         "model-search TEXT     Search cached model data.",
@@ -4044,7 +4479,7 @@ sessions                    List saved sessions with friendly title metadata.
 search TEXT                 Search session filenames, titles, and logs.
 search-session SESSION TEXT Search one session log.
 rename-session SESSION TITLE
-                            Set session-title metadata; filename stays stable.
+                            Name the session and rename its saved log file.
 rename-session-file OLD NEW Rename a session file; legacy escape hatch.
 turns SESSION               List turn numbers from a session.
 branch SESSION TURN         Branch a session after TURN.
@@ -4054,6 +4489,26 @@ archive-session             Show your archive-on-expire preference.
 archive-session on          Save expiring public sessions before deletion.
 archive-session off         Do not save expiring public sessions.
 archive-session status      Show the archive preference status.
+
+An ordinary subject supplies a readable session name. An unnamed session gets
+a naming reminder at the top of each reply. Renaming uses the backend's
+title--session-id filename; earlier email subjects keep working through a
+private alias index in the same session directory. Copy that index with your
+logs when moving a mailbox installation.
+
+WEB SEARCH
+
+web on              Enable web search for your future chat messages.
+web off             Disable the optional web tool.
+web status          Show effective search settings.
+tty-set WEB_SEARCH_ENGINE auto
+                    Let OpenRouter select the search engine.
+tty-set WEB_SEARCH_MAX_RESULTS 5
+tty-set WEB_SEARCH_MAX_USES 3
+
+The model chooses when to use web search. Search fees and result tokens are
+additional to normal chat usage, including on free models. Native providers
+can ignore result/search-call limits; these settings are not a dollar cap.
 
 MODELS
 
@@ -4241,7 +4696,7 @@ def mailbot_manpage(cfg: Optional[Config] = None) -> str:
 
 
 def embedded_mailbot_manpage(cfg: Optional[Config] = None) -> str:
-    return rf""".TH TTYCHATTER.MAILBOT 1 "June 2026" "ttychatter.mailbot {VERSION}" "User Commands"
+    return rf""".TH TTYCHATTER.MAILBOT 1 "October 2026" "ttychatter.mailbot {VERSION}" "User Commands"
 .SH NAME
 ttychatter.mailbot \- email transport adapter and remote control surface for ttychatter
 .SH SYNOPSIS
@@ -4254,6 +4709,12 @@ ttychatter.mailbot \- email transport adapter and remote control surface for tty
 ttychatter.mailbot bridges IMAP mail to a selected ttychatter subprocess and replies by sendmail or SMTP. The selected backend may be ttychatter.python, the C ttychatter binary, or ttychatter.bash. Install ttychatter.mailbot.1 beside the program or in man1 for the full manual.
 .SH BACKENDS
 TTYCHATTER_BACKEND accepts python, c, bash, auto, or command. TTYCHATTER_CLIENT is accepted as a legacy alias. TTYCHATTER_COMMAND overrides the backend map. Chat calls use --loopback --input - --session PATH for compatibility with current C, Python, and Bash clients.
+.SH WEB SEARCH
+Use the email command web on, web off, or web status. Shared settings are WEB_SEARCH=0, WEB_SEARCH_ENGINE=auto, WEB_SEARCH_MAX_RESULTS=5, and WEB_SEARCH_MAX_USES=3. CLI --web, --no-web, --web-engine ENGINE, --web-max-results N, and --web-max-uses N override per-user preferences. Engines are auto, native, exa, parallel, perplexity, and firecrawl. Search can add provider fees and input tokens. Native providers can ignore search limits; these settings are not a dollar cap.
+.SH SESSION NAMES
+Ordinary subjects name sessions. Unnamed replies prominently request a name. rename-session SESSION TITLE changes both the human title and physical log filename, while a private alias index keeps old subjects working. Replies to tc:{{new}} use the new conversation's real selector.
+.SH DELIVERY RECOVERY
+Completed chat replies are saved privately in pending-chat-replies next to PROCESSED_DB before mail delivery. Failed deliveries retry the saved reply without repeating the model call. This does not guarantee exactly-once SMTP delivery across crashes after server acceptance. Chat calls time out after TTYCHATTER_CHAT_TIMEOUT=600 seconds; controls and mail transports use TTYCHATTER_CONTROL_TIMEOUT=180. Overlapping polls sharing one processed database are skipped.
 .SH API-KEY MODES
 USER_API_KEY_MODE accepts operator, persistent, session, or both. api-key stores a persistent per-user key when persistent mode is enabled. api-key-session stores a temporary runtime key that expires after USER_API_KEY_TTL_MINUTES. Temporary keys avoid long-term .config/.local/state storage but ordinary email is not confidential unless encrypted end-to-end.
 .SH FILES
@@ -4477,6 +4938,13 @@ def command_line_contains_api_key_secret_operand(command_line: str) -> bool:
 
 
 def dispatch_mailbot_command(cfg: Config, command_line: str, dry_run: bool = False, sender: str = "") -> Tuple[bool, str, List[ReplyAttachment]]:
+    try:
+        return _dispatch_mailbot_command(cfg, command_line, dry_run=dry_run, sender=sender)
+    except (OSError, ValueError) as exc:
+        return False, f"mailbot command failed: {exc}\n", []
+
+
+def _dispatch_mailbot_command(cfg: Config, command_line: str, dry_run: bool = False, sender: str = "") -> Tuple[bool, str, List[ReplyAttachment]]:
     braced_delete = parse_braced_delete_command(command_line or "")
     if braced_delete is not None:
         tokens = braced_delete
@@ -4612,6 +5080,34 @@ def dispatch_mailbot_command(cfg: Config, command_line: str, dry_run: bool = Fal
 
     if command == "user":
         return True, runtime_user_status(cfg), []
+
+    if command == "web":
+        if len(args) > 1 or (args and normalize_keyword(args[0]) not in {"on", "off", "status"}):
+            return False, "usage: web [on|off|status]\n", []
+        action = normalize_keyword(args[0]) if args else "status"
+        if action in {"on", "off"}:
+            ok, result, attachments = dispatch_mailbot_command(
+                cfg, f"tty-set WEB_SEARCH {int(action == 'on')}", dry_run=dry_run, sender=sender,
+            )
+            if not ok or dry_run:
+                return ok, result, attachments
+        try:
+            values = effective_web_settings(cfg)
+        except (OSError, ValueError) as exc:
+            return False, f"web settings failed: {exc}\n", []
+        state = "on" if values["WEB_SEARCH"] else "off"
+        text = (
+            f"Web search: {state}\n"
+            f"Engine: {values['WEB_SEARCH_ENGINE']}\n"
+            f"Results per search: {values['WEB_SEARCH_MAX_RESULTS']}\n"
+            f"Requested search-call limit: {values['WEB_SEARCH_MAX_USES']}\n"
+            "The selected backend uses OpenRouter's web tool; the model decides when to search.\n"
+            "Search charges and search-result tokens are additional to ordinary chat usage.\n"
+            "Provider-native search may ignore result/search-call settings; these are not a dollar cap.\n"
+        )
+        if cfg.web_cli_overrides:
+            text += "The mailbot process has command-line web overrides; they take precedence until it restarts without those flags.\n"
+        return True, text, []
 
     if command == "api-key":
         if len(args) != 1:
@@ -4855,7 +5351,7 @@ def dispatch_mailbot_command(cfg: Config, command_line: str, dry_run: bool = Fal
     if command == "tty-set":
         if len(args) < 2:
             return False, "usage: tty-set KEY VALUE\n", []
-        key = args[0]
+        key = args[0].upper()
         value = " ".join(args[1:])
         if api_key_config_key(key):
             if dry_run:
@@ -4866,6 +5362,11 @@ def dispatch_mailbot_command(cfg: Config, command_line: str, dry_run: bool = Fal
                 return False, f"api-key save failed: {exc}\n", []
         if not user_ttyconfig_key_allowed(cfg, key):
             return False, "tty-set refused; allowed keys: " + ", ".join(cfg.user_ttyconfig_allowed_keys) + "\n", []
+        if key in WEB_SEARCH_KEYS:
+            try:
+                validate_web_setting(key, value)
+            except ValueError as exc:
+                return False, str(exc) + "\n", []
         if ttychatter_backend_kind(cfg) == "c":
             cli = ["--set", f"{key}={value}"]
             label_cli = ["--set", f"{key}=VALUE"]
@@ -5062,6 +5563,13 @@ def process_message(cfg: Config, conn: imaplib.IMAP4, uid: bytes, dry_run: bool 
     processed = load_processed(cfg.processed_db)
     if msgid in processed:
         return False
+    pending = pending_chat_reply_path(cfg, msgid, sender)
+    if pending.exists() or pending.is_symlink():
+        try:
+            return deliver_pending_chat_reply(cfg, conn, uid, msg, msgid, dry_run=dry_run)
+        except (OSError, ValueError, RuntimeError, smtplib.SMTPException, subprocess.SubprocessError) as exc:
+            print(f"pending chat reply retained: {exc}", file=sys.stderr)
+            return False
 
     privileged = private_allowed_sender(sender, cfg)
     msg_limit_reason = message_limit_reject_reason(cfg, msg, privileged)
@@ -5117,7 +5625,10 @@ def process_message(cfg: Config, conn: imaplib.IMAP4, uid: bytes, dry_run: bool 
             session = public_session_from_request(cfg, request, msg, uid)
             if not dry_run:
                 record_public_session(cfg, session, sender)
-    session_limit_reason = session_count_reject_reason(runtime_cfg, session, privileged)
+    try:
+        session_limit_reason = session_count_reject_reason(runtime_cfg, session, privileged)
+    except (OSError, ValueError) as exc:
+        session_limit_reason = f"session reference rejected: {exc}"
     if session_limit_reason:
         print(f"skip: {session_limit_reason}", file=sys.stderr)
         return False
@@ -5138,16 +5649,24 @@ def process_message(cfg: Config, conn: imaplib.IMAP4, uid: bytes, dry_run: bool 
             rc, output, stderr_text = run_ttychatter(runtime_cfg, session, body, attachments)
         ok = rc == 0
         reply_session = display_session_name(session, stderr_text)
-        reply = build_reply(runtime_cfg, msg, reply_session, output if ok else stderr_text or output, stderr_text, ok)
+        reply_body = output
+        if not ok:
+            reply_body = (output + "\n\n" if output else "") + "[backend error; any partial answer above is incomplete]\n" + stderr_text
+        if runtime_cfg.runtime_openrouter_api_key:
+            reply_body = reply_body.replace(runtime_cfg.runtime_openrouter_api_key, "REDACTED")
+            stderr_text = stderr_text.replace(runtime_cfg.runtime_openrouter_api_key, "REDACTED")
+        reply = build_reply(runtime_cfg, msg, reply_session, redact_api_key_literals(reply_body), redact_api_key_literals(stderr_text), ok)
         if not dry_run:
-            send_reply(runtime_cfg, reply)
+            save_pending_chat_reply(runtime_cfg, msg, reply, msgid)
             if public_unprivileged and ok:
                 trim_note = trim_public_session_log(runtime_cfg, session_log_path(runtime_cfg, reply_session), dry_run=False)
                 if trim_note:
                     print(trim_note)
-            remember_processed(runtime_cfg.processed_db, msgid)
-            if runtime_cfg.mark_seen:
-                conn.uid("STORE", uid, "+FLAGS", "(\\Seen)")
+            try:
+                deliver_pending_chat_reply(runtime_cfg, conn, uid, msg, msgid)
+            except (OSError, ValueError, RuntimeError, smtplib.SMTPException, subprocess.SubprocessError) as exc:
+                print(f"generated reply saved; delivery will be retried without another model call: {exc}", file=sys.stderr)
+                return False
         else:
             print(reply.as_string())
     return True
@@ -5186,6 +5705,19 @@ def list_candidates(cfg: Config) -> int:
 
 
 def run_once(cfg: Config, dry_run: bool = False) -> int:
+    cfg.processed_db.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = cfg.processed_db.with_name(cfg.processed_db.name + ".lock")
+    fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    with os.fdopen(fd, "a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("another mailbot poll is already running; skipped this poll")
+            return 0
+        return run_once_locked(cfg, dry_run=dry_run)
+
+
+def run_once_locked(cfg: Config, dry_run: bool = False) -> int:
     cfg.work_dir.mkdir(parents=True, exist_ok=True)
     cfg.processed_db.parent.mkdir(parents=True, exist_ok=True)
     cfg.session_dir.mkdir(parents=True, exist_ok=True)
@@ -5203,7 +5735,9 @@ def run_once(cfg: Config, dry_run: bool = False) -> int:
             print("IMAP search failed", file=sys.stderr)
             return 1
         uids = (data[0] or b"").split()
-        for uid in uids[: cfg.max_messages_per_run]:
+        for uid in uids:
+            if processed_count >= cfg.max_messages_per_run:
+                break
             if process_message(cfg, conn, uid, dry_run=dry_run):
                 processed_count += 1
     finally:
@@ -5420,6 +5954,11 @@ def print_config(cfg: Config) -> None:
     print(f"AI_FILE_DOWNLOAD_MODE={cfg.ai_file_download_mode}{' (configured)' if cfg.ai_file_download_mode_configured else ' (backend default/noninteractive metadata)'}")
     print(f"MAILBOT_SEND_AI_FILES={int(cfg.mailbot_send_ai_files)}")
     print(f"TTYCHATTER_CONTROL_TIMEOUT={cfg.ttychatter_control_timeout}")
+    print(f"TTYCHATTER_CHAT_TIMEOUT={cfg.ttychatter_chat_timeout}")
+    print(f"WEB_SEARCH={int(cfg.web_search)}")
+    print(f"WEB_SEARCH_ENGINE={cfg.web_search_engine}")
+    print(f"WEB_SEARCH_MAX_RESULTS={cfg.web_search_max_results}")
+    print(f"WEB_SEARCH_MAX_USES={cfg.web_search_max_uses}")
     print(f"SESSION_DIR={cfg.session_dir}")
     print(f"ATTACHMENT_DIR={cfg.attachment_dir}")
     print(f"MODEL_CACHE_FILE={cfg.model_cache_file}")
@@ -5536,6 +6075,8 @@ USAGE
     {PROGRAM} --ttychatter-backend python|c|bash|auto
     {PROGRAM} --ttychatter-command COMMAND
     {PROGRAM} --ttychatter-extra-args ARGS
+    {PROGRAM} --once [--web|--no-web] [--web-engine ENGINE]
+    {PROGRAM} --once [--web-max-results N] [--web-max-uses N]
     {PROGRAM} --config
     {PROGRAM} --raw-config
     {PROGRAM} --set KEY VALUE
@@ -5556,9 +6097,26 @@ MAIL SUBJECTS
     tc:delete{{session-name}}      Delete a ttychatter session log
     tc:rm{{session-name}}          Alias for delete{{session-name}}
     tc:archive-session on|off    Public archive-on-expire preference
+    tc:web on|off|status        Control this sender's web search
     tc:{{session-name}}          Send body to ttychatter session
     tc:{{new}}                   Create a fresh timestamped ttychatter session
     MAILBOT                      Use first nonempty body line as command/session selector
+
+SESSION NAMES
+    Ordinary subjects name sessions. Unnamed sessions get a prominent naming
+    reminder. rename-session SESSION TITLE renames the physical log as well as
+    its title; existing subject selectors are retained in a private alias
+    index. Replies to tc:{{new}} use the new session's real selector.
+
+WEB SEARCH
+    Defaults: WEB_SEARCH=0, WEB_SEARCH_ENGINE=auto,
+    WEB_SEARCH_MAX_RESULTS=5, WEB_SEARCH_MAX_USES=3.
+    Mailbot defaults < per-user/shared ttychatter preferences < mailbot CLI
+    overrides. Engines: auto, native, exa, parallel, perplexity, firecrawl.
+    Result and search-round limits: 0..25; zero omits ttychatter limits; Perplexity nonzero results <=20.
+    Settings are passed to every backend with --web/--no-web, --web-engine,
+    --web-max-results, and --web-max-uses. Search is model-controlled and can
+    add search fees and input tokens; native providers may ignore these limits.
 
 USER REGISTRY AND PREFERENCES
     USER_REGISTRY=1 creates a private ttychatter HOME per sender. The registry
@@ -5626,6 +6184,12 @@ TTYCHATTER BACKEND
     remains python for existing deployments. C and Bash compatibility use the
     shared command form --loopback --input - --session PATH. TTYCHATTER_COMMAND
     overrides the backend map when set.
+    TTYCHATTER_EXTRA_ARGS applies to chat and utility commands. Chat calls time
+    out after TTYCHATTER_CHAT_TIMEOUT=600 seconds; controls use
+    TTYCHATTER_CONTROL_TIMEOUT=180. Partial output is kept on timeout. A poll
+    lock prevents overlapping cron/daemon invocations using one processed DB.
+    Completed chat replies are saved before delivery and retried from the
+    saved message after mail-transport failure, without repeating model work.
 
 CONFIG PATH
     If --config-file is omitted, the path is resolved as:
@@ -5673,6 +6237,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ttychatter-backend", metavar="BACKEND")
     parser.add_argument("--ttychatter-command", metavar="COMMAND")
     parser.add_argument("--ttychatter-extra-args", metavar="ARGS")
+    web = parser.add_mutually_exclusive_group()
+    web.add_argument("--web", dest="web_search", action="store_true", default=None)
+    web.add_argument("--no-web", dest="web_search", action="store_false")
+    parser.add_argument("--web-engine", choices=sorted(WEB_SEARCH_ENGINES))
+    parser.add_argument("--web-max-results", type=int, choices=range(1, 26), metavar="N")
+    parser.add_argument("--web-max-uses", type=int, choices=range(1, 11), metavar="N")
     parser.add_argument("--config", action="store_true")
     parser.add_argument("--raw-config", action="store_true")
     parser.add_argument("--set", nargs=2, metavar=("KEY", "VALUE"))
@@ -5702,6 +6272,12 @@ def main() -> int:
         cfg.ttychatter_command_configured = True
     if args.ttychatter_extra_args is not None:
         cfg.ttychatter_extra_args = args.ttychatter_extra_args
+    if args.web_search is not None:
+        cfg.web_cli_overrides["WEB_SEARCH"] = str(int(args.web_search))
+    for field_name, key in (("web_engine", "WEB_SEARCH_ENGINE"), ("web_max_results", "WEB_SEARCH_MAX_RESULTS"), ("web_max_uses", "WEB_SEARCH_MAX_USES")):
+        value = getattr(args, field_name)
+        if value is not None:
+            cfg.web_cli_overrides[key] = str(value)
     try:
         migrate_plaintext_openrouter_api_key(cfg)
     except Exception as exc:
