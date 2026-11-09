@@ -87,6 +87,10 @@ General and chat/session options:
     -m, --model MODEL
     -a, --attach FILE
     --stream / --no-stream
+    --web / --no-web
+    --web-engine ENGINE
+    --web-max-results N
+    --web-max-uses N
     --ai-download ask|auto|metadata|off
     --status / --no-status
     --progress / --no-progress
@@ -191,8 +195,8 @@ New config writes go to the OpenRouter path.
 Session address modes
 ---------------------
 
-No-argument terminal mode starts a new interactive session and saves it under
-SESSION_DIR using the timestamped session filename scheme:
+No-argument terminal mode starts a new interactive session and asks for a name.
+The log is saved under SESSION_DIR. Enter skips naming and keeps a timestamp:
 
     ttychatter
     ttychatter --new
@@ -232,39 +236,109 @@ Bare names resolve to:
 Any SESSION containing '/' is treated as an explicit path.  Use ./notes.log for
 a log in the current directory.
 
-Session titles and --list
--------------------------
+Session names, filenames, and --list
+-----------------------------------
 
-Session filenames remain mechanical and timestamped when ttychatter creates
-them automatically:
+Interactive terminals ask for a name when opening an unnamed session. If the
+initial question is skipped, the client asks again after the first successful
+reply. Existing named sessions do not repeat the question. Pipes and batch
+commands never consume input for naming. To disable these prompts:
 
-    session-2026-06-03-14-22-33.log
+    PROMPT_SESSION_NAME=0
 
-The user-facing title is metadata inside the log.  The --list command displays
-that title when present and falls back to the filename stem when absent:
+The interactive banner marks unnamed sessions prominently. Use :rename at any
+point, or rename an old timestamped log from the command line:
 
-    TITLE                                      UPDATED             BYTES  FILE
-    Friendly Notes                            2026-06-03 14:22     1234  session-2026-06-03-14-22-33.log
-
-Renaming a session now means setting title metadata.  It does not rename the
-file:
-
-    ttychatter --rename-session notes Friendly Notes
-
-Interactive mode has the same operation:
-
+    ttychatter --rename-session session-2026-06-03-14-22-33 "Friendly Notes"
     :rename Friendly Notes
 
-Automatic AI titles are optional and disabled by default.  Enable them in the
-config only when desired:
+Renaming changes the actual filename in its existing directory and appends the
+complete human title to metadata. The filename has this form:
+
+    Friendly-Notes--0123456789ab.log
+
+The suffix is the first 12 characters of a stable random 32-character session
+ID. Renames preserve that ID; branches receive new IDs. Filename text is limited
+to 80 safe ASCII characters, while title metadata preserves the complete name.
+If a destination already exists, a numeric suffix is used. Existing files are
+never replaced. Symlinks are not renamed. The move uses POSIX hard links; on a
+file system without hard-link support it reports an error and keeps the source.
+
+The --list command shows friendly titles and the current physical filenames.
+After a rename, resume by the current filename or a unique quoted title:
+
+    ttychatter --resume "Friendly Notes"
+    ttychatter --resume Friendly-Notes--0123456789ab.log
+
+Renames also retain previous filename stems and human titles as session-alias
+metadata, so old names still resolve across compatible clients. A current
+filename takes priority. Duplicate titles or aliases require an exact filename.
+Untouched older timestamped logs
+continue to load. No automatic directory-wide migration is performed.
+
+An explicitly named new --session notes session retains notes.log and records
+notes as its title, so repeated --session notes commands address the same file.
+Explicit output paths remain where requested. A manual rename can rename an
+explicitly selected log; automatic titles preserve explicit output paths.
+
+Optional AI title generation remains disabled by default:
 
     SESSION_AUTO_TITLE=1
     SESSION_TITLE_MODEL=openrouter/auto
     SESSION_TITLE_MAX_WORDS=8
 
-SESSION_TITLE_MODEL is a separate secondary model used only for title metadata.
-The main conversation still uses MODEL.  If title generation fails, the session
-continues normally and --list falls back to the filename stem.
+AI titles rename automatically created managed logs after the first successful
+response. Title generation uses a separate model request with web search off;
+it can incur an extra model charge. Its word limit applies only to AI titles.
+A title failure does not discard the saved chat. Each chat and manual rename
+emits the final absolute path on stderr as: session: /absolute/path.log
+
+Web search
+----------
+
+All C chat modes can enable OpenRouter's server web-search tool:
+
+    ttychatter --web --stream --prompt 'Check current documentation for this issue.'
+    ttychatter --no-web --prompt 'Explain this local snippet.'
+    :web on
+    :web off
+    :web
+
+:web without an argument reports the current setting. Per-command overrides do
+not change the saved configuration:
+
+    --web-engine auto|native|exa|parallel|perplexity|firecrawl
+    --web-max-results 5
+    --web-max-uses 3
+
+Config defaults:
+
+    WEB_SEARCH=0
+    WEB_SEARCH_ENGINE=auto
+    WEB_SEARCH_MAX_RESULTS=5
+    WEB_SEARCH_MAX_USES=3
+
+Results and search rounds accept 0..25. Zero results omits max_results so the
+provider chooses its default; zero search rounds omits max_tool_calls so
+ttychatter imposes no round cap. Perplexity requests cap a nonzero result limit
+at 20. Provider, model, context, rate, and account limits still apply. These are
+API controls, not a guaranteed currency spending cap.
+
+Enabling search lets the model decide whether to search; it does not guarantee
+that every reply uses the web. Search can add provider charges. The client uses
+tools:[{type:"openrouter:web_search",parameters:{...}}], with OpenRouter handling
+tool execution. It does not silently retry using the deprecated web plugin or
+:online model suffix. Server tools are a provider beta and support can differ
+by model or engine. A provider error is shown and saved for diagnosis.
+
+Returned URL citations appear in a plain Sources section in the response and
+log. Raw annotations, request ID, reported model/provider, usage, and reasoning_details
+are saved separately as system openrouter-response metadata, outside the model
+conversation. Streaming continues through the final accounting/annotation
+chunks until [DONE]. The title generator and model smoke test keep search off.
+
+Provider reference (checked October 2026):
+https://openrouter.ai/docs/guides/features/server-tools/web-search
 
 
 Streaming and local status updates
@@ -408,6 +482,7 @@ can choose the control plane that fits the terminal workflow:
     :branch N, :fork N     --branch SESSION N
     :edit N, :edit-turn N  --edit-turn SESSION N
     :stream on|off         --stream / --no-stream, STREAM=1/0
+    :web [on|off|status]    --web / --no-web, WEB_SEARCH=1/0
     :ai-download MODE      --ai-download MODE, AI_FILE_DOWNLOAD_MODE=MODE
     :status on|off         --status / --no-status, STATUS_UPDATES=1/0
     :progress on|off       alias for :status
@@ -456,17 +531,40 @@ New C logs then use the shared line-oriented ttychatter transcript format:
 
     [HH:MM:SS] User: ...
     [HH:MM:SS] AI: ...
-    [HH:MM:SS] system: CONTEXT_BEGIN
-    User: ...
-    Assistant: ...
-    [HH:MM:SS] system: CONTEXT_END
+    [HH:MM:SS] system: CONTEXT_SNAPSHOT_JSON ["User: ...", "Assistant: ..."]
 
-Optional session title metadata is stored as a system line:
+Session identity, names, and provider metadata use separate system lines:
 
     [HH:MM:SS] system: session-title: Friendly Notes
+    [HH:MM:SS] system: session-alias: Previous Friendly Title
+    [HH:MM:SS] system: session-id: 0123456789abcdef0123456789abcdef
+    [HH:MM:SS] system: openrouter-response: {"usage":{"total_tokens":42}}
 
-The parser also reads the older 0.6.0 C marker blocks so existing C-only logs
-remain resumable.
+The loader applies complete JSON or text context snapshots in file order, then
+replays newer real turns. JSON preserves multiline text exactly. Empty snapshots
+clear memory; incomplete or malformed snapshots do not replace working memory.
+Older CONTEXT_BEGIN/CONTEXT_END snapshots and 0.6.0 C marker logs remain readable.
+Metadata is excluded from conversational context and transcript export.
+The memory editor opens a JSON array so embedded newlines and role-looking text
+survive an unchanged save. Existing editor scripts may still return labeled
+User:/Assistant: text with continuation lines. All saved edits and memory clears
+use JSON snapshots; invalid edits leave working memory unchanged.
+
+Failed provider requests remain visible as request-error records, including any
+partial stream text, and do not become successful assistant memory. Batch mode
+returns failure for failed requests. Explicit ESC cancellation saves the partial
+reply with its interruption marker. Pending interactive attachments remain queued
+after failed requests. No paid request is automatically retried.
+
+New session, code attachment, and received attachment files use private file
+permissions. New filenames are reserved without clobbering existing files; code
+blocks in later turns no longer overwrite previous extracted code. Base64 file
+receipts retain their padded final bytes and reject malformed encodings. Write
+errors are reported instead of claiming a completed save.
+
+make check runs offline protocol, file-preservation, CLI, and PTY tests. Python 3
+is needed for the CLI/PTY tests; it is not a C runtime dependency. These checks do
+not call a paid model or live search engine.
 
 Design notes
 ------------

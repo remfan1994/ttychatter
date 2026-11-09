@@ -18,6 +18,7 @@ MANDIR ?= $(PREFIX)/share/man/man1
 
 TARGET = ttychatter
 SRC = src/ttychatter.c
+CORE_TEST = tests/test_core
 
 .PHONY: all clean install uninstall check
 
@@ -26,7 +27,10 @@ all: $(TARGET)
 $(TARGET): $(SRC)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $(SRC) $(LDLIBS)
 
-check: $(TARGET)
+$(CORE_TEST): tests/test_core.c $(SRC)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ tests/test_core.c $(LDLIBS)
+
+check: $(TARGET) $(CORE_TEST)
 	$(CC) $(CPPFLAGS) -fsyntax-only $(CFLAGS) $(SRC)
 	./$(TARGET) --version
 	./$(TARGET) --help >/dev/null
@@ -83,31 +87,31 @@ check: $(TARGET)
 	grep -q -- 'XDG_CONFIG_HOME' README
 	grep -q -- 'XDG_CONFIG_HOME' ttychatter.1
 	grep -q -- 'Interactive command equivalents' README
-	tmp=$$(mktemp -d); \
+	set -eu; tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
 	printf ':help\n:q\n' | XDG_CONFIG_HOME=$$tmp/config XDG_DATA_HOME=$$tmp/data XDG_CACHE_HOME=$$tmp/cache ./$(TARGET) --demo --interactive --new > $$tmp/runtime-help; \
 	grep -q -- ':fork N' $$tmp/runtime-help; \
 	grep -q -- ':edit-turn N' $$tmp/runtime-help; \
 	grep -q -- ':progress \[on|off\]' $$tmp/runtime-help; \
 	grep -q -- ':transcribe FILE' $$tmp/runtime-help; \
 	rm -rf $$tmp
-	tmp=$$(mktemp -d); \
+	set -eu; tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
 	XDG_CONFIG_HOME=$$tmp/config XDG_DATA_HOME=$$tmp/data XDG_CACHE_HOME=$$tmp/cache ./$(TARGET) --demo --prompt 'make check auto session' >/dev/null; \
 	test $$(find $$tmp/data/ttychatter/openrouter/sessions -type f -name 'session-*.log' | wc -l) -eq 1; \
 	rm -rf $$tmp
-	tmp=$$(mktemp -d); \
+	set -eu; tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
 	XDG_CONFIG_HOME=$$tmp/config XDG_DATA_HOME=$$tmp/data XDG_CACHE_HOME=$$tmp/cache ./$(TARGET) --set MODEL=demo/xdg >/dev/null; \
 	test -f $$tmp/config/ttychatter/openrouter/config; \
 	XDG_CONFIG_HOME=$$tmp/config XDG_DATA_HOME=$$tmp/data XDG_CACHE_HOME=$$tmp/cache ./$(TARGET) --config | grep -q 'model=demo/xdg'; \
 	XDG_CONFIG_HOME=$$tmp/config XDG_DATA_HOME=$$tmp/data XDG_CACHE_HOME=$$tmp/cache ./$(TARGET) --demo --update-models >/dev/null; \
 	test -f $$tmp/cache/ttychatter/openrouter/models.json; \
 	rm -rf $$tmp
-	tmp=$$(mktemp -d); \
+	set -eu; tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
 	mkdir -p $$tmp/config/ttychatter/openrouter; \
 	printf 'SESSION_AUTO_TITLE=1\nSESSION_TITLE_MODEL=demo/title\nSESSION_TITLE_MAX_WORDS=4\n' > $$tmp/config/ttychatter/openrouter/config; \
 	XDG_CONFIG_HOME=$$tmp/config XDG_DATA_HOME=$$tmp/data XDG_CACHE_HOME=$$tmp/cache ./$(TARGET) --demo --prompt 'make check generated title smoke' >/dev/null; \
-	XDG_CONFIG_HOME=$$tmp/config XDG_DATA_HOME=$$tmp/data XDG_CACHE_HOME=$$tmp/cache ./$(TARGET) --list | grep -q 'Make check generated title'; \
+	XDG_CONFIG_HOME=$$tmp/config XDG_DATA_HOME=$$tmp/data XDG_CACHE_HOME=$$tmp/cache ./$(TARGET) --list | grep -q 'make check generated title'; \
 	rm -rf $$tmp
-	tmp=$$(mktemp -d); \
+	set -eu; tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
 	XDG_CONFIG_HOME=$$tmp/config XDG_DATA_HOME=$$tmp/data XDG_CACHE_HOME=$$tmp/cache ./$(TARGET) --demo --prompt 'first branch message' --session branchdemo >/dev/null; \
 	XDG_CONFIG_HOME=$$tmp/config XDG_DATA_HOME=$$tmp/data XDG_CACHE_HOME=$$tmp/cache ./$(TARGET) --demo --prompt 'second branch message' --session branchdemo >/dev/null; \
 	XDG_CONFIG_HOME=$$tmp/config XDG_DATA_HOME=$$tmp/data XDG_CACHE_HOME=$$tmp/cache ./$(TARGET) --turns branchdemo | grep -q 'second branch message'; \
@@ -118,16 +122,16 @@ check: $(TARGET)
 	test -f $$branch2; \
 	XDG_CONFIG_HOME=$$tmp/config XDG_DATA_HOME=$$tmp/data XDG_CACHE_HOME=$$tmp/cache ./$(TARGET) --rename-session branchdemo Friendly Branch Demo >/dev/null; \
 	XDG_CONFIG_HOME=$$tmp/config XDG_DATA_HOME=$$tmp/data XDG_CACHE_HOME=$$tmp/cache ./$(TARGET) --search-sessions 'Friendly Branch' | grep -q 'title: Friendly Branch Demo'; \
-	XDG_CONFIG_HOME=$$tmp/config XDG_DATA_HOME=$$tmp/data XDG_CACHE_HOME=$$tmp/cache ./$(TARGET) --search-sessions 'branchdemo.log' | grep -q 'file: branchdemo.log'; \
-	XDG_CONFIG_HOME=$$tmp/config XDG_DATA_HOME=$$tmp/data XDG_CACHE_HOME=$$tmp/cache ./$(TARGET) --export branchdemo --format markdown | grep -q 'first branch message'; \
+	XDG_CONFIG_HOME=$$tmp/config XDG_DATA_HOME=$$tmp/data XDG_CACHE_HOME=$$tmp/cache ./$(TARGET) --search-sessions 'Friendly-Branch-Demo--' | grep -q 'file: Friendly-Branch-Demo--'; \
+	XDG_CONFIG_HOME=$$tmp/config XDG_DATA_HOME=$$tmp/data XDG_CACHE_HOME=$$tmp/cache ./$(TARGET) --export "Friendly Branch Demo" --format markdown | grep -q 'first branch message'; \
 	rm -rf $$tmp
-	tmp=$$(mktemp -d); \
+	set -eu; tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
 	XDG_CONFIG_HOME=$$tmp/config XDG_DATA_HOME=$$tmp/data XDG_CACHE_HOME=$$tmp/cache ./$(TARGET) --demo --prompt 'original edit turn' --session editdemo >/dev/null; \
 	printf '#!/bin/sh\nprintf edited-turn-from-make-check > "$$1"\n' > $$tmp/editor.sh; chmod +x $$tmp/editor.sh; \
 	EDITOR=$$tmp/editor.sh XDG_CONFIG_HOME=$$tmp/config XDG_DATA_HOME=$$tmp/data XDG_CACHE_HOME=$$tmp/cache ./$(TARGET) --demo --edit-turn editdemo 1 >/dev/null; \
 	grep -R -q 'edited-turn-from-make-check' $$tmp/data/ttychatter/openrouter/sessions; \
 	rm -rf $$tmp
-	tmp=$$(mktemp -d); \
+	set -eu; tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
 	mkdir -p $$tmp/config/ttychatter/openrouter; \
 	printf 'VOICE_INPUT_CMD=cat %%f\nVOICE_OUTPUT_CMD=cat > %s/spoken.txt\n' $$tmp > $$tmp/config/ttychatter/openrouter/config; \
 	printf 'voice make check prompt' > $$tmp/audio.txt; \
@@ -135,10 +139,13 @@ check: $(TARGET)
 	test -s $$tmp/spoken.txt; \
 	grep -R -q 'voice make check prompt' $$tmp/data/ttychatter/openrouter/sessions; \
 	rm -rf $$tmp
-	tmp=$$(mktemp -d); \
+	set -eu; tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
 	XDG_CONFIG_HOME=$$tmp/config XDG_DATA_HOME=$$tmp/data XDG_CACHE_HOME=$$tmp/cache ./$(TARGET) --demo --stream --prompt 'stream make check prompt' > $$tmp/out; \
 	grep -q 'Demo response' $$tmp/out; \
 	rm -rf $$tmp
+
+	set -eu; tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; ./$(CORE_TEST) "$$tmp"
+	python3 tests/test_cli.py ./$(TARGET)
 
 install: $(TARGET)
 	install -d $(DESTDIR)$(BINDIR)
@@ -151,4 +158,4 @@ uninstall:
 	rm -f $(DESTDIR)$(MANDIR)/ttychatter.1
 
 clean:
-	rm -f $(TARGET) *.o src/*.o
+	rm -f $(TARGET) $(CORE_TEST) *.o src/*.o

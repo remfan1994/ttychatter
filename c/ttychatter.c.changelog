@@ -1,3 +1,26 @@
+0.7.1-c-cli - 2026-11-03
+- Updated OpenRouter web-search payloads to omit max_results at 0 and omit
+  max_tool_calls at 0; removed stale max_total_results/max_uses parameters.
+- Extended web search-round controls to 0..25 and preserved explicit zero CLI
+  overrides instead of confusing zero with an unset option.
+
+0.7.0-c-cli - 2026-10-18
+- Added current OpenRouter server web-search controls in all C chat modes,
+  explicit engine/result/use overrides, citations, and response metadata.
+- Added TTY-only name prompts, physical no-clobber session renames, stable random
+  IDs, friendly-title resume, private new logs, and final-path integration marker.
+- Preserved previous filename and human-title aliases through repeated renames.
+- Fixed cross-client context replay, accepted JSON snapshots, and preserved exact
+  multiline messages in new JSON snapshots.
+- Preserved partial stream failures without treating errors as successful memory;
+  read late usage/source events until [DONE], bounded duplicate SSE diagnostics,
+  and retained explicit ESC cancellation behavior.
+- Fixed padded base64 truncation and code-attachment overwrites; reserved file
+  destinations exclusively and checked writes. Kept pending attachments on errors.
+- Forwarded initial interactive attachment/search/download options and removed
+  fixed line splitting that could turn a long input into multiple requests.
+- Added offline protocol, session, attachment, CLI, and real-PTY regressions.
+
 # ttychatter C changelog
 
 ## 0.6.1-c-cli

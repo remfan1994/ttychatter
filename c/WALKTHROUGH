@@ -77,7 +77,7 @@ This creates a new log under:
 
     ${XDG_DATA_HOME:-~/.local/share}/ttychatter/openrouter/sessions/
 
-The filename remains mechanical and timestamped, for example:
+Without a name or optional AI title, the filename remains timestamped, for example:
 
     session-2026-06-03-14-22-33.log
 
@@ -127,8 +127,10 @@ Use ./notes.log when the intended file is in the current directory.
     ./ttychatter --list
     ./ttychatter --rename-session notes Friendly Notes
 
-The retitle operation writes session-title metadata into the log.  It does not
-rename the filename.  The --list table displays the title when present and uses
+The rename operation changes the filename to Friendly-Notes--IDPREFIX.log and
+writes the complete title into the log. Resume with --resume "Friendly Notes"
+or the filename shown by --list. Existing files are never overwritten. The
+--list table displays the title when present and uses
 the filename stem as fallback.
 
 Automatic AI-generated titles are optional and off by default:
@@ -137,7 +139,7 @@ Automatic AI-generated titles are optional and off by default:
     ./ttychatter --set SESSION_TITLE_MODEL=openrouter/auto
     ./ttychatter --set SESSION_TITLE_MAX_WORDS=8
 
-SESSION_TITLE_MODEL is a secondary model used only for title metadata.  The
+SESSION_TITLE_MODEL is a secondary model used only for automatic titles and filename updates.  The
 main conversation still uses MODEL.
 
 11. Start interactive mode
@@ -368,3 +370,66 @@ AI file receipt
 ---------------
 
 If a provider returns file artifacts, ttychatter does not silently download them by default.  Configure AI_FILE_DOWNLOAD_MODE=ask, auto, metadata, or off, or use --ai-download MODE.  Interactive ask mode prompts per file; noninteractive ask mode records metadata only.  Saved files go under ATTACHMENT_DIR/received.
+
+Session naming update
+---------------------
+
+New or unnamed interactive TTY sessions now ask for a name. If skipped, naming
+is offered after the first successful reply. Pipes and batch input never pause
+for a name. Disable the prompts with:
+
+    ./ttychatter --set PROMPT_SESSION_NAME=0
+
+Manual names remain complete in metadata. Filenames use up to 80 safe ASCII
+characters plus -- and 12 characters from the stable random session ID. Renames
+preserve the ID; branches start a new ID. Explicit output paths remain stable
+unless manually renamed. Every chat/rename reports the final absolute log path
+on stderr using session: /absolute/path.log.
+Previous filenames and human titles remain usable through session-alias
+metadata. If a name matches more than one log, use its exact filename from
+--list. The current filename always takes priority over title or alias matches.
+
+Web search update
+-----------------
+
+Search is off by default. It can add API charges when the model uses it:
+
+    ./ttychatter --web --stream --prompt 'Check the current documentation.'
+    ./ttychatter --no-web --prompt 'Explain this local code.'
+    ./ttychatter --web --web-engine exa --web-max-results 5 --web-max-uses 3 --prompt 'Find sources.'
+
+    :web on
+    :web
+    :web status
+    :web off
+
+Per-run overrides do not alter saved config. Persistent settings are:
+
+    WEB_SEARCH=0
+    WEB_SEARCH_ENGINE=auto
+    WEB_SEARCH_MAX_RESULTS=5
+    WEB_SEARCH_MAX_USES=3
+
+Supported engines are auto, native, exa, parallel, perplexity, and firecrawl.
+Results and search rounds accept 0..25. Zero results leaves the provider default;
+zero search rounds omits ttychatter's max_tool_calls cap. Perplexity caps a
+nonzero result limit at 20. Provider/model limits still apply. These are API
+controls, not a monetary spending cap. Enabling search lets
+the model choose to search. Provider errors are visible, and no fallback or paid
+retry is automatic. Sources are preserved in the reply and log; accounting and
+raw annotations are kept in separate system metadata.
+
+Offline maintenance checks
+--------------------------
+
+    make check
+
+The suite covers requests, late-stream citations and usage, cancellation,
+provider/transport failures, mixed-client snapshots, naming prompts in a real
+PTY, safe renames, attachment preservation, and base64 padding. Python 3 is only
+needed for the CLI/PTY test. Demo and fixtures do not make live API requests.
+
+Memory edits open as JSON arrays; this preserves newlines and literal User: or
+Assistant: lines inside a message. Older editor scripts may still return labeled
+text with continuation lines. Saved edits and --clear-memory always append JSON
+snapshots. Invalid edits keep the previous memory unchanged.
