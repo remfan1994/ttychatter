@@ -1,0 +1,23 @@
+{
+  "history_bytes": 16866282,
+  "wrap_characters": 262144,
+  "outputs_identical": true,
+  "before": {
+    "version": "0.17.0",
+    "replay_seconds_with_tracemalloc": 0.14793533600004594,
+    "replay_peak_python_bytes": 34819660,
+    "context_entries": 24,
+    "visible_entries": 80,
+    "wrap_seconds_median_of_3": 0.5060412140001063,
+    "wrapped_rows": 3277
+  },
+  "after": {
+    "version": "0.17.1",
+    "replay_seconds_with_tracemalloc": 0.09602026599986857,
+    "replay_peak_python_bytes": 485314,
+    "context_entries": 24,
+    "visible_entries": 80,
+    "wrap_seconds_median_of_3": 0.09609204499975021,
+    "wrapped_rows": 3277
+  }
+}

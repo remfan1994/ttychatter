@@ -1,0 +1,261 @@
+TTYCHATTER STABILITY AND PERFORMANCE REVIEW
+2026-11-16
+
+Completed update: C 0.7.2-c-cli; Python helper and Bash 3.20-stability;
+ncurses 0.17.1; mailbot 0.7.2-stability.
+
+1. SCOPE AND BASELINE
+
+This update starts from ttychatter-update-2026-11-03.zip. The independently
+saved ncurses 0.17.0 source matched the ncurses file inside that archive.
+
+Baseline archive SHA-256:
+ae318fd5531def9c58eb9b9b59e078757e621d2eb2f3032fd42a65e17327261e
+Baseline ncurses SHA-256:
+0b9ad0ec03a0cdb4b2aa7cf5f071de15bab5bf29a4538beb921f2057adcf213f
+
+The work focused on reproduced failures and avoidable CPU, memory, process,
+and disk work. The shared config and session-log formats, stable IDs, existing
+attachments, startup notice, and established interface choices are retained.
+There is no migration or bulk rewrite of saved chats.
+
+2. NCURSES: REQUESTS, DISPLAY, AND SAVED CHATS
+
+Recovered request completion and drafts
+
+An unexpected exception in the worker previously killed that thread while the
+UI continued believing a response was active. The new worker always reports
+its result. The UI can recover the original draft and attachments, and a
+failed worker no longer permanently blocks subsequent sends or session changes.
+A failure to write the failure record itself is also handled without exiting
+the UI or discarding the draft. Thread-start failure uses the same recovery.
+
+Failed prompts remain honestly recorded in the log. The restored conversation
+context is now saved separately after a failed request, so reopening a session
+does not silently add the rejected prompt back into the model's memory.
+
+Restored streaming behavior
+
+Escape had stopped cancelling ncurses streams after the background-worker
+change. It now stops an active stream and preserves the partial answer.
+Otherwise Escape opens the command menu; F1 remains a direct menu alias.
+Incoming chunks no longer reset a scrolled reading position or hide a draft
+that the user reopened after the response started. Completion preserves those
+choices as well.
+
+The UI handoff queue is bounded to 64 events. Small text pieces are coalesced,
+and each UI pass consumes a bounded batch before returning to keyboard work.
+A reproduced fast-producer case accumulated 12,001 queued events in the old
+version; the updated regression verifies the 64-event bound. The lower-level
+HTTP reader queue is bounded too. Finishing at [DONE] now wakes and releases
+the HTTP reader even when the server keeps the connection open.
+
+Lower idle and history costs
+
+Idle timeouts no longer trigger a redraw on every pass. The active request
+poll is 50 ms; an idle screen waits up to 250 ms for input and redraws only
+after a key, resize, or response event. A regression with 30 idle polls
+previously drew 30 times and now draws once.
+
+History replay uses a streaming parser with bounded retained history: the
+newest 80 visible entries and the configured conversation context, plus the
+entry/snapshot currently being parsed. The complete file remains available
+for export. Reloading a session no longer duplicates visible rows. Session
+ID lookup stops after finding the existing ID rather than reading the full
+log into another string.
+
+Session browsing caches titles and full-text matches using file identity,
+size, and modification/change timestamps. Repeated navigation avoids rereading
+unchanged logs; changed/deleted files invalidate the corresponding entries.
+Only the latest full-text query is retained per file. Long paragraphs are
+wrapped with advancing indices instead of repeatedly copying the entire
+remaining paragraph.
+
+Malformed data and naming
+
+Buffered provider bodies and total SSE input now have a 64 MiB limit; the
+existing 4 MiB line and 8 MiB event limits remain. HTTP error-body reads are
+bounded to 64 KiB. Event-size accounting is incremental, and each streamed
+JSON event is decoded once instead of twice.
+
+Malformed model-catalog containers and list members no longer cause type
+errors. Unpaired Unicode surrogates accepted by Python's JSON decoder are
+replaced before display, persistence, and export; valid Unicode is retained.
+Model-cache replacements use the existing atomic private-file writer.
+
+Optional automatic naming now runs in the existing request worker. The answer
+is queued for independent saving/display while the title request runs. The UI
+saves the answer and context before applying a proposed title. Navigation
+remains available; the existing active-request guard prevents another send,
+session switch, or rename until naming finishes. Naming errors leave the
+answer intact. Saving the answer is not an acknowledgment barrier before the
+network title request starts; these operations may overlap.
+
+3. C CLIENT: FILES, CONTEXT, STREAMS, AND TERMINAL STATE
+
+The previous replacement writer opened the destination for truncation and
+ignored write/close failures. A file-size-limit reproduction showed that it
+could destroy the previous config and still report success. The replacement
+is now written to a private temporary file in the same directory, checked
+through write/flush/fsync/close, and renamed only after success. The old file
+survives a failed replacement. Existing symlinks to regular files are retained.
+This covers shared replacement paths for config, model cache, favorites, and
+exports; it does not turn every append-only log operation into a transaction.
+
+Fixed-size config-line buffers split values longer than 8191 bytes. Loading,
+replacing, and deleting now handle complete lines with getline. Read failures
+stop replacement, and adding a setting repairs a missing final newline.
+
+Checked size arithmetic prevents CONTEXT_TURNS=LONG_MAX from overflowing into
+a two-message window. General buffer growth also checks addition and doubling
+before allocation.
+
+Context replay starts at the newest valid JSON snapshot, then applies newer
+turns and text snapshots. Legacy fallback, malformed snapshots, explicit empty
+snapshots, and exact context content are covered. The C implementation still
+reads the complete log; the saving comes from avoiding allocations and parsing
+for obsolete historical entries.
+
+The SSE parser remembers the scanned position, compacts once per callback,
+and handles LF, CRLF, and CR even when line endings span callbacks. The 8 MiB
+event limit now applies to complete events as well as incomplete buffers.
+An exact-cap event is accepted consistently with split or contiguous delimiters;
+cap-plus-one is rejected. [DONE] ends the HTTP transfer without waiting for
+connection closure. Completed response-buffer ownership is transferred rather
+than duplicated.
+
+A real terminal reproduction found that Ctrl+C during streaming could leave
+echo and canonical input disabled. Scoped cleanup now restores terminal state
+before the normal termination action. SIGINT, SIGTERM, and SIGHUP preserve
+native signal exit status. SIGTSTP restores the terminal while suspended;
+SIGCONT resumes streaming mode, and final completion restores the original
+attributes again. No new application shortcut replaces those signal actions.
+
+4. BASH AND BASH+PYTHON CLIENTS
+
+Bash previously launched jq once per SSE event, repeatedly copied the complete
+answer, retained full events, and waited for transport EOF after [DONE]. It
+now uses one persistent streaming parser, writes deltas incrementally, retains
+only metadata for final reduction, and ends promptly at [DONE]. A 120-event
+reproduction started 123 jq processes before the change. The regression now
+checks a small constant parser count for the entire request.
+
+Request-scoped cleanup restores terminal settings, reaps workers, and removes
+request files after cancellation, Ctrl+C, SIGHUP, and SIGTERM. A retained
+terminal descriptor permits restoration after the controlling session closes.
+
+The Python streaming helper now uses a bounded 32-event queue with
+cancellation-aware backpressure. Malformed choices data preserves received
+partial text and reports an error instead of raising an uncaught TypeError.
+HTTP error capture is limited to 4 KiB. The prompt spool is removed before
+networking, and signal cleanup restores the terminal.
+
+5. MAILBOT
+
+Backend stdin, stdout, and stderr are drained concurrently using nonblocking
+I/O. Capture limits now apply while reading, instead of after unbounded
+communicate() allocation. Stdout keeps a bounded head; stderr keeps a bounded
+tail so final session-path diagnostics survive. Truncation is explicit.
+Defaults retain up to 8 MiB of stdout and 200,000 bytes of stderr, derived from
+existing configuration limits. Timeout cleanup and final waits are bounded,
+including detached descendants that keep an output pipe open.
+
+Command and configuration replies now use the same durable pending-reply
+queue as chat replies. A delivery failure retries the saved reply instead of
+repeating the completed operation. Existing queue files/formats are retained.
+
+Unknown MIME charsets fall back to readable replacement text. Unsolicited
+IMAP FLAGS records before a message body no longer crash fetch handling.
+A message-local failure does not prevent later unread work; a disconnected
+IMAP transport ends the poll so the next attempt can reconnect.
+
+Processed IDs are read once per locked poll and updated immediately after
+recording a processed message. Fetched mail retains its original wire size,
+avoiding repeated MIME serialization. With the default size enforcement,
+BODY.PEEK fetches no more than MAX_MESSAGE_BYTES plus one byte, rejecting
+oversized messages before MIME parsing. The explicit administrator bypass
+setting retains its prior behavior.
+
+6. MEASURED PERFORMANCE
+
+These are controlled local fixtures on Linux, not real-provider generation
+speed or universal hardware guarantees. Compared outputs were identical.
+
+Ncurses history replay:
+  Synthetic history: 4,096 messages; 16,866,282 bytes; context 24 entries;
+  visible transcript 80 entries.
+  Peak traced Python allocation: 34,819,660 -> 485,314 bytes.
+  Elapsed time with allocation tracing: 0.14794 -> 0.09602 seconds.
+  The memory figures measure Python allocations, not whole-process RSS.
+
+Ncurses wrapping:
+  262,144-character paragraph; terminal width 80; 3,277 identical rows.
+  Median of three timings: 0.50604 -> 0.09609 seconds (about 5.3 times faster).
+
+C context replay:
+  10,000-turn synthetic log; 30,505,894 bytes; identical context bytes.
+  Median of three runs: 0.235345 -> 0.023653 seconds (about 10 times faster).
+  Median peak RSS: 157,112 -> 34,764 KiB (about 78 percent lower).
+
+Bash streaming:
+  2,000 synthetic text events; 26,001 identical output bytes.
+  Single recorded local run: 9.1175 -> 0.3503 seconds.
+  Includes setup, fake transport, parsing, and cleanup; excludes provider/network.
+
+Raw results and reusable drivers:
+  verification/ncurses-benchmark.json
+  verification/bash-benchmark.txt
+  c/tests/context_benchmark_results.txt
+  tools/benchmark_ncurses.py --baseline /path/to/0.17.0.ncurses
+  tools/benchmark_bash.py --baseline /path/to/old/ttychatter.bash
+  c/tests/benchmark_context.py /path/to/old/ttychatter c/ttychatter
+
+Run benchmark drivers with python3 from the extracted package root.
+
+7. VERIFICATION
+
+Passed the complete current Python suite:
+  python3 -B -m unittest discover -s tests -v
+  92 tests: 66 ncurses/UI, 23 shell-client, 3 cross-client interchange tests.
+
+Passed mailbot tests:
+  python3 -B -m unittest discover -s mailbot/tests -v
+  43 tests.
+
+The cross-client tests exercise actual C, Bash, Python-helper, and ncurses
+session creation, renaming, aliases, empty memory, and legacy/newer snapshots.
+The ncurses checks include real pseudoterminals at 80x24 and 40x12. pyte was
+installed to enable those optional checks; stale PTY scripts were updated to
+the already established F11/Enter/menu bindings rather than removed shortcuts.
+
+C verification includes the full make check target, core protocol/session/
+attachment harness, new stability harness, CLI/PTY checks, and loopback HTTP
+completion, truncation, Escape, signal-exit, suspension, and terminal-restore
+cases. AddressSanitizer and UndefinedBehaviorSanitizer checks cover both C
+harnesses. Leak detection is disabled because existing command/test-lifetime
+allocations are not all released at exit; this is not a leak-free claim.
+
+Bash syntax, Python parsing, executable version/help checks, whitespace checks,
+and source-package integrity are also checked. The staged source package
+was built and installed into an isolated temporary prefix; all five installed
+programs reported the expected versions and all five manuals were present.
+Regression source and test output are included. Independent cross-review produced additional concrete
+fixes for exact SSE size boundaries, terminal signals, invalid Unicode, and
+optional title-save failures.
+
+8. LIMITS AND INSTALLATION
+
+No real OpenRouter request, paid model call, mailbox, or SMTP delivery was used.
+Native OpenBSD and the user's actual terminal/provider environment still need
+runtime acceptance. The package contains portable source and scripts, not a
+prebuilt Linux binary represented as an OpenBSD executable.
+
+Mail delivery cannot promise exactly once across a crash after server acceptance
+but before local acknowledgment. A crash between performing a command and
+queuing its reply can also remain ambiguous. Failed file replacements preserve
+prior bytes before rename, but this pass does not claim complete power-loss
+transaction semantics on every filesystem. SIGKILL cannot run cleanup.
+
+Use START_HERE.txt for dependencies, full-family and scripts-only installation,
+version checks, controls, and offline demo instructions. SHA256SUMS identifies
+this package's exact contents.

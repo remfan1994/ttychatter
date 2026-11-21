@@ -1,0 +1,439 @@
+CURRENT RELEASE UPDATE - 2026-11-03
+
+Current package versions:
+  C command line:        0.7.1-c-cli
+  Bash + Python helpers: 3.19-web-limits
+  Bash-only:             3.19-web-limits
+  Python ncurses:        0.17.0
+  Mailbot:               0.7.1-web-limits
+
+Ncurses 0.17.0 makes request generation asynchronous, enters read mode when reply output begins, moves the command menu to Escape, removes attachment/web/menu control-key bindings, adds vim-like read navigation, improves session sorting/search, and handles OpenRouter tool-incompatible web-search routes with an automatic web-plugin fallback in auto mode. Web result/search-round values now accept 0 across the client family; zero means ttychatter does not send that limit.
+
+The historical 2026-10-18 report follows for provenance. Where it conflicts with the current-release section above, the current-release behavior supersedes it.
+
+TTYCHATTER MAINTENANCE REPORT
+October 18, 2026
+
+1. RELEASE SCOPE
+
+This update starts from the latest supplied source bundle,
+ttychatter-ai-attachment-receipt-update.zip, dated June 13, 2026. That bundle
+already contained the earlier stream-stop work. Existing attachment-receipt,
+voice-hook, model-selection, and transcript features were retained while
+repairing the affected interfaces and shared backend behavior.
+
+The updated client versions are:
+
+  C command line:        0.7.0-c-cli
+  Bash + Python helpers: 3.18-terminal-web-sessions
+  Bash-only:             3.18-terminal-web-sessions
+  Python ncurses:        0.16.0
+  Mailbot:               0.7.0-web-sessions
+
+The deliverable contains all five implementations, updated documentation,
+offline regression tests, and a root Makefile for build/check/install.
+It is a source release; compiled test binaries are not included. No live user
+session directory was edited, no email was sent, and no paid model request was
+made during this work.
+
+2. NCURSES: REQUESTED INTERFACE CHANGES
+
+Terminal colors
+
+The UI inherits the terminal foreground and background. It does not initialize
+a custom palette. Bold and reverse video distinguish headings, selected rows,
+and the insertion cell. Old THEME values remain accepted for compatibility but
+all resolve to terminal colors. The ineffective palette chooser is removed.
+
+Reading space and navigation
+
+The middle action bars are removed. The draft normally occupies three rows
+plus its label, rather than taking roughly half of a small terminal. INPUT_HEIGHT
+can set 1..12 rows. F11 hides the draft and returns its space to the
+reply; showing it again restores text and cursor position.
+
+Ctrl+P and F12 open the full scrollable command menu. F1 remains an alias but is
+unnecessary. This provides an independent route when an emulator consumes F1.
+The command menu contains models, keys, sessions, options, memory, files, editor
+options, naming, web search, diagnostics, keyboard help, and closing.
+
+PgUp/PgDn scroll by a visible transcript page. With the draft hidden, Up/Down
+scroll one line and Home/End go to the first/latest displayed transcript line.
+With the draft visible, arrows edit. Shift+Up/Down also scroll if the terminal
+emits those key codes. Mouse-wheel support remains available. While a reply
+streams, growing output no longer shifts a scrolled reading position.
+
+Cursor visibility
+
+The insertion cell is visibly marked, the hardware cursor is placed after the
+rest of the screen is drawn, and the footer displays line/column coordinates.
+The previous footer drawing could leave the cursor in the wrong location.
+Draft wrapping and mouse placement now account for tabs, combining characters,
+and wide characters already in the buffer. Direct key entry remains
+ASCII-oriented; broader Unicode entry is available through the external editor.
+
+External editor and closing
+
+F8 opens options. It does not launch an editor until Open in external editor is
+selected. Other choices configure the editor and save the last reply to a new
+file. F7, F8, and F9 switch directly between their screens. Repeated modal
+navigation uses an iterative dispatcher, avoiding a growing call stack.
+
+F10 and Ctrl+Q ask:
+
+  Session will be ended and unsaved data lost. Really close? Y/N
+
+Only Y confirms. N, Enter, and Esc return to the application. Pressing F10 again
+inside this confirmation does not open another confirmation on top of it.
+
+Further ncurses repairs
+
+- The current prompt is sent once; the previous path duplicated it in context.
+- Session switching preserves separate drafts and pending attachments in memory.
+- Failed requests retain the draft and do not enter error messages as AI turns.
+- Received replies become visible before fallible disk writes. If saving fails,
+  the raw reply remains recoverable through F8 Save last reply to file.
+- A function-key switch during returned-file confirmation finishes preserving
+  the already received reply before opening the requested screen.
+- Wrapped transcript lines are cached; only changed entries need rewrapping.
+- Configuration replacement is atomic and preserves the previous file on error.
+- Streaming reads in a background worker, so cancellation and scrolling remain
+  available during network silence. Nonstreaming calls remain synchronous.
+
+3. WEB SEARCH AND OPENROUTER MAINTENANCE
+
+All five interfaces expose web search. Mailbot delegates to its selected C,
+Python-helper, or Bash backend. The common options are:
+
+  --web
+  --no-web
+  --web-engine auto|native|exa|parallel|perplexity|firecrawl
+  --web-max-results N
+  --web-max-uses N
+
+The common configuration defaults are:
+
+  WEB_SEARCH=0
+  WEB_SEARCH_ENGINE=auto
+  WEB_SEARCH_MAX_RESULTS=5
+  WEB_SEARCH_MAX_USES=3
+
+The line clients have :web on, :web off, and :web status. Ncurses has Ctrl+W
+and a web-options screen. Mailbot understands tc:web on, tc:web off, and
+tc:web status, with sender-specific preference handling and operator overrides.
+
+The request uses the documented openrouter:web_search server tool [1]. The
+provider executes the search; no local search process, extra engine API key,
+or client-side tool-execution loop is required. The old plugin and :online
+interfaces are not used as an automatic fallback. Server tools are beta [2].
+
+Enabled means the tool is available to the model. The model may decide not to
+search. Search can add charges to ordinary model-token charges. Default payloads
+request five results per search, three searches, 15 total results, and five tool
+calls. Perplexity's result limit is capped at 20. Native engine support for
+individual limits differs, so these are request controls, not monetary budgets.
+Existing provider presets or search-specific models may behave independently
+of the tool that ttychatter adds [1].
+
+The request now includes an opaque session_id that remains stable when the
+human title or filename changes. This aligns with OpenRouter session tracking
+and sticky routing while keeping the human filename out of the ID field [4].
+
+When supplied by OpenRouter, source annotations become a visible Sources section
+and are retained in the log. Response IDs, provider/model details, usage,
+annotations, and supplied reasoning details are also preserved in separate
+openrouter-response system records. Malformed citation entries are ignored
+without discarding a valid answer. Reasoning metadata is retained for later
+use; this release does not implement full structured reasoning/tool replay.
+
+Streaming consumes SSE events through [DONE], including usage after an earlier
+finish_reason. Empty choices, newline-only text, comments/keepalives, and error
+events are handled. Errors can arrive with HTTP 200, so status alone is not
+treated as proof of success. Partial answers survive cancellation, premature
+EOF, or stream failure. No client automatically retries paid generation.
+Cancellation closes the request, but provider processing/billing behavior can
+vary [3].
+
+Ncurses model parsing now retains actual output limits and additional capability
+information instead of losing top_provider.max_completion_tokens. Existing
+catalog data can expose tools, reasoning, structured outputs, modalities, and
+expiration information. The shell clients stage and validate model-cache updates
+so a failed download cannot replace a usable cache.
+
+The Bash-only edition needs jq for web search, streaming, and safe restoration
+of JSON snapshots. Its reduced no-jq mode gives an explicit explanation where
+the missing parser would otherwise cause incorrect behavior.
+
+4. SESSION NAMING, FILENAMES, AND MEMORY
+
+Interactive unnamed sessions now request a name prominently. Ncurses also
+shows UNNAMED in its header and repeats the request after the first successful
+reply if a title is still absent. Ctrl+N names the current ncurses session.
+The line clients prompt and provide :rename. PROMPT_SESSION_NAME=1 is the
+default; setting it to 0 disables automatic terminal prompts. Batch and piped
+input are not consumed by naming prompts.
+
+Titles are stored in metadata and reflected in the physical log filename:
+
+  Research_Notes--0123456789ab.log
+
+The example uses ncurses' underscore convention; the exact replacement for
+spaces differs between implementations. The invariant is a safe title followed
+by two hyphens and the first 12 characters of the session's opaque 32-character
+ID. Manual titles are independent of the automatic-title word limit; the shell
+clients cap them at 200 bytes, and ncurses at 240 characters. A collision
+receives a numeric suffix without replacing another log.
+
+An explicit --session notes begins as notes.log with title notes. Unnamed
+sessions still receive timestamped filenames until they are named. Explicit
+output paths are respected. Renaming is explicit or follows an accepted naming
+prompt; old directories are not silently bulk-renamed or sent for AI labeling.
+Optional AI title generation remains off by default and never enables web search.
+
+Renaming preserves the ID and existing attachments, updates the active log path,
+and writes aliases for the prior filename and prior human title. Current titles
+and aliases resolve across updated clients when unambiguous. Exact filenames
+take precedence. Ambiguity reports an error and asks for the filename rather
+than silently opening a different conversation. Hard-link reservation prevents
+overwriting; the filesystem must support same-directory hard links. The shell
+implementation also uses ln -T, as described in its manual.
+
+Examples:
+
+  ttychatter --list
+  ttychatter --rename-session session-2026-06-04-12-00-00 "Research Notes"
+  ttychatter --resume "Research Notes"
+
+Metadata records are excluded from conversation memory. Only the exact project
+notice is excluded as a notice: a real user with the same speaker name keeps
+their real messages. ID migration also preserves old logs that lack a final
+newline.
+
+The shared snapshot format is now:
+
+  [HH:MM:SS] system: CONTEXT_SNAPSHOT_JSON ["User: ...", "Assistant: ..."]
+
+JSON preserves embedded newlines and role-like text within a message. Readers
+use the latest complete snapshot and then append later real turns. An empty
+array deliberately clears memory. Malformed or incomplete snapshots do not
+discard the last valid state. Legacy stamped CONTEXT_BEGIN/CONTEXT_END blocks
+remain readable. Older clients should be upgraded together before sharing
+newly edited memory; they do not all understand the new snapshot records.
+
+5. OTHER BACKEND REPAIRS
+
+C client
+
+- Retains web citations and usage in buffered and streaming responses.
+- Provider-returned file receipt is buffered-only in C; use --no-stream for it.
+- Handles HTTP-200 API errors, stream errors, partial output, and cancellation.
+- Uses the shared session identity, safe rename, aliases, and naming prompts.
+- Preserves multiline context through snapshot loading and editing.
+- Corrects base64 padding: for example, aGVsbG8= now decodes to all of hello.
+- Prevents generated code and received files from replacing earlier files.
+- Includes build/help/manual parity checks and protocol, session, CLI, and PTY
+  regressions. Builds with the existing strict warning flags.
+
+Shell clients
+
+- Honor --output even when no --session argument is present.
+- Honor SEND_INPUT=enter in the Bash+Python interface.
+- Preserve complete multiline transcripts and exports, including code fences.
+- The Python-helper client rejects unusable attachments before the HTTP request.
+  Bash's reduced attachment mode instead labels unavailable/non-inline files
+  in the text request.
+- Preserve received answers for display if logging or extraction fails.
+- Prevent requests when the initial user prompt cannot be saved.
+- Reserve extraction filenames exclusively rather than restarting and overwriting
+  code file 1 on each reply.
+- Handle Bash JSON control characters and prompts above normal argument limits.
+- Report model-test failures correctly and do not save a failed tested model.
+- Use a private FIFO directory and the actual curl process for Bash streaming.
+- Restore terminal state after a stopped stream.
+
+Mailbot
+
+- Uses ordinary email subjects as full human session titles and retains manual
+  names. Unnamed sessions receive a prominent rename reminder.
+- Replies to tc:{new} contain the real newly created selector, so replies resume
+  that session rather than repeatedly creating new sessions.
+- Tracks physical renames, old subjects, and stable IDs in a private alias index;
+  public ownership and cleanup references follow the new path.
+- Confines sessions to the sender's directory and excludes symlink logs.
+- Isolates per-user XDG state and removes inherited operator API-key variables
+  before choosing a user key. Disabled key fallback now stays disabled.
+- Bounds chat/utility subprocess time, stops process groups on timeout, and
+  preserves partial output in an explicitly incomplete reply.
+- Locks overlapping polls and stops unaccepted unread messages from starving
+  eligible messages later in the mailbox.
+- Saves completed chat replies privately before mail delivery. On a later poll,
+  a failed SMTP/sendmail delivery retries that saved reply without generating
+  it again. The saved message keeps the same Message-ID.
+- Treats successful SMTP acceptance separately from a failing QUIT/cleanup step.
+- Adds verified IMAP TLS and network timeouts, private atomic state writes, and
+  key redaction in diagnostic/error replies.
+
+Mail delivery is not exactly-once across every crash boundary. A crash after
+server acceptance but before the local success record can still produce a
+duplicate email. Generation interrupted before a completed reply is queued
+still needs review. Control-command replies do not yet use the saved-reply queue.
+
+6. VALIDATION AND PRACTICAL LIMITS
+
+The root make check release gate passed with exit status 0:
+
+  C build, help/manual parity, and existing demo smoke checks: PASS
+  C low-level protocol/session/memory/attachment groups:       7 groups PASS
+  C CLI and real-PTY scenarios:                                PASS
+  Ncurses unit regressions:                                   37 tests PASS
+  Ncurses real-screen PTY regressions (80x24 and 40x12):          2 tests PASS
+  Shell-client regressions:                                   18 tests PASS
+  Cross-client interoperability:                              3 tests PASS
+  Mailbot regressions:                                       28 tests PASS
+
+This is 88 Python unittest cases, plus the C checks and CLI/PTY scenarios.
+The three interoperability cases include four real-client session origins,
+eight renames by other clients, 48 exports through old/current names, eight
+resumes through old selectors, and 88 memory comparisons across readers.
+
+An additional C AddressSanitizer/UndefinedBehaviorSanitizer core run passed
+during maintenance; leak detection was disabled for process-lifetime config
+allocations. The final combined run revealed a test-fixture reader thread
+outliving its cancellation test. The fixture now releases and joins that
+thread; all 39 ncurses unit/PTY tests then passed with deprecation warnings
+treated as errors. Application source was unchanged by this fixture cleanup.
+
+A staged make install succeeded. All five installed programs returned their
+expected versions, executable modes were checked, and all five manuals were
+present. The package excludes generated executables, bytecode, temporary homes,
+test credentials, helper downloads, and transient test output.
+
+The checks use local demo responses, fixtures, temporary homes, mocked HTTP,
+real subprocesses, and pseudoterminals. The ncurses screen assertions use
+pyte at 80x24 and 40x12. Additional layout assertions cover smaller dimensions.
+These test the terminal protocol and screen state; they are not a direct test
+inside the user's Terminator configuration.
+
+Run from the extracted project directory:
+
+  make
+  make check
+  make install PREFIX="$HOME/.local"
+
+The full test suite needs a C compiler, make, pkg-config, libcurl/json-c
+development dependencies, Python 3, Bash, and jq. Install pyte in a development
+environment for real-screen assertions; those tests skip if it is absent.
+Runtime script requirements are listed in README.md. A scripts-only installation
+is available through make install-scripts PREFIX="$HOME/.local".
+
+The provider-side beta, native search support, live billing, actual model search
+decisions, and live email transport were not exercised with paid accounts.
+Provider errors are reported explicitly. Drafts are retained while ncurses is
+open but not yet persisted across a crash. The UI replays the latest 80 transcript
+entries; the full transcript remains in the log and available through export.
+Concurrent editing or renaming of the same session by multiple running clients
+is not a fully transactional multiwriter workflow.
+
+7. UI ADDITIONS THAT NOW HAVE USEFUL BACKEND SUPPORT
+
+Highest priority: session management
+
+A session dashboard should offer search, an Unnamed filter, date/size/last-turn
+sorting, title editing, preview, and a rename queue for old timestamped logs.
+Stable IDs, title metadata, and aliases added here provide the underlying
+identity. A reviewed bulk-naming flow would address the existing backlog without
+guessing titles or paying for automatic labeling without a deliberate choice.
+
+Source and usage inspection
+
+A sources screen could list citations by reply, open or copy URLs, and export a
+small bibliography. A reply-details panel could expose model/provider, response
+ID, tokens, recorded cost where supplied, and web-search call counts. Most of
+the needed provider metadata is now retained. The UI should distinguish reported
+cost from an estimate and make missing fields explicit.
+
+Model and search selection
+
+Capability filters could expose tools, reasoning, structured output, modality,
+context/output limits, and expiration information together. A search chooser
+could explain engine compatibility with the current model and show a bounded
+request summary. Catalog metadata provides a better basis than hard-coded
+guesses about model names.
+
+Mail delivery operations
+
+A mailbot queue command could show pending replies, delivery attempts, the last
+error, retry timing, and retry/cancel actions. The new saved-reply records give
+this a concrete foundation. Retry backoff and control-reply queuing would be
+natural next steps.
+
+8. MAJOR FEATURE ADDITIONS RECOMMENDED FOR A LATER RELEASE
+
+1) Persistent drafts and crash recovery.
+   Save draft text, cursor position, and attachment references per stable session
+   ID, with an explicit recovery screen. The current in-memory session draft
+   separation is a starting point, but closing/crashing still loses unsent work.
+
+2) A shared structured conversation core.
+   Replace flattened request history with explicit user/assistant/tool roles,
+   message IDs, attachments, reasoning details, and provider annotations. Keep
+   readable log exports and provide migration adapters. This would reduce
+   duplicated parser logic across four clients and support correct tool and
+   reasoning continuation. Retaining raw metadata alone does not complete this.
+
+3) Token-aware context management.
+   Estimate context size, reserve space for the reply, and clearly show which
+   older turns will be omitted or summarized. Current retention is primarily
+   turn-count based. A larger schema change should make trimming auditable and
+   support model-specific context limits without silently losing selected notes.
+
+4) Fully asynchronous requests and a request-state UI.
+   Extend the responsive streaming transport to ordinary requests, model tests,
+   and catalog operations. Show connecting/searching/receiving/saving states,
+   cancellation, and recoverable failures without freezing the interface.
+
+5) Explicit URL fetch and richer research workflows.
+   Add optional OpenRouter web_fetch support, document/PDF retrieval, saved
+   research sources, and per-message web settings. Keep it distinct from search
+   and from arbitrary local command execution. Provider/server-tool support and
+   attachment limits should be checked before implementation.
+
+6) Per-session preferences and spending controls.
+   Persist the chosen model, web policy, engine, response limits, and system
+   instructions per session. Add reported-cost summaries and deliberate limits
+   before requests. Current search-call limits are not a reliable dollar cap,
+   particularly for native search engines.
+
+7) Durable mail jobs and indexed sessions.
+   Record a job before model generation and track its transition to delivery,
+   with crash recovery and deduplicated control commands. An indexed session
+   catalog can replace repeated full-log scans in large deployments. Mailbox
+   UIDVALIDITY-aware deduplication and trusted MTA authentication metadata also
+   deserve a separate design pass for public installations.
+
+8) Safer concurrent session access.
+   Introduce a common transaction/locking protocol for append, rename, branch,
+   and index updates across all implementations. The current exclusive filename
+   reservation prevents clobbering but does not make simultaneous live edits
+   across multiple clients fully atomic.
+
+9. SOURCES
+
+OpenRouter's primary documentation was checked during this maintenance pass.
+These are the sources for the API decisions above; implementation and test
+claims refer to the code and regression files supplied in this release.
+
+[1] OpenRouter web search server tool and migration guidance:
+    https://openrouter.ai/docs/guides/features/server-tools/web-search
+
+[2] OpenRouter server tools overview and beta status:
+    https://openrouter.ai/docs/guides/features/server-tools
+
+[3] OpenRouter streaming, final usage, errors, and cancellation:
+    https://openrouter.ai/docs/api_reference/streaming
+
+[4] Chat completion request schema, including session_id:
+    https://openrouter.ai/docs/api/api-reference/chat/create-a-chat-completion
+
+The older STREAM_STOP_UPDATE_REPORT.txt is retained as historical documentation.
+This report and the current manuals describe the October 2026 behavior.

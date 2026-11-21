@@ -1,0 +1,13 @@
+stability: exit=0
+C stability and streaming regressions passed
+could not finish writing /tmp/tmpth4ndgq3/atomic.conf: File too large; previous file preserved
+
+core: exit=0
+C offline protocol, session, and attachment regressions passed
+memory was not changed: use a JSON array of User:/Assistant: strings or labeled text
+memory was not changed: use a JSON array of User:/Assistant: strings or labeled text
+empty memory snapshot appended to /tmp/tmps5hqp8vv/sessions/session-2026-11-16-10-06-10-004.log
+cannot rename session: expected a regular file: /tmp/tmps5hqp8vv/sessions/shortcut.log
+
+HTTP/PTy sanitizer: exit=0
+C loopback HTTP completion, truncation, ESC, signals, suspend/resume, and terminal cleanup passed

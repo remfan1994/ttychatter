@@ -1,0 +1,1019 @@
+ttychatter.mailbot walkthrough
+==============================
+
+This walkthrough assumes:
+
+    mailbot user:          r94
+    mailbot binary:        /home/r94/bin/ttychatter.mailbot
+    mailbot manpage:       /home/r94/bin/ttychatter.mailbot.1
+
+    C backend:             /home/r94/bin/ttychatter
+    Python-compatible:     /home/r94/bin/ttychatter.python
+    Bash-only backend:     /home/r94/bin/ttychatter.bash
+
+    mailbot config:        /home/r94/.config/ttychatter/mailbot/config
+    mailbot state:         /home/r94/.local/state/ttychatter/mailbot/
+    mailbot cache:         /home/r94/.cache/ttychatter/mailbot/
+
+    shared sessions:       /home/r94/.local/share/ttychatter/openrouter/sessions/
+    shared attachments:    /home/r94/.local/share/ttychatter/openrouter/attachments/
+    shared model cache:    /home/r94/.cache/ttychatter/openrouter/models.json
+
+The mailbot is a transport bridge:
+
+    email message -> ttychatter subprocess -> email reply
+
+It does not contain OpenRouter chat logic.  The selected ttychatter backend owns
+model calls, session logs, context reconstruction, attachments, model listing,
+exports, streaming support, and session-title metadata.
+
+Backend selection
+-----------------
+
+The default backend remains ttychatter.python for old deployments:
+
+    TTYCHATTER_BACKEND=python
+
+Other supported values:
+
+    TTYCHATTER_BACKEND=c
+    TTYCHATTER_BACKEND=bash
+    TTYCHATTER_BACKEND=auto
+    TTYCHATTER_BACKEND=command
+
+Backend meanings:
+
+    python   use ttychatter.python
+    c        use ttychatter
+    bash     use ttychatter.bash
+    auto     use the first available command: ttychatter, ttychatter.python,
+             then ttychatter.bash
+    command  use TTYCHATTER_COMMAND exactly
+
+Legacy configs may still use:
+
+    TTYCHATTER_CLIENT=python
+
+but new configs should use TTYCHATTER_BACKEND.
+
+For nonstandard paths, either put /home/r94/bin in PATH or set:
+
+    TTYCHATTER_COMMAND=/home/r94/bin/ttychatter
+
+or:
+
+    TTYCHATTER_COMMAND=/home/r94/bin/ttychatter.python
+
+or:
+
+    TTYCHATTER_COMMAND=/home/r94/bin/ttychatter.bash
+
+Do not invoke ttychatter.python with python3.  In the current tree it is an
+executable shell helper.  Let its shebang run it, or invoke it with a shell only
+when needed.
+
+The mailbot chat subprocess form is intentionally portable across the current
+C, ttychatter.python, and ttychatter.bash clients:
+
+    COMMAND [TTYCHATTER_EXTRA_ARGS] [WEB_FLAGS] --loopback --input - --attach FILE --session PATH
+
+Use the matching current backends: this mailbot passes the shared web option
+flags. TTYCHATTER_EXTRA_ARGS now applies to utility commands too, so --demo
+remains active during model-list and diagnostic smoke tests.
+
+Web search
+----------
+
+Mailbot defaults:
+
+    WEB_SEARCH=0
+    WEB_SEARCH_ENGINE=auto
+    WEB_SEARCH_MAX_RESULTS=5
+    WEB_SEARCH_MAX_USES=3
+
+The sender's ttychatter configuration overrides these defaults. Operator flags
+--web, --no-web, --web-engine, --web-max-results, and --web-max-uses override
+both for the current mailbot process. Use web status to see effective settings.
+
+Enable search for your own future messages:
+
+    Subject: MAILBOT
+
+    web on
+
+Disable it again with web off. Other preferences can be set through:
+
+    tty-set WEB_SEARCH_ENGINE exa
+    tty-set WEB_SEARCH_MAX_RESULTS 5
+    tty-set WEB_SEARCH_MAX_USES 3
+
+Engines: auto, native, exa, parallel, perplexity, firecrawl. Result and search-
+round ranges are 0..25; zero omits ttychatter's limit. Perplexity clamps a
+nonzero result limit to 20. The four
+WEB_SEARCH keys are in the default USER_TTYCONFIG_ALLOWED_KEYS; add them to any
+custom allowlist if users should control search themselves.
+
+The C, Python-compatible, and Bash backends use OpenRouter's web server tool.
+The model decides whether to search, and search fees plus result tokens add to
+chat cost, even on free models. Some native providers ignore result and search
+limits. These controls are not a dollar spending cap.
+
+Install files
+-------------
+
+Install the mailbot and its manual:
+
+    install -d -m 0755 /home/r94/bin
+    install -m 0755 ttychatter.mailbot /home/r94/bin/ttychatter.mailbot
+    install -m 0644 ttychatter.mailbot.1 /home/r94/bin/ttychatter.mailbot.1
+
+Install whichever ttychatter backends you want to support:
+
+    install -m 0755 ttychatter /home/r94/bin/ttychatter
+    install -m 0755 ttychatter.python /home/r94/bin/ttychatter.python
+    install -m 0755 ttychatter.bash /home/r94/bin/ttychatter.bash
+
+For a system manpage install:
+
+    doas mkdir -p /usr/local/share/man/man1
+    doas install -m 0644 ttychatter.mailbot.1 /usr/local/share/man/man1/ttychatter.mailbot.1
+
+Create the XDG directories explicitly:
+
+    install -d -m 0700 /home/r94/.config/ttychatter/mailbot
+    install -d -m 0700 /home/r94/.local/state/ttychatter/mailbot
+    install -d -m 0700 /home/r94/.cache/ttychatter/mailbot
+    install -d -m 0700 /home/r94/.local/share/ttychatter/openrouter/sessions
+    install -d -m 0700 /home/r94/.local/share/ttychatter/openrouter/attachments
+    install -d -m 0700 /home/r94/.cache/ttychatter/openrouter
+    install -d -m 0700 /home/r94/.secrets/ttychatter/mailbot
+
+Minimum private config
+----------------------
+
+Create /home/r94/.config/ttychatter/mailbot/config:
+
+    IMAP_HOST=localhost
+    IMAP_PORT=993
+    IMAP_SSL=1
+    IMAP_USER=r94
+    IMAP_MAILBOX=INBOX
+
+    SEND_METHOD=sendmail
+    SENDMAIL=/usr/sbin/sendmail
+
+    MAIL_FROM=ttychatter@localhost
+    ALLOWED_FROM=you@example.org
+    DENY_FROM=ttychatter@localhost
+    REJECT_SELF_SENDER=1
+
+    SUBJECT_PREFIX=tc
+    SUBJECT_SEPARATOR=:
+    SESSION_OPEN_DELIM={
+    SESSION_CLOSE_DELIM=}
+    CONFIG_SUBJECT_TOKEN=CONFIG
+    MODELS_SUBJECT_TOKEN=MODELS
+    COMMAND_SUBJECT_TOKEN=CMD
+    MAILBOT_SUBJECT_TOKEN=MAILBOT
+    BODY_COMMAND_SUBJECTS=MAILBOT,CMD
+    SUBJECT_SESSIONS=1
+
+    TTYCHATTER_BACKEND=auto
+    TTYCHATTER_EXTRA_ARGS=
+    TTYCHATTER_CONTROL_TIMEOUT=180
+
+    SESSION_DIR=/home/r94/.local/share/ttychatter/openrouter/sessions
+    ATTACHMENT_DIR=/home/r94/.local/share/ttychatter/openrouter/attachments
+    MODEL_CACHE_FILE=/home/r94/.cache/ttychatter/openrouter/models.json
+    MAILBOT_MANPAGE_FILE=/home/r94/bin/ttychatter.mailbot.1
+
+    USER_REGISTRY=1
+    USER_HOME_ROOT=/home/r94/.local/state/ttychatter/mailbot/users
+    USER_REGISTRY_FILE=/home/r94/.local/state/ttychatter/mailbot/users.json
+    USER_SECRET_DIR=/home/r94/.secrets/ttychatter/mailbot/openrouter-users
+    DEFAULT_OPENROUTER_API_KEY_FILE=/home/r94/.secrets/ttychatter/mailbot/openrouter-default.key
+    ALLOW_USER_API_KEYS=1
+    USER_API_KEY_MODE=persistent
+    USER_API_KEY_TTL_MINUTES=60
+    USER_API_KEY_RUNTIME_DIR=/tmp/ttychatter-mailbot-r94/user-api-keys
+    USER_API_KEY_FALLBACK_TO_OPERATOR=1
+    API_KEY_COMMANDS_REQUIRE_BODY=1
+
+    COMMAND_OUTPUT_MODE=auto
+    MODEL_CACHE_OUTPUT=auto
+    MODEL_SEARCH_OUTPUT=body
+    MODEL_LIST_OUTPUT=auto
+    SESSIONS_OUTPUT=body
+    CONFIG_OUTPUT=attachment
+    OUTPUT_INLINE_MAX_BYTES=50000
+
+Keep it private:
+
+    chmod 600 /home/r94/.config/ttychatter/mailbot/config
+
+Backend-specific config examples
+--------------------------------
+
+Use the C backend explicitly:
+
+    TTYCHATTER_BACKEND=c
+
+Use ttychatter.python explicitly:
+
+    TTYCHATTER_BACKEND=python
+
+Use the Bash-only backend explicitly:
+
+    TTYCHATTER_BACKEND=bash
+
+Use a custom command path:
+
+    TTYCHATTER_BACKEND=command
+    TTYCHATTER_COMMAND=/home/r94/bin/ttychatter
+
+Use demo mode for local smoke tests only:
+
+    TTYCHATTER_EXTRA_ARGS=--demo
+
+or on the local command line:
+
+    /home/r94/bin/ttychatter.mailbot --config-file /home/r94/.config/ttychatter/mailbot/config --ttychatter-backend c --ttychatter-extra-args=--demo --once --dry-run
+
+OpenRouter key source
+---------------------
+
+For a private single-user deployment, the simplest server default key file is:
+
+    /home/r94/.secrets/ttychatter/mailbot/openrouter-default.key
+
+Create it:
+
+    install -d -m 0700 /home/r94/.secrets/ttychatter/mailbot
+    printf '%s\n' 'sk-or-v1-REPLACE-ME' > /home/r94/.secrets/ttychatter/mailbot/openrouter-default.key
+    chmod 600 /home/r94/.secrets/ttychatter/mailbot/openrouter-default.key
+
+With USER_REGISTRY=1 and ALLOW_USER_API_KEYS=1, a sender may also provide a
+private key by email.  Use a body-command subject so the key is not placed in
+the message subject:
+
+    Subject: tc:CMD
+
+    api-key sk-or-v1-...
+
+With USER_API_KEY_MODE=persistent, that key is stored under USER_SECRET_DIR as
+a chmod 600 secret file and injected into the ttychatter subprocess environment.
+It is not written to .config.
+
+Temporary runtime keys are also supported for encrypted-mail or otherwise
+trusted deployments.  Enable them with:
+
+    USER_API_KEY_MODE=session
+
+or allow both temporary and persistent user keys with:
+
+    USER_API_KEY_MODE=both
+
+Then the sender can send:
+
+    Subject: tc:CMD
+
+    api-key-session sk-or-v1-...
+
+The temporary key is stored under USER_API_KEY_RUNTIME_DIR, expires after
+USER_API_KEY_TTL_MINUTES, and is preferred over a persistent key while valid.
+It avoids long-term .local/state or .config storage, but ordinary email is still
+not confidential unless the mail path is encrypted end-to-end.  A trusted host
+administrator or root can still inspect process/runtime storage.
+
+Useful API-key commands:
+
+    Subject: tc:CMD
+
+    api-key-status
+
+    Subject: tc:CMD
+
+    forget-session-api-key
+
+    Subject: tc:CMD
+
+    forget-api-key
+
+forget-api-key removes both persistent and temporary user keys.
+
+IMAP and SMTP password source
+-----------------------------
+
+Plaintext local IMAP password, protected by file mode:
+
+    IMAP_PASSWORD=your-imap-password
+
+Encrypted IMAP password file:
+
+    /home/r94/bin/ttychatter.mailbot --set-imap-password --gpg
+
+Then the config should contain:
+
+    IMAP_PASSWORD_GPG_FILE=/home/r94/.config/ttychatter/mailbot/imap-password.gpg
+
+For SMTP password storage, use:
+
+    /home/r94/bin/ttychatter.mailbot --set-smtp-password --gpg
+
+A cron or daemon process can decrypt a gpg password file only if gpg-agent can
+unlock it without an interactive prompt.  If not, use a protected plaintext
+IMAP_PASSWORD or SMTP_PASSWORD line, a service environment variable, or a local
+secret manager appropriate to the host.
+
+Initial diagnostics
+-------------------
+
+Run as the mailbot user, not root:
+
+    su -l r94
+
+Then run:
+
+    /home/r94/bin/ttychatter.mailbot --config-file /home/r94/.config/ttychatter/mailbot/config --config
+    /home/r94/bin/ttychatter.mailbot --config-file /home/r94/.config/ttychatter/mailbot/config --doctor
+    /home/r94/bin/ttychatter.mailbot --config-file /home/r94/.config/ttychatter/mailbot/config --list-candidates
+    /home/r94/bin/ttychatter.mailbot --config-file /home/r94/.config/ttychatter/mailbot/config --sessions
+    /home/r94/bin/ttychatter.mailbot --config-file /home/r94/.config/ttychatter/mailbot/config --once --dry-run
+
+If --config shows an incomplete config, make the path explicit with
+--config-file or set:
+
+    TTYCHATTER_MAILBOT_CONFIG=/home/r94/.config/ttychatter/mailbot/config
+
+Backend smoke tests
+-------------------
+
+These tests do not fetch mail.  They check local mailbot/backend wiring.
+
+Check C backend wiring:
+
+    /home/r94/bin/ttychatter.mailbot --config-file /home/r94/.config/ttychatter/mailbot/config --ttychatter-backend c --ttychatter-extra-args=--demo --sessions
+
+Check ttychatter.python wiring:
+
+    /home/r94/bin/ttychatter.mailbot --config-file /home/r94/.config/ttychatter/mailbot/config --ttychatter-backend python --ttychatter-extra-args=--demo --sessions
+
+Check Bash-only backend wiring:
+
+    /home/r94/bin/ttychatter.mailbot --config-file /home/r94/.config/ttychatter/mailbot/config --ttychatter-backend bash --ttychatter-extra-args=--demo --sessions
+
+Check model cache command:
+
+    /home/r94/bin/ttychatter.mailbot --config-file /home/r94/.config/ttychatter/mailbot/config --model-cache
+
+Check session search:
+
+    /home/r94/bin/ttychatter.mailbot --config-file /home/r94/.config/ttychatter/mailbot/config --search-sessions cron
+
+Check session export:
+
+    /home/r94/bin/ttychatter.mailbot --config-file /home/r94/.config/ttychatter/mailbot/config --export SESSION --format markdown
+
+The Bash-only ttychatter backend intentionally omits JSON export.  Use markdown
+or text for Bash-only export tests.
+
+Cron on OpenBSD
+---------------
+
+Install the crontab for r94, not root:
+
+    crontab -u r94 -e
+
+Example:
+
+    SHELL=/bin/sh
+    HOME=/home/r94
+    XDG_CONFIG_HOME=/home/r94/.config
+    XDG_DATA_HOME=/home/r94/.local/share
+    XDG_STATE_HOME=/home/r94/.local/state
+    XDG_CACHE_HOME=/home/r94/.cache
+    PATH=/home/r94/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
+    MAILTO=""
+
+    */2 * * * * -s /bin/sh -c 'echo "----- mailbot cron start -----"; /bin/date; /usr/local/bin/python3 /home/r94/bin/ttychatter.mailbot --config-file /home/r94/.config/ttychatter/mailbot/config --once; rc=$?; echo "----- mailbot cron end rc=$rc -----"; exit $rc' >>/home/r94/.local/state/ttychatter/mailbot/cron.log 2>&1
+
+Use /usr/local/bin/python3 explicitly for the mailbot if the script shebang is
+#!/usr/bin/env python3 and cron has a sparse PATH.
+
+If ttychatter.python or ttychatter.bash use #!/usr/bin/env bash, make sure
+/usr/local/bin is in PATH so env can find bash on OpenBSD.
+
+Daemon mode
+-----------
+
+Cron is usually simpler.  Daemon mode is available when the host has a suitable
+service supervisor:
+
+    /usr/local/bin/python3 /home/r94/bin/ttychatter.mailbot --config-file /home/r94/.config/ttychatter/mailbot/config --daemon
+
+Polling is controlled by:
+
+    POLL_INTERVAL=60
+    MAX_MESSAGES_PER_RUN=10
+
+Private-mode mail examples
+--------------------------
+
+Chat with a named session:
+
+    Subject: tc:{worklog}
+
+    Summarize where we left off.
+
+Start a new timestamped session:
+
+    Subject: tc:{new}
+
+    Draft a short note about the build.
+
+The first reply includes the created session selector in its subject. Replying
+to that message resumes it. It also asks for a readable session name until you
+provide one. An ordinary descriptive subject supplies a name automatically,
+without another model request.
+
+Use an ordinary subject as the session name when SUBJECT_SESSIONS=1:
+
+    Subject: build notes
+
+    Continue the discussion from this subject thread.
+
+A later reply with:
+
+    Subject: Re: build notes
+
+resumes the same sender/session pair.
+
+List sessions:
+
+    Subject: tc:sessions
+
+The session list displays friendly names, actual log filenames, and readable
+chat previews. Internal session IDs and response metadata are not preview text.
+
+Search sessions:
+
+    Subject: tc:search cron
+
+Rename a session title:
+
+    Subject: tc:rename-session worklog Build Notes and Cron Setup
+
+This changes the session title and the physical log filename. Managed filenames
+contain a safe title (up to 80 characters) and a stable session identity suffix,
+for example Build_Notes_and_Cron_Setup--0123456789ab.log. The precise title
+sanitization is supplied by the selected backend.
+
+Replies using the original worklog subject still resume the renamed log. The
+mailbot stores a private .mailbot-session-aliases.json file beside each sender's
+logs. Copy it together with those logs when moving an installation. It also
+recovers backend renames performed outside the mailbot by looking up session IDs.
+Missing or ambiguous targets produce an error instead of a new empty session.
+
+Rename the actual session file only when you deliberately want the legacy file
+rename operation:
+
+    Subject: tc:rename-session-file old-session new-session
+
+Show turn numbers:
+
+    Subject: tc:turns worklog
+
+Branch from a turn:
+
+    Subject: tc:branch worklog 6
+
+Export a session:
+
+    Subject: tc:export worklog markdown
+
+or:
+
+    Subject: tc:export worklog text
+
+or, with C or ttychatter.python backends:
+
+    Subject: tc:export worklog json
+
+Delete a session by exact sanitized name:
+
+    Subject: tc:delete{old-session}
+
+Use the body-command envelope:
+
+    Subject: tc:CMD
+
+    model-search claude
+
+Use the MAILBOT body-command subject:
+
+    Subject: MAILBOT
+
+    sessions
+
+Use MAILBOT as an AI prompt instead of a command:
+
+    Subject: MAILBOT
+
+    Explain the attached config. Do not modify anything.
+
+Because the first nonempty body line is not a known mailbot command, that body
+is treated as a chat prompt.
+
+Attachments
+-----------
+
+Mail attachments are saved under ATTACHMENT_DIR and passed to the selected
+backend with --attach.  Current C, ttychatter.python, and ttychatter.bash
+understand that form.
+
+Relevant limits:
+
+    PROCESS_ATTACHMENTS=1
+    MAX_ATTACHMENT_BYTES=1048576
+    MAX_ATTACHMENT_COUNT=3
+    MAX_TOTAL_ATTACHMENT_BYTES=2097152
+    API_MAX_ATTACHMENT_BYTES=2097152
+
+Attachment support still depends on the selected model and backend behavior.
+The mailbot should be treated as the transport layer, not the multimodal model
+compatibility checker.
+
+AI-returned file attachments
+----------------------------
+
+The ttychatter backends now understand provider-returned file metadata when an
+AI/provider response contains downloadable files, data URLs, or base64 payloads.
+The mailbot should not silently download arbitrary returned files by default.
+
+Operator defaults:
+
+    AI_FILE_DOWNLOAD_MODE=metadata
+    MAILBOT_SEND_AI_FILES=1
+
+Supported modes:
+
+    AI_FILE_DOWNLOAD_MODE=ask       noninteractive mailbot use records metadata only
+    AI_FILE_DOWNLOAD_MODE=metadata  list returned files without saving them
+    AI_FILE_DOWNLOAD_MODE=auto      save all returned files under ATTACHMENT_DIR/received
+    AI_FILE_DOWNLOAD_MODE=off       ignore returned file metadata
+
+If MAILBOT_SEND_AI_FILES=1 and auto mode saves returned files under the shared
+ATTACHMENT_DIR, the mailbot attaches those saved files to the outgoing reply,
+subject to MAX_OUTGOING_ATTACHMENT_BYTES.
+
+For per-sender registry users, allow AI_FILE_DOWNLOAD_MODE in
+USER_TTYCONFIG_ALLOWED_KEYS, then the user can opt in by email:
+
+    Subject: tc:CMD
+
+    tty-set AI_FILE_DOWNLOAD_MODE auto
+
+They can return to metadata-only behavior with:
+
+    Subject: tc:CMD
+
+    tty-set AI_FILE_DOWNLOAD_MODE metadata
+
+This feature is separate from local user-to-AI attachments and from code-block
+extraction. It only applies to provider-returned file objects or file-like
+content in model responses.
+
+Model cache commands
+--------------------
+
+Send the existing cache only, without refreshing:
+
+    Subject: tc:MODELS
+
+Search the existing cache only:
+
+    Subject: tc:MODELS claude
+
+or:
+
+    Subject: tc:model-search claude
+
+Refresh explicitly:
+
+    Subject: tc:update-models
+
+Do not use tc:MODELS when you mean update-models.  The two operations are
+separate on purpose.
+
+The canonical shared cache path is now:
+
+    /home/r94/.cache/ttychatter/openrouter/models.json
+
+Compatibility fallback exists for old models-cache.json files, but new configs
+should use models.json under XDG_CACHE_HOME.
+
+Safe model-list flags
+---------------------
+
+The mailbot allows only a bounded model-list flag set through email:
+
+    --all
+    --sort VALUE
+    --modellist-sort-tokens
+    --min-input-tokens N
+    --min-output-tokens N
+    --hide-preview
+    --show-preview
+    --require-tokens
+    --allow-missing-tokens
+    --favorites-only
+    --model-type VALUE
+
+Example:
+
+    Subject: tc:models --min-output-tokens 16000 --show-preview
+
+Output delivery config
+----------------------
+
+Default output settings:
+
+    COMMAND_OUTPUT_MODE=auto
+    MODEL_CACHE_OUTPUT=auto
+    MODEL_SEARCH_OUTPUT=body
+    MODEL_LIST_OUTPUT=auto
+    SESSIONS_OUTPUT=body
+    CONFIG_OUTPUT=attachment
+    OUTPUT_INLINE_MAX_BYTES=50000
+    MAX_COMMAND_OUTPUT_BYTES=200000
+    MAX_OUTGOING_ATTACHMENT_BYTES=8388608
+
+Set MODEL_CACHE_OUTPUT=body when you want the cache text inline.  Set
+MODEL_CACHE_OUTPUT=attachment when you always want models.json attached.  The
+auto policy uses the body for short readable results and attachments for large
+or structured results.
+
+Config editing by email
+-----------------------
+
+Request current config:
+
+    Subject: tc:CONFIG
+
+The bot replies with an attached config file.  Edit that attachment and send it
+back with the same subject.  Plaintext IMAP_PASSWORD and SMTP_PASSWORD values
+are redacted from exported config.  Password file paths are preserved.
+
+In public mode, tc:CONFIG remains privileged.  Non-ALLOWED_FROM public senders
+receive a refusal.
+
+User registry and per-sender preferences
+----------------------------------------
+
+With USER_REGISTRY=1, each sender gets a private ttychatter HOME under:
+
+    /home/r94/.local/state/ttychatter/mailbot/users/
+
+That private HOME contains the sender's ttychatter OpenRouter config, data,
+cache, favorites, sessions, and optional API-key state.  Persistent user keys
+live under USER_SECRET_DIR; temporary user keys live under
+USER_API_KEY_RUNTIME_DIR until expiry.  This keeps different mail senders from
+colliding in the same subject-named sessions.
+
+Useful user commands:
+
+    Subject: tc:user
+    Subject: tc:prefs
+    Subject: tc:set MODEL openrouter/auto
+    Subject: tc:set STREAM 1
+    Subject: tc:set SESSION_AUTO_TITLE 1
+    Subject: tc:set SESSION_TITLE_MODEL qwen/qwen3-coder:free
+    Subject: tc:unset STREAM
+
+The allowed tty-set keys are controlled by:
+
+    USER_TTYCONFIG_ALLOWED_KEYS=...
+
+The mailbot adapts tty-set syntax for the selected backend:
+
+    C backend:              --set KEY=VALUE
+    Python/Bash backends:   --set KEY VALUE
+
+Public demo mode
+----------------
+
+For a public demo mailbox, add:
+
+    OPEN_TO_PUBLIC=1
+    REJECT_SELF_SENDER=1
+    DENY_FROM=mailbot@thatiam.vip
+    USER_REGISTRY=1
+    SUBJECT_SESSIONS=1
+    RE_SESSION_SUBJECTS=public
+
+With USER_REGISTRY=1, public senders are isolated by registry user and subject
+session.  ALLOWED_FROM remains the private/admin allowlist for global mailbot
+controls such as config export/update.  If you want public users to bring their
+own temporary API keys instead of spending the operator key, set:
+
+    USER_API_KEY_MODE=session
+    USER_API_KEY_FALLBACK_TO_OPERATOR=0
+
+and tell users to send api-key-session through a body-command email.
+
+If you disable the user registry, restrict public users to a small command set:
+
+    USER_REGISTRY=0
+    PUBLIC_SESSION_MODE=per-sender
+    PUBLIC_SESSION_PREFIX=public
+    PUBLIC_ALLOW_NAMED_SESSIONS=0
+    PUBLIC_ALLOWED_COMMANDS=help,manpage,model-cache,model-search,archive-session
+
+Recommended public cleanup:
+
+    PUBLIC_SESSION_CLEANUP=1
+    PUBLIC_SESSION_IDLE_HOURS=72
+    PUBLIC_SESSION_TTL_HOURS=168
+    PUBLIC_SESSION_MAX_COUNT=200
+    PUBLIC_SESSION_MAX_TURNS=12
+
+Recommended public archive behavior:
+
+    PUBLIC_SESSION_INDEX_FILE=/home/r94/.local/state/ttychatter/mailbot/public-sessions.json
+    PUBLIC_SESSION_ARCHIVE_ON_DELETE=1
+    PUBLIC_SESSION_ARCHIVE_USER_TOGGLE=1
+    PUBLIC_SESSION_ARCHIVE_FAILURE_POLICY=keep
+    PUBLIC_SESSION_ARCHIVE_MAX_BYTES=1048576
+
+Run public mode from cron by either setting OPEN_TO_PUBLIC=1 in the config or
+adding --open-to-public to the cron command.
+
+Public user behavior
+--------------------
+
+A stranger can send:
+
+    Subject: hello
+
+    What can this bot do?
+
+The mailbot treats that as a prompt.  The public sender does not need tc:.
+The reply subject contains the real public session name, for example:
+
+    Re: public-85956a993804cda1
+
+If the user replies to that subject, the same session resumes when
+RE_SESSION_SUBJECTS allows public reply-subject resumption.
+
+With USER_REGISTRY=0 and the recommended public allowlist, public users may
+send:
+
+    Subject: tc:help
+    Subject: tc:manpage
+    Subject: tc:model-cache
+    Subject: tc:model-search qwen
+    Subject: tc:archive-session status
+    Subject: tc:archive-session off
+    Subject: tc:archive-session on
+
+They cannot edit config, update the model cache, rename/delete sessions, set
+API keys, or run tty-set unless the operator deliberately exposes those commands.
+With USER_REGISTRY=1, regular user-profile commands are available to each
+registered sender; USER_API_KEY_MODE controls whether api-key, api-key-session,
+or neither is accepted.
+
+Public cleanup and archive
+--------------------------
+
+Cleanup runs at the start of --once and --daemon polling.  It can also be run
+locally:
+
+    /home/r94/bin/ttychatter.mailbot --config-file /home/r94/.config/ttychatter/mailbot/config --open-to-public --cleanup-public-sessions --dry-run
+
+The default policy means:
+
+    idle>72h       delete inactive public logs
+    ttl>168h       delete old public logs even if occasionally active
+    count>200      keep only the newest 200 public logs
+    max_turns=12   trim surviving logs to the last 12 user/assistant cycles
+
+If PUBLIC_SESSION_ARCHIVE_ON_DELETE=1, the bot emails the log to the recorded
+public sender before deleting it.  With PUBLIC_SESSION_ARCHIVE_FAILURE_POLICY=keep,
+a failed archive send keeps the local log.  With delete, cleanup deletes anyway.
+
+Local administration commands
+-----------------------------
+
+Show effective config:
+
+    /home/r94/bin/ttychatter.mailbot --config-file /home/r94/.config/ttychatter/mailbot/config --config
+
+Show raw config:
+
+    /home/r94/bin/ttychatter.mailbot --config-file /home/r94/.config/ttychatter/mailbot/config --raw-config
+
+Set a mailbot config key:
+
+    /home/r94/bin/ttychatter.mailbot --config-file /home/r94/.config/ttychatter/mailbot/config --set TTYCHATTER_BACKEND c
+
+Unset a mailbot config key:
+
+    /home/r94/bin/ttychatter.mailbot --config-file /home/r94/.config/ttychatter/mailbot/config --unset TTYCHATTER_EXTRA_ARGS
+
+Rename a session and its physical log:
+
+    /home/r94/bin/ttychatter.mailbot --config-file /home/r94/.config/ttychatter/mailbot/config --rename-session worklog "Build Notes and Cron Setup"
+
+Delete a session:
+
+    /home/r94/bin/ttychatter.mailbot --config-file /home/r94/.config/ttychatter/mailbot/config --delete-session old-session
+
+Search sessions:
+
+    /home/r94/bin/ttychatter.mailbot --config-file /home/r94/.config/ttychatter/mailbot/config --search-sessions cron
+
+Show turns:
+
+    /home/r94/bin/ttychatter.mailbot --config-file /home/r94/.config/ttychatter/mailbot/config --turns worklog
+
+Branch from turn 6:
+
+    /home/r94/bin/ttychatter.mailbot --config-file /home/r94/.config/ttychatter/mailbot/config --branch worklog 6
+
+Export session:
+
+    /home/r94/bin/ttychatter.mailbot --config-file /home/r94/.config/ttychatter/mailbot/config --export worklog --format markdown
+
+API-key privacy notes
+---------------------
+
+The mailbot cannot make ordinary email secret.  The privacy improvement in
+api-key-session is storage lifetime: the key is not written into the per-user
+ttychatter config and is not kept as a persistent USER_SECRET_DIR file.  It is
+kept in runtime storage only until USER_API_KEY_TTL_MINUTES expires or the user
+sends forget-session-api-key.
+
+For best privacy, combine api-key-session with an encrypted mail setup and:
+
+    USER_API_KEY_MODE=session
+    USER_API_KEY_FALLBACK_TO_OPERATOR=0
+    API_KEY_COMMANDS_REQUIRE_BODY=1
+
+For compatibility with older private deployments, the default remains:
+
+    USER_API_KEY_MODE=persistent
+    USER_API_KEY_FALLBACK_TO_OPERATOR=1
+
+Delivery recovery and timeouts
+-----------------------------
+
+Completed chat, command, and config replies are saved before delivery in pending-chat-replies/
+next to PROCESSED_DB. If SMTP or sendmail fails, the next poll resends that saved
+reply with the same Message-ID. It does not ask the model again or append a
+second generated response to the session, reapply a config attachment, or
+repeat a completed command such as branching a session. A corrupt pending record is kept for
+operator inspection, rather than discarded and regenerated.
+
+Keep pending-chat-replies/, the processed-message database, and each session
+directory's .mailbot-session-aliases.json with the installation's state during
+upgrades or moves. These private files contain replies and session references.
+
+The queue does not guarantee exactly-once delivery if the process stops after
+the SMTP server accepts an email but before the mailbot records success. It
+also cannot recover an unfinished generation if the process stops before a
+reply has been queued. Inspect the session log before manually retrying that
+case. The same limitation applies if a command changes state and the process
+stops before its reply has been queued.
+
+The default limits are:
+
+    TTYCHATTER_CHAT_TIMEOUT=600
+    TTYCHATTER_CONTROL_TIMEOUT=180
+
+A backend timeout stops its process group, including shell child processes,
+and preserves partial output in an explicitly incomplete error reply. Cleanup
+allows five seconds for termination, then one second to drain remaining pipes
+after SIGKILL. A detached child holding an output pipe cannot stall the poll
+indefinitely. IMAP,
+SMTP, and sendmail use the control timeout. IMAP over TLS verifies server
+certificates and hostnames against the system trust store; SMTP TLS and
+STARTTLS do the same. Install the correct local CA when using a private CA.
+
+With ABUSE_LIMIT_ALLOWED_FROM=1 and a positive MAX_MESSAGE_BYTES, the IMAP
+fetch requests at most the limit plus one byte. Oversized messages stay
+unread and are skipped before MIME decoding. ABUSE_LIMIT_ALLOWED_FROM=0
+keeps the existing admin bypass: the full email is fetched before checking
+the parsed sender's limits.
+
+Backend stdout is captured up to the larger of MAX_COMMAND_OUTPUT_BYTES and
+MAX_OUTGOING_ATTACHMENT_BYTES (8 MiB with the defaults). The final
+MAX_COMMAND_OUTPUT_BYTES of stderr are retained (200000 bytes by default),
+including final session-path markers. Buffers have a 1000-byte minimum.
+Additional output is drained without accumulating in memory; any shortened
+result is explicitly marked. Capture does not shorten the original session
+log written by the backend.
+
+Polls that share PROCESSED_DB also share a process lock. An overlapping cron
+or daemon poll is skipped. The unread-message scan continues past rejected
+senders and irrelevant subjects; MAX_MESSAGES_PER_RUN counts processed mail.
+Malformed message charsets fall back to UTF-8. Other message-local errors are
+reported while the scan continues to later unread messages. A disconnected
+IMAP connection ends the poll, allowing a fresh connection on the next run.
+The processed-message history is read once per locked poll, updated after
+each durable delivery record, and reloaded on the next poll.
+
+Offline regression tests
+------------------------
+
+From the source tree, run:
+
+    python3 -m unittest discover -s mailbot/tests -v
+
+The tests use temporary directories and simulated mail/backend calls. They
+cover web-setting precedence, all three backend argument conventions, physical
+session renames and old email subjects, naming reminders, private user state,
+partial timeout output, overlapping polls, and mail-delivery retry recovery.
+No mailbox, SMTP server, or OpenRouter account is contacted.
+
+Troubleshooting
+---------------
+
+If cron logs contain:
+
+    env: python3: No such file or directory
+
+use an absolute Python path for the mailbot cron command:
+
+    /usr/local/bin/python3 /home/r94/bin/ttychatter.mailbot ...
+
+If cron logs contain:
+
+    env: bash: No such file or directory
+
+then ttychatter.python or ttychatter.bash is using #!/usr/bin/env bash and cron
+cannot find bash.  Add /usr/local/bin to PATH or use TTYCHATTER_COMMAND with an
+explicit shell:
+
+    TTYCHATTER_BACKEND=command
+    TTYCHATTER_COMMAND=/usr/local/bin/bash /home/r94/bin/ttychatter.python
+
+If root sees an empty config, do not debug as root unless the bot is intended to
+run as root.  The mailbot reads paths under the process user's HOME unless
+--config-file or TTYCHATTER_MAILBOT_CONFIG says otherwise.
+
+If tc:MODELS returns an old or empty cache, remember that it is cache-only.  Use:
+
+    Subject: tc:update-models
+
+If --sessions looks different between mailbot and local ttychatter, check that
+all processes have the same XDG_DATA_HOME and SESSION_DIR.
+
+If model cache behavior differs between backends, check that all processes have
+the same XDG_CACHE_HOME and MODEL_CACHE_FILE.
+
+If backend=auto chooses the C client when you expected ttychatter.python, set:
+
+    TTYCHATTER_BACKEND=python
+
+or provide an exact command with:
+
+    TTYCHATTER_BACKEND=command
+    TTYCHATTER_COMMAND=/home/r94/bin/ttychatter.python
+
+Public self-loop protection
+---------------------------
+
+For a public demo, keep self-rejection enabled even when accepting all senders:
+
+    ALLOWED_FROM=*
+    REJECT_SELF_SENDER=1
+    DENY_FROM=mailbot@thatiam.vip
+
+REJECT_SELF_SENDER is enabled by default.  It rejects the bot's own MAIL_FROM
+before allowlist or public-mode checks.  DENY_FROM is an extra operator block
+list.  BANNED_FROM and BANNED_LIST are accepted aliases, but DENY_FROM is the
+canonical name.
+
+If a loop has already started, stop cron, delete the Re: Re: loop messages from
+the Maildir, then restart cron after confirming --list-candidates reports:
+
+    skip: self-sender rejected
+
+or:
+
+    skip: sender is in DENY_FROM/BANNED_LIST
+
+Operational rule
+----------------
+
+Use one shared XDG environment everywhere:
+
+    XDG_CONFIG_HOME=/home/r94/.config
+    XDG_DATA_HOME=/home/r94/.local/share
+    XDG_STATE_HOME=/home/r94/.local/state
+    XDG_CACHE_HOME=/home/r94/.cache
+
+The mailbot, C backend, ttychatter.python, ttychatter.bash, and ttychatter.ncurses
+are intended to share sessions and settings through those directories.  If a
+cron job, daemon supervisor, login shell, and manual test run use different XDG
+values, they are different worlds.

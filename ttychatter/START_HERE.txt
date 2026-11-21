@@ -1,0 +1,102 @@
+TTYCHATTER STABILITY AND PERFORMANCE UPDATE - 2026-11-16
+
+This is the complete source package for the current ttychatter client family.
+It builds on the November 3 update and preserves shared configuration,
+session IDs, plaintext logs, existing attachments, and established controls.
+
+CURRENT VERSIONS
+
+    ttychatter C:        0.7.2-c-cli
+    ttychatter.python:   3.20-stability
+    ttychatter.bash:     3.20-stability
+    ttychatter.ncurses:  0.17.1
+    ttychatter.mailbot:  0.7.2-stability
+
+READ FIRST
+
+    STABILITY_REPORT.txt  Changes, reproductions, performance, tests, limits.
+    README.md             Main client-family documentation.
+    c/README              C build dependencies and command-line use.
+    c/WALKTHROUGH         C usage walkthrough.
+    mailbot/ttychatter.mailbot.walkthrough.txt  Mail setup and operation.
+
+INSTALL THE WHOLE FAMILY
+
+From this extracted ttychatter directory, after installing a C compiler,
+make, pkg-config, libcurl development files, and json-c development files:
+
+    make
+    make install PREFIX="$HOME/.local"
+
+The source archive contains no prebuilt operating-system-specific binaries.
+Use your system's compiler and libraries. The build was verified on Linux;
+native OpenBSD runtime testing remains outstanding.
+
+INSTALL SCRIPT CLIENTS ONLY
+
+    make install-scripts PREFIX="$HOME/.local"
+
+This installs the ncurses, Bash, Bash+Python, and mailbot scripts and manuals.
+Python 3 with curses is needed for the ncurses client. Bash/curl are needed
+for the line-oriented scripts, with Python 3 for ttychatter.python and jq for
+the full Bash JSON/streaming functionality.
+
+VERIFY THE COPY YOU RUN
+
+    python3 ./nonc/ttychatter.ncurses --version
+    ./c/ttychatter --version
+    bash ./nonc/ttychatter.python --version
+    bash ./nonc/ttychatter.bash --version
+    python3 ./mailbot/ttychatter.mailbot --version
+
+An installed command may still resolve to an older copy. For example:
+
+    type -a ttychatter.ncurses
+    ttychatter.ncurses --version
+
+OFFLINE NCURSES TRYOUT
+
+    python3 ./nonc/ttychatter.ncurses --demo --new
+
+Demo mode does not send a model request. Main controls:
+
+    Esc                 Stop an active stream; otherwise command menu
+    F1                  Command menu, including during a stream
+    F2                  Models
+    F3                  API key
+    F4                  Sessions
+    F5                  Options, including web and streaming settings
+    F6                  Memory
+    F7                  Files and attachments
+    F8                  External editor and Save last reply
+    F9                  About
+    F10                 Close confirmation
+    F11                 Draft/read toggle
+    PgUp/PgDn           Transcript page scrolling
+    Up/Down or k/j      Read-mode line scrolling
+    u/d                 Read-mode half-page scrolling
+    g/G                 Oldest/latest transcript position
+
+Enter sends by default. Ctrl+G sends only when SEND_INPUT=ctrl_g is configured.
+Nonessential control-key bindings removed in the prior release remain removed.
+The first response text enters read mode. Later chunks respect a draft you
+reopen and a reading position you scroll to.
+
+RUN THE OFFLINE REGRESSION SUITE
+
+    make check
+
+The optional development dependency pyte enables terminal-screen assertions;
+without it, those two screen-layout tests explicitly skip. Other tests use
+local fixtures, demo mode, and loopback servers. No real mailbox or paid model
+account is needed for this suite.
+
+CHECK PACKAGE INTEGRITY
+
+SHA256SUMS lists the files in this source package. On systems with sha256sum:
+
+    sha256sum -c SHA256SUMS
+
+The package includes test and benchmark source for reproducing the work.
+Benchmark measurements are synthetic local comparisons, not provider latency
+or universal performance guarantees.

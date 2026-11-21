@@ -1,0 +1,16 @@
+make: Entering directory '/workspace/scratch/53e911a8244e/release/ttychatter'
+make -C c install
+make[1]: Entering directory '/workspace/scratch/53e911a8244e/release/ttychatter/c'
+cc -I/workspace/scratch/53e911a8244e/c-deps/unpacked/usr/include -O2 -g -Wall -Wextra -Wpedantic -o ttychatter src/ttychatter.c -lcurl -l:libjson-c.so.5
+install -d /workspace/scratch/53e911a8244e/install-check/usr/bin
+install -m 0755 ttychatter /workspace/scratch/53e911a8244e/install-check/usr/bin/ttychatter
+install -d /workspace/scratch/53e911a8244e/install-check/usr/share/man/man1
+install -m 0644 ttychatter.1 /workspace/scratch/53e911a8244e/install-check/usr/share/man/man1/ttychatter.1
+make[1]: Leaving directory '/workspace/scratch/53e911a8244e/release/ttychatter/c'
+make install-scripts
+make[1]: Entering directory '/workspace/scratch/53e911a8244e/release/ttychatter'
+install -d "/workspace/scratch/53e911a8244e/install-check/usr/bin" "/workspace/scratch/53e911a8244e/install-check/usr/share/man/man1"
+install -m 0755 nonc/ttychatter.python nonc/ttychatter.bash nonc/ttychatter.ncurses mailbot/ttychatter.mailbot "/workspace/scratch/53e911a8244e/install-check/usr/bin/"
+install -m 0644 nonc/ttychatter.python.1 nonc/ttychatter.bash.1 nonc/ttychatter.ncurses.1 mailbot/ttychatter.mailbot.1 "/workspace/scratch/53e911a8244e/install-check/usr/share/man/man1/"
+make[1]: Leaving directory '/workspace/scratch/53e911a8244e/release/ttychatter'
+make: Leaving directory '/workspace/scratch/53e911a8244e/release/ttychatter'

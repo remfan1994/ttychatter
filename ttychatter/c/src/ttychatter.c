@@ -1,0 +1,5627 @@
+/*
+ * ttychatter.c - command-line OpenRouter client for the ttychatter project
+ *
+ * This C edition is deliberately NOT an ncurses program.  The Python ncurses
+ * edition is the full terminal application.  This file is the traditional Unix
+ * command-line client: the user may start a plain interactive session, send an
+ * input file into an automatically saved timestamped session, or use the classic
+ * input-file/output-log form when an explicit path is desired.
+ *
+ * The design target is the classic shell workflow plus complete terminal prompt
+ * coverage:
+ *
+ *     ttychatter
+ *     $EDITOR prompt.txt
+ *     ttychatter prompt.txt
+ *     ttychatter -a notes.txt prompt.txt session.log
+ *     ttychatter --prompt "summarize this" --session notes
+ *     less session.log
+ *
+ * The output file is more than a transcript.  It is also the session state. On
+ * subsequent invocations, ttychatter reads the most recent turns from that file
+ * and sends them back to OpenRouter as context.  This means the user can resume
+ * a conversation by simply reusing the same output file:
+ *
+ *     ttychatter new-question.txt session.log
+ *
+ * The implementation is heavily commented on purpose.  The project owner wants
+ * future maintainers, porters, packagers, and fork authors to understand not
+ * only what the code does, but why the code takes a given shape.  C code that
+ * touches networking, terminal files, config files, and user secrets becomes
+ * expensive to maintain if the original design intent is not written down.
+ */
+
+#define _POSIX_C_SOURCE 200809L
+#define _XOPEN_SOURCE 700
+
+#include <ctype.h>
+#include <curl/curl.h>
+#include <errno.h>
+#include <dirent.h>
+#include <fcntl.h>
+#include <getopt.h>
+#include <json-c/json.h>
+#include <limits.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+#include <sys/select.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <termios.h>
+#include <time.h>
+#include <unistd.h>
+
+#define TC_PROGRAM "ttychatter"
+#define TC_VERSION "0.7.2-c-cli"
+#define TC_OPENROUTER_CHAT_URL "https://openrouter.ai/api/v1/chat/completions"
+#define TC_OPENROUTER_MODELS_URL "https://openrouter.ai/api/v1/models"
+
+/*
+ * New 0.6.1 logs use ttychatter's shared line-oriented OpenRouter transcript
+ * format.  The older C marker strings remain defined so the parser can resume
+ * 0.6.0-era C logs without forcing users to migrate old session files.
+ */
+#define TC_TURN_BEGIN "===== TTYCHATTER TURN BEGIN ====="
+#define TC_TURN_END   "===== TTYCHATTER TURN END ====="
+#define TC_USER_BEGIN "----- USER BEGIN -----"
+#define TC_USER_END   "----- USER END -----"
+#define TC_AI_BEGIN   "----- AI BEGIN -----"
+#define TC_AI_END     "----- AI END -----"
+#define TC_NOTICE_BEGIN "===== TTYCHATTER NOTICE BEGIN ====="
+#define TC_NOTICE_END   "===== TTYCHATTER NOTICE END ====="
+#define TC_MEMORY_CLEAR "===== TTYCHATTER MEMORY CLEAR ====="
+#define TC_CONTEXT_BEGIN "===== TTYCHATTER CONTEXT BEGIN ====="
+#define TC_CONTEXT_END   "===== TTYCHATTER CONTEXT END ====="
+#define TC_PRECHAT_LINE "Everyone is encouraged to get the cruelty-free vegetarian alternatives and remember the bloodguilt curse from the Bible... http://bloodguiltcurse.net"
+#define TC_STREAM_INTERRUPT_MARKER "[assistant stream interrupted by user]"
+
+/*
+ * Configuration defaults follow XDG conventions rather than the early project
+ * prototype's ~/.gpt directory.  ~/.gpt was convenient while the project was
+ * personal; public Unix software should keep config, cache, and data separate.
+ */
+typedef struct TCConfig {
+    char *config_file;
+    char *api_key;
+    char *api_key_gpg_file;
+    char *model;
+    char *session_title_model;
+    char *web_search_engine;
+    char *model_cache_file;
+    char *model_favorites_file;
+    char *session_dir;
+    char *attachment_dir;
+    char *ai_file_download_mode;
+    long context_turns;
+    long session_title_max_words;
+    long web_search_max_results;
+    long web_search_max_uses;
+    long code_attachment_min_lines;
+    long max_attachment_bytes;
+    char *theme;
+    char *send_input;
+    char *editor_cmd;
+    char *voice_input_cmd;
+    char *voice_output_cmd;
+    char *model_test_prompt;
+    char *model_sort_order;
+    char *model_type_filter;
+    bool model_filter_generate_content;
+    bool model_filter_require_tokens;
+    bool model_filter_hide_preview;
+    long model_min_input_tokens;
+    long model_min_output_tokens;
+    bool confirm_live_send;
+    bool startup_notice;
+    bool session_auto_title;
+    bool prompt_session_name;
+    bool web_search;
+    bool stream;
+    bool status_updates;
+    bool voice_output;
+    bool demo_mode_default;
+    bool loopback_default;
+} TCConfig;
+
+typedef struct TCArgs {
+    bool show_help;
+    bool show_version;
+    bool doctor;
+    bool set_api_key;
+    bool set_api_key_gpg;
+    bool forget_api_key;
+    bool update_models;
+    bool list_models;
+    bool test_model;
+    bool loopback;
+    bool demo;
+    bool interactive;
+    bool show_config;
+    bool favorites;
+    bool favorite_model;
+    bool unfavorite_model;
+    bool config_set_cmd;
+    bool config_unset_cmd;
+    bool list_sessions_cmd;
+    bool rename_session_cmd;
+    bool show_memory_cmd;
+    bool clear_memory_cmd;
+    bool edit_memory_cmd;
+    bool editor_prompt_cmd;
+    bool credits_cmd;
+    bool search_sessions_cmd;
+    bool select_model_cmd;
+    bool new_session_cmd;
+    bool turns_cmd;
+    bool branch_cmd;
+    bool edit_turn_cmd;
+    bool export_cmd;
+    bool show_all_models;
+    char *loopback_file;
+    char *interactive_session_path;
+    char *session_arg;
+    char *prompt_text;
+    char *config_key;
+    char *config_value;
+    char *rename_old;
+    char *rename_new;
+    char *memory_path;
+    char *resume_session;
+    char *turns_session;
+    char *branch_session;
+    long branch_turn;
+    char *edit_turn_session;
+    long edit_turn;
+    char *export_session;
+    char *export_format;
+    char *search;
+    char *model_type;
+    char *model_sort;
+    long min_input_tokens;
+    long min_output_tokens;
+    bool require_tokens;
+    bool allow_missing_tokens;
+    bool hide_preview;
+    bool show_preview;
+    bool favorites_only;
+    bool save;
+    bool yes;
+    bool stream_set;
+    bool stream;
+    bool web_set;
+    bool web_search;
+    char *web_search_engine;
+    long web_search_max_results;
+    long web_search_max_uses;
+    bool web_search_max_results_set;
+    bool web_search_max_uses_set;
+    char *session_id;
+    bool preserve_session_path;
+    bool request_failed;
+    bool did_prompt_after_reply;
+    json_object *response_metadata;
+    bool status_set;
+    bool status_updates;
+    bool speak_set;
+    bool speak;
+    char *model_override;
+    char *test_model_id;
+    char *input_path;
+    char *output_path;
+    char *voice_input_path;
+    char *ai_file_download_mode;
+    char **attachments;
+    size_t attachment_count;
+} TCArgs;
+
+typedef struct TCBuffer {
+    char *data;
+    size_t len;
+    size_t cap;
+} TCBuffer;
+
+typedef struct TCHttpResponse {
+    long status;
+    char *body;
+    bool failed;
+    bool displayed;
+    json_object *metadata;
+} TCHttpResponse;
+
+typedef struct TCMessage {
+    char *role;
+    char *content;
+} TCMessage;
+
+typedef struct TCMessageList {
+    TCMessage *items;
+    size_t count;
+    size_t cap;
+} TCMessageList;
+
+typedef struct TCAttachmentResult {
+    char *prompt_text_addition;
+    json_object *content_parts;
+} TCAttachmentResult;
+
+/* ------------------------------------------------------------------------- */
+/* Small allocation and string helpers                                       */
+/* ------------------------------------------------------------------------- */
+
+static void die(const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+    exit(1);
+}
+
+static char *xstrdup(const char *s) {
+    if (!s) return NULL;
+    char *out = strdup(s);
+    if (!out) die("out of memory");
+    return out;
+}
+
+static void *xcalloc(size_t n, size_t size) {
+    void *p = calloc(n, size);
+    if (!p) die("out of memory");
+    return p;
+}
+
+static void buffer_init(TCBuffer *b) {
+    b->cap = 4096;
+    b->len = 0;
+    b->data = xcalloc(1, b->cap);
+}
+
+static void buffer_reserve(TCBuffer *b, size_t extra) {
+    if (b->len == SIZE_MAX || extra > SIZE_MAX - b->len - 1) die("buffer size overflow");
+    size_t need = b->len + extra + 1;
+    if (need <= b->cap) return;
+    size_t capacity = b->cap ? b->cap : 4096;
+    while (need > capacity) {
+        if (capacity > SIZE_MAX / 2) { capacity = need; break; }
+        capacity *= 2;
+    }
+    char *p = realloc(b->data, capacity);
+    if (!p) die("out of memory");
+    b->data = p;
+    b->cap = capacity;
+}
+
+static void buffer_append_n(TCBuffer *b, const char *s, size_t n) {
+    buffer_reserve(b, n);
+    memcpy(b->data + b->len, s, n);
+    b->len += n;
+    b->data[b->len] = '\0';
+}
+
+static void buffer_append(TCBuffer *b, const char *s) {
+    if (s) buffer_append_n(b, s, strlen(s));
+}
+
+static void buffer_appendf(TCBuffer *b, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    va_list ap2;
+    va_copy(ap2, ap);
+    int need = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (need < 0) die("vsnprintf failed");
+    buffer_reserve(b, (size_t)need);
+    vsnprintf(b->data + b->len, b->cap - b->len, fmt, ap2);
+    va_end(ap2);
+    b->len += (size_t)need;
+}
+
+static char *buffer_take(TCBuffer *b) {
+    char *out = b->data;
+    b->data = NULL;
+    b->len = b->cap = 0;
+    return out;
+}
+
+static char *trim_in_place(char *s) {
+    if (!s) return s;
+    while (isspace((unsigned char)*s)) s++;
+    char *end = s + strlen(s);
+    while (end > s && isspace((unsigned char)end[-1])) end--;
+    *end = '\0';
+    return s;
+}
+
+static bool starts_with(const char *s, const char *prefix) {
+    return strncmp(s, prefix, strlen(prefix)) == 0;
+}
+
+static bool starts_with_casefold(const char *s, const char *prefix) {
+    if (!s || !prefix) return false;
+    size_t n = strlen(prefix);
+    return strncasecmp(s, prefix, n) == 0;
+}
+
+static bool parse_bool_string(const char *value, bool fallback) {
+    /*
+     * Boolean config values are deliberately permissive because real users tend
+     * to write config files by hand.  Accepting several common spellings avoids
+     * making the C client feel brittle.  This helper is used only for user-facing
+     * configuration keys; internal flags stay strongly typed as bool.
+     */
+    if (!value) return fallback;
+    if (strcasecmp(value, "1") == 0 || strcasecmp(value, "yes") == 0 ||
+        strcasecmp(value, "y") == 0 || strcasecmp(value, "true") == 0 ||
+        strcasecmp(value, "on") == 0) return true;
+    if (strcasecmp(value, "0") == 0 || strcasecmp(value, "no") == 0 ||
+        strcasecmp(value, "n") == 0 || strcasecmp(value, "false") == 0 ||
+        strcasecmp(value, "off") == 0) return false;
+    return fallback;
+}
+
+static char *path_join2(const char *a, const char *b) {
+    TCBuffer buf;
+    buffer_init(&buf);
+    buffer_append(&buf, a);
+    if (buf.len && buf.data[buf.len - 1] != '/') buffer_append(&buf, "/");
+    buffer_append(&buf, b);
+    return buffer_take(&buf);
+}
+
+static char *home_path(const char *suffix) {
+    const char *home = getenv("HOME");
+    if (!home || !*home) home = ".";
+    return path_join2(home, suffix);
+}
+
+static char *expand_tilde(const char *path) {
+    if (!path) return NULL;
+    if (path[0] == '~' && path[1] == '/') {
+        char *base = home_path(path + 2);
+        return base;
+    }
+    return xstrdup(path);
+}
+
+static void mkdir_p(const char *path) {
+    if (!path || !*path) return;
+    char *tmp = xstrdup(path);
+    for (char *p = tmp + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            mkdir(tmp, 0700);
+            *p = '/';
+        }
+    }
+    mkdir(tmp, 0700);
+    free(tmp);
+}
+
+static bool file_exists(const char *path) {
+    struct stat st;
+    return path && stat(path, &st) == 0;
+}
+
+static long file_size(const char *path) {
+    struct stat st;
+    if (!path || stat(path, &st) != 0) return -1;
+    return (long)st.st_size;
+}
+
+static char *read_file(const char *path, size_t *out_len) {
+    FILE *f = fopen(path, "rb");
+    if (!f) die("could not open %s: %s", path, strerror(errno));
+    if (fseek(f, 0, SEEK_END) != 0) die("could not seek %s", path);
+    long n = ftell(f);
+    if (n < 0) die("could not tell size for %s", path);
+    rewind(f);
+    char *data = xcalloc((size_t)n + 1, 1);
+    size_t got = fread(data, 1, (size_t)n, f);
+    if (got != (size_t)n && ferror(f)) die("could not read %s", path);
+    fclose(f);
+    data[got] = '\0';
+    if (out_len) *out_len = got;
+    return data;
+}
+
+static char *read_stream(FILE *f, size_t *out_len) {
+    TCBuffer b;
+    buffer_init(&b);
+    char chunk[8192];
+    while (!feof(f)) {
+        size_t n = fread(chunk, 1, sizeof(chunk), f);
+        if (n > 0) buffer_append_n(&b, chunk, n);
+        if (ferror(f)) die("could not read input stream");
+    }
+    if (out_len) *out_len = b.len;
+    return buffer_take(&b);
+}
+
+static char *read_input_source(const char *path, size_t *out_len) {
+    if (!path || strcmp(path, "-") == 0) return read_stream(stdin, out_len);
+    return read_file(path, out_len);
+}
+
+static void write_file_mode(const char *path, const char *data, mode_t mode) {
+    /* Commit replacements only after the complete file has reached disk. A
+     * failed flush must not destroy an existing config, cache, or export. */
+    char *copy = xstrdup(path);
+    char *slash = strrchr(copy, '/');
+    if (slash) {
+        *slash = '\0';
+        mkdir_p(copy);
+    }
+    free(copy);
+
+    char *resolved = NULL;
+    const char *target = path;
+    struct stat info;
+    if (lstat(path, &info) == 0) {
+        /* Keep an existing symlink intact, as the old fopen-based writer did. */
+        if (S_ISLNK(info.st_mode)) {
+            resolved = realpath(path, NULL);
+            if (!resolved) die("could not resolve %s: %s", path, strerror(errno));
+            target = resolved;
+            if (stat(target, &info) != 0) die("could not inspect %s: %s", path, strerror(errno));
+        }
+        if (!S_ISREG(info.st_mode)) die("could not replace %s: expected a regular file", path);
+    } else if (errno != ENOENT) die("could not inspect %s: %s", path, strerror(errno));
+
+    TCBuffer temporary;
+    buffer_init(&temporary);
+    const char *target_slash = strrchr(target, '/');
+    if (target_slash) buffer_append_n(&temporary, target, (size_t)(target_slash - target) + 1);
+    buffer_append(&temporary, ".ttychatter-write.XXXXXX");
+    int fd = mkstemp(temporary.data);
+    if (fd < 0) die("could not prepare %s: %s", path, strerror(errno));
+    bool ok = fchmod(fd, mode) == 0;
+    FILE *f = ok ? fdopen(fd, "wb") : NULL;
+    int saved_errno = errno;
+    if (!f) {
+        close(fd);
+        ok = false;
+    } else {
+        size_t length = data ? strlen(data) : 0;
+        ok = !length || fwrite(data, 1, length, f) == length;
+        if (ok) ok = fflush(f) == 0;
+        if (ok) ok = fsync(fd) == 0;
+        if (!ok) saved_errno = errno;
+        if (fclose(f) != 0 && ok) { ok = false; saved_errno = errno; }
+    }
+    if (ok && rename(temporary.data, target) != 0) { ok = false; saved_errno = errno; }
+    if (!ok) {
+        unlink(temporary.data);
+        free(temporary.data); free(resolved);
+        die("could not finish writing %s: %s; previous file preserved", path, strerror(saved_errno));
+    }
+    free(temporary.data); free(resolved);
+}
+
+static bool append_file_text_checked(const char *path, const char *data) {
+    char *copy = xstrdup(path);
+    char *slash = strrchr(copy, '/');
+    if (slash) {
+        *slash = '\0';
+        mkdir_p(copy);
+    }
+    free(copy);
+    int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (fd < 0) { fprintf(stderr, "could not append %s: %s\n", path, strerror(errno)); return false; }
+    FILE *f = fdopen(fd, "ab");
+    if (!f) { close(fd); fprintf(stderr, "could not open session stream for %s\n", path); return false; }
+    size_t len = data ? strlen(data) : 0;
+    bool ok = !len || fwrite(data, 1, len, f) == len;
+    if (fclose(f) != 0) ok = false;
+    if (!ok) fprintf(stderr, "could not finish writing %s: %s\n", path, strerror(errno));
+    return ok;
+}
+
+static void append_file_text(const char *path, const char *data) {
+    if (!append_file_text_checked(path, data)) die("session data was not fully saved; check the destination and free disk space");
+}
+
+static char *now_string(void) {
+    time_t t = time(NULL);
+    struct tm tmv;
+    localtime_r(&t, &tmv);
+    char buf[64];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S %z", &tmv);
+    return xstrdup(buf);
+}
+
+static char *now_hms(void) {
+    time_t t = time(NULL);
+    struct tm tmv;
+    localtime_r(&t, &tmv);
+    char buf[32];
+    strftime(buf, sizeof(buf), "%H:%M:%S", &tmv);
+    return xstrdup(buf);
+}
+
+static char *basename_no_ext(const char *path) {
+    const char *base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    char *out = xstrdup(base);
+    char *dot = strrchr(out, '.');
+    if (dot && dot != out) *dot = '\0';
+    for (char *p = out; *p; p++) {
+        if (!isalnum((unsigned char)*p) && *p != '-' && *p != '_' && *p != '.') *p = '_';
+    }
+    return out;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Base64 helper for data URLs                                               */
+/* ------------------------------------------------------------------------- */
+
+static const char b64_table[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static char *base64_encode(const unsigned char *data, size_t len) {
+    size_t out_len = 4 * ((len + 2) / 3);
+    char *out = xcalloc(out_len + 1, 1);
+    size_t i = 0, j = 0;
+    while (i < len) {
+        unsigned octet_a = i < len ? data[i++] : 0;
+        unsigned octet_b = i < len ? data[i++] : 0;
+        unsigned octet_c = i < len ? data[i++] : 0;
+        unsigned triple = (octet_a << 16) | (octet_b << 8) | octet_c;
+        out[j++] = b64_table[(triple >> 18) & 0x3F];
+        out[j++] = b64_table[(triple >> 12) & 0x3F];
+        out[j++] = b64_table[(triple >> 6) & 0x3F];
+        out[j++] = b64_table[triple & 0x3F];
+    }
+    if (len % 3) {
+        out[out_len - 1] = '=';
+        if (len % 3 == 1) out[out_len - 2] = '=';
+    }
+    return out;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Shell quoting and external GPG                                            */
+/* ------------------------------------------------------------------------- */
+
+static char *shell_quote(const char *s) {
+    TCBuffer b;
+    buffer_init(&b);
+    buffer_append(&b, "'");
+    for (const char *p = s; *p; p++) {
+        if (*p == '\'') buffer_append(&b, "'\\''");
+        else buffer_append_n(&b, p, 1);
+    }
+    buffer_append(&b, "'");
+    return buffer_take(&b);
+}
+
+static bool command_exists(const char *cmd) {
+    const char *path = getenv("PATH");
+    if (!path) return false;
+    char *copy = xstrdup(path);
+    for (char *tok = strtok(copy, ":"); tok; tok = strtok(NULL, ":")) {
+        char *candidate = path_join2(tok, cmd);
+        bool ok = access(candidate, X_OK) == 0;
+        free(candidate);
+        if (ok) {
+            free(copy);
+            return true;
+        }
+    }
+    free(copy);
+    return false;
+}
+
+static char *read_command_output(const char *cmd) {
+    FILE *p = popen(cmd, "r");
+    if (!p) return NULL;
+    TCBuffer b;
+    buffer_init(&b);
+    char chunk[4096];
+    while (fgets(chunk, sizeof(chunk), p)) buffer_append(&b, chunk);
+    int rc = pclose(p);
+    if (rc != 0) {
+        free(b.data);
+        return NULL;
+    }
+    char *out = buffer_take(&b);
+    char *trimmed = trim_in_place(out);
+    if (trimmed != out) memmove(out, trimmed, strlen(trimmed) + 1);
+    return out;
+}
+
+
+static char *command_with_file_placeholder(const char *cmd, const char *path) {
+    char *qpath = path && *path ? shell_quote(path) : xstrdup("");
+    TCBuffer out;
+    buffer_init(&out);
+    const char *p = cmd ? cmd : "";
+    bool replaced = false;
+    while (*p) {
+        if (p[0] == '%' && p[1] == 'f') {
+            buffer_append(&out, qpath);
+            p += 2;
+            replaced = true;
+        } else {
+            buffer_append_n(&out, p, 1);
+            p++;
+        }
+    }
+    if (!replaced && path && *path) {
+        if (out.len > 0) buffer_append(&out, " ");
+        buffer_append(&out, qpath);
+    }
+    free(qpath);
+    return buffer_take(&out);
+}
+
+static char *run_voice_input_command(const TCConfig *cfg, const char *path) {
+    if (!cfg->voice_input_cmd || !*cfg->voice_input_cmd) {
+        fprintf(stderr, "VOICE_INPUT_CMD is not configured\n");
+        return NULL;
+    }
+    char *cmd = command_with_file_placeholder(cfg->voice_input_cmd, path);
+    char *out = read_command_output(cmd);
+    free(cmd);
+    if (!out || !trim_in_place(out)[0]) {
+        free(out);
+        fprintf(stderr, "voice input command produced no text\n");
+        return NULL;
+    }
+    return out;
+}
+
+static int run_voice_output_command(const TCConfig *cfg, const char *text) {
+    if (!cfg->voice_output_cmd || !*cfg->voice_output_cmd) {
+        fprintf(stderr, "VOICE_OUTPUT_CMD/TTS_CMD is not configured\n");
+        return 1;
+    }
+    if (strstr(cfg->voice_output_cmd, "%f")) {
+        char tmpl[PATH_MAX];
+        snprintf(tmpl, sizeof(tmpl), "/tmp/ttychatter-tts-text.XXXXXX");
+        int fd = mkstemp(tmpl);
+        if (fd < 0) return 1;
+        FILE *tf = fdopen(fd, "wb");
+        if (!tf) { close(fd); unlink(tmpl); return 1; }
+        if (text) fwrite(text, 1, strlen(text), tf);
+        fclose(tf);
+        char *cmd = command_with_file_placeholder(cfg->voice_output_cmd, tmpl);
+        int rc = system(cmd);
+        free(cmd);
+        unlink(tmpl);
+        return rc == 0 ? 0 : 1;
+    }
+    FILE *p = popen(cfg->voice_output_cmd, "w");
+    if (!p) return 1;
+    if (text) fwrite(text, 1, strlen(text), p);
+    int rc = pclose(p);
+    return rc == 0 ? 0 : 1;
+}
+
+static char *gpg_decrypt_file(const char *path) {
+    if (!path || !file_exists(path) || !command_exists("gpg")) return NULL;
+    char *q = shell_quote(path);
+    TCBuffer cmd;
+    buffer_init(&cmd);
+    buffer_appendf(&cmd, "gpg --quiet --decrypt %s 2>/dev/null", q);
+    free(q);
+    char *cmds = buffer_take(&cmd);
+    char *out = read_command_output(cmds);
+    free(cmds);
+    return out;
+}
+
+static bool gpg_encrypt_text_to_file(const char *text, const char *path) {
+    if (!command_exists("gpg")) return false;
+    char tmpl[PATH_MAX];
+    snprintf(tmpl, sizeof(tmpl), "/tmp/ttychatter-key.XXXXXX");
+    int fd = mkstemp(tmpl);
+    if (fd < 0) return false;
+    FILE *f = fdopen(fd, "wb");
+    if (!f) {
+        close(fd);
+        unlink(tmpl);
+        return false;
+    }
+    fwrite(text, 1, strlen(text), f);
+    fclose(f);
+    chmod(tmpl, 0600);
+
+    char *qin = shell_quote(tmpl);
+    char *qout = shell_quote(path);
+    TCBuffer cmd;
+    buffer_init(&cmd);
+    buffer_appendf(&cmd, "gpg --symmetric --cipher-algo AES256 --output %s %s", qout, qin);
+    char *cmds = buffer_take(&cmd);
+    int rc = system(cmds);
+    free(cmds);
+    free(qin);
+    free(qout);
+    unlink(tmpl);
+    if (rc == 0) {
+        chmod(path, 0600);
+        return true;
+    }
+    return false;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Config file handling                                                      */
+/* ------------------------------------------------------------------------- */
+
+static char *xdg_config_provider_file(const char *leaf) {
+    const char *xdg = getenv("XDG_CONFIG_HOME");
+    if (xdg && *xdg) {
+        char *dir = path_join2(xdg, "ttychatter/openrouter");
+        char *file = path_join2(dir, leaf);
+        free(dir);
+        return file;
+    }
+    char tmp[PATH_MAX];
+    snprintf(tmp, sizeof(tmp), ".config/ttychatter/openrouter/%s", leaf);
+    return home_path(tmp);
+}
+
+static char *xdg_config_file(void) {
+    return xdg_config_provider_file("config");
+}
+
+static char *legacy_xdg_config_file(void) {
+    const char *xdg = getenv("XDG_CONFIG_HOME");
+    if (xdg && *xdg) {
+        char *dir = path_join2(xdg, "ttychatter");
+        char *file = path_join2(dir, "config");
+        free(dir);
+        return file;
+    }
+    return home_path(".config/ttychatter/config");
+}
+
+static char *xdg_api_key_gpg_file(void) {
+    return xdg_config_provider_file("api-key.gpg");
+}
+
+static char *legacy_xdg_api_key_gpg_file(void) {
+    const char *xdg = getenv("XDG_CONFIG_HOME");
+    if (xdg && *xdg) {
+        char *dir = path_join2(xdg, "ttychatter");
+        char *file = path_join2(dir, "api-key.gpg");
+        free(dir);
+        return file;
+    }
+    return home_path(".config/ttychatter/api-key.gpg");
+}
+
+static char *xdg_cache_file(void) {
+    const char *xdg = getenv("XDG_CACHE_HOME");
+    if (xdg && *xdg) {
+        char *dir = path_join2(xdg, "ttychatter/openrouter");
+        char *file = path_join2(dir, "models.json");
+        free(dir);
+        return file;
+    }
+    return home_path(".cache/ttychatter/openrouter/models.json");
+}
+
+static char *xdg_data_dir(const char *leaf) {
+    const char *xdg = getenv("XDG_DATA_HOME");
+    if (xdg && *xdg) {
+        char *dir = path_join2(xdg, "ttychatter/openrouter");
+        char *out = path_join2(dir, leaf);
+        free(dir);
+        return out;
+    }
+    char tmp[PATH_MAX];
+    snprintf(tmp, sizeof(tmp), ".local/share/ttychatter/openrouter/%s", leaf);
+    return home_path(tmp);
+}
+
+static void config_init_defaults(TCConfig *cfg) {
+    memset(cfg, 0, sizeof(*cfg));
+    cfg->config_file = xdg_config_file();
+    cfg->api_key_gpg_file = xdg_api_key_gpg_file();
+    cfg->model = xstrdup("openrouter/auto");
+    cfg->session_title_model = xstrdup("openrouter/auto");
+    cfg->web_search_engine = xstrdup("auto");
+    cfg->web_search_max_results = 5;
+    cfg->web_search_max_uses = 3;
+    cfg->model_cache_file = xdg_cache_file();
+    cfg->model_favorites_file = xdg_config_provider_file("model-favorites");
+    cfg->session_dir = xdg_data_dir("sessions");
+    cfg->attachment_dir = xdg_data_dir("attachments");
+    cfg->ai_file_download_mode = xstrdup("ask");
+    cfg->context_turns = 12;
+    cfg->session_title_max_words = 8;
+    cfg->code_attachment_min_lines = 5;
+    cfg->max_attachment_bytes = 1024 * 1024;
+    cfg->theme = xstrdup("default");
+    cfg->send_input = xstrdup("file");
+    cfg->editor_cmd = xstrdup("");
+    cfg->voice_input_cmd = xstrdup("");
+    cfg->voice_output_cmd = xstrdup("");
+    cfg->model_test_prompt = xstrdup("Please reply with a short sentence confirming this model is available for text generation.");
+    cfg->model_sort_order = xstrdup("name");
+    cfg->model_type_filter = xstrdup("all");
+    cfg->model_filter_generate_content = true;
+    cfg->model_filter_require_tokens = false;
+    cfg->model_filter_hide_preview = false;
+    cfg->model_min_input_tokens = 0;
+    cfg->model_min_output_tokens = 0;
+    cfg->confirm_live_send = false;
+    cfg->startup_notice = true;
+    cfg->session_auto_title = false;
+    cfg->prompt_session_name = true;
+    cfg->web_search = false;
+    cfg->stream = false;
+    cfg->status_updates = false;
+    cfg->voice_output = false;
+    cfg->demo_mode_default = false;
+    cfg->loopback_default = false;
+}
+
+static bool valid_web_engine(const char *value) {
+    const char *engines[] = {"auto", "native", "exa", "parallel", "perplexity", "firecrawl", NULL};
+    for (size_t i = 0; value && engines[i]; i++) {
+        if (strcmp(value, engines[i]) == 0) return true;
+    }
+    return false;
+}
+
+static long bounded_number(const char *value, long minimum, long maximum) {
+    char *end = NULL;
+    errno = 0;
+    long result = value ? strtol(value, &end, 10) : 0;
+    if (errno || !value || !*value || !end || *end || result < minimum || result > maximum) return LONG_MIN;
+    return result;
+}
+
+static long parse_bounded_number(const char *value, long minimum, long maximum, const char *label) {
+    long result = bounded_number(value, minimum, maximum);
+    if (result == LONG_MIN) die("%s must be an integer from %ld to %ld", label, minimum, maximum);
+    return result;
+}
+
+static bool valid_web_config(const char *key, const char *value) {
+    if (strcmp(key, "WEB_SEARCH_ENGINE") == 0 && !valid_web_engine(value)) {
+        fprintf(stderr, "WEB_SEARCH_ENGINE must be auto, native, exa, parallel, perplexity, or firecrawl\n"); return false;
+    }
+    if (strcmp(key, "WEB_SEARCH_MAX_RESULTS") == 0 && bounded_number(value, 0, 25) == LONG_MIN) {
+        fprintf(stderr, "WEB_SEARCH_MAX_RESULTS must be an integer from 0 to 25\n"); return false;
+    }
+    if (strcmp(key, "WEB_SEARCH_MAX_USES") == 0 && bounded_number(value, 0, 25) == LONG_MIN) {
+        fprintf(stderr, "WEB_SEARCH_MAX_USES must be an integer from 0 to 25\n"); return false;
+    }
+    return true;
+}
+
+static void config_set(TCConfig *cfg, const char *key, const char *value) {
+    if (!valid_web_config(key, value)) return;
+    if (strcmp(key, "OPENROUTER_API_KEY") == 0 || strcmp(key, "TTYCHATTER_API_KEY") == 0 || strcmp(key, "API_KEY") == 0) {
+        free(cfg->api_key);
+        cfg->api_key = xstrdup(value);
+    } else if (strcmp(key, "API_KEY_GPG_FILE") == 0 || strcmp(key, "OPENROUTER_API_KEY_GPG_FILE") == 0) {
+        free(cfg->api_key_gpg_file);
+        cfg->api_key_gpg_file = expand_tilde(value);
+    } else if (strcmp(key, "MODEL") == 0) {
+        free(cfg->model);
+        cfg->model = xstrdup(value);
+    } else if (strcmp(key, "SESSION_TITLE_MODEL") == 0) {
+        free(cfg->session_title_model);
+        cfg->session_title_model = xstrdup(value);
+    } else if (strcmp(key, "MODEL_CACHE_FILE") == 0) {
+        free(cfg->model_cache_file);
+        cfg->model_cache_file = expand_tilde(value);
+    } else if (strcmp(key, "MODEL_FAVORITES_FILE") == 0) {
+        free(cfg->model_favorites_file);
+        cfg->model_favorites_file = expand_tilde(value);
+    } else if (strcmp(key, "SESSION_DIR") == 0) {
+        free(cfg->session_dir);
+        cfg->session_dir = expand_tilde(value);
+    } else if (strcmp(key, "ATTACHMENT_DIR") == 0) {
+        free(cfg->attachment_dir);
+        cfg->attachment_dir = expand_tilde(value);
+    } else if (strcmp(key, "AI_FILE_DOWNLOAD_MODE") == 0 || strcmp(key, "AI_DOWNLOAD") == 0) {
+        free(cfg->ai_file_download_mode);
+        cfg->ai_file_download_mode = xstrdup(value);
+    } else if (strcmp(key, "CONTEXT_TURNS") == 0 || strcmp(key, "HISTORY_LIMIT") == 0) {
+        cfg->context_turns = atol(value) > 0 ? atol(value) : cfg->context_turns;
+    } else if (strcmp(key, "SESSION_TITLE_MAX_WORDS") == 0) {
+        cfg->session_title_max_words = atol(value) > 0 ? atol(value) : cfg->session_title_max_words;
+    } else if (strcmp(key, "CODE_ATTACHMENT_MIN_LINES") == 0) {
+        cfg->code_attachment_min_lines = atol(value) > 0 ? atol(value) : cfg->code_attachment_min_lines;
+    } else if (strcmp(key, "MAX_ATTACHMENT_BYTES") == 0) {
+        cfg->max_attachment_bytes = atol(value) > 0 ? atol(value) : cfg->max_attachment_bytes;
+    } else if (strcmp(key, "THEME") == 0) {
+        free(cfg->theme);
+        cfg->theme = xstrdup(value);
+    } else if (strcmp(key, "SEND_INPUT") == 0) {
+        free(cfg->send_input);
+        cfg->send_input = xstrdup(value);
+    } else if (strcmp(key, "EDITOR") == 0) {
+        free(cfg->editor_cmd);
+        cfg->editor_cmd = xstrdup(value);
+    } else if (strcmp(key, "VOICE_INPUT_CMD") == 0 || strcmp(key, "TRANSCRIBE_CMD") == 0) {
+        free(cfg->voice_input_cmd);
+        cfg->voice_input_cmd = xstrdup(value);
+    } else if (strcmp(key, "VOICE_OUTPUT_CMD") == 0 || strcmp(key, "TTS_CMD") == 0) {
+        free(cfg->voice_output_cmd);
+        cfg->voice_output_cmd = xstrdup(value);
+    } else if (strcmp(key, "MODEL_TEST_PROMPT") == 0) {
+        free(cfg->model_test_prompt);
+        cfg->model_test_prompt = xstrdup(value);
+    } else if (strcmp(key, "MODEL_SORT_ORDER") == 0) {
+        free(cfg->model_sort_order);
+        cfg->model_sort_order = xstrdup(value);
+    } else if (strcmp(key, "MODEL_TYPE_FILTER") == 0) {
+        free(cfg->model_type_filter);
+        cfg->model_type_filter = xstrdup(value);
+    } else if (strcmp(key, "MODEL_FILTER_GENERATE_CONTENT") == 0 || strcmp(key, "MODEL_FILTER_CHAT_COMPLETIONS") == 0) {
+        cfg->model_filter_generate_content = parse_bool_string(value, cfg->model_filter_generate_content);
+    } else if (strcmp(key, "MODEL_FILTER_REQUIRE_TOKENS") == 0) {
+        cfg->model_filter_require_tokens = parse_bool_string(value, cfg->model_filter_require_tokens);
+    } else if (strcmp(key, "MODEL_FILTER_HIDE_PREVIEW") == 0) {
+        cfg->model_filter_hide_preview = parse_bool_string(value, cfg->model_filter_hide_preview);
+    } else if (strcmp(key, "MODEL_MIN_INPUT_TOKENS") == 0) {
+        cfg->model_min_input_tokens = atol(value) >= 0 ? atol(value) : cfg->model_min_input_tokens;
+    } else if (strcmp(key, "MODEL_MIN_OUTPUT_TOKENS") == 0) {
+        cfg->model_min_output_tokens = atol(value) >= 0 ? atol(value) : cfg->model_min_output_tokens;
+    } else if (strcmp(key, "CONFIRM_LIVE_SEND") == 0) {
+        cfg->confirm_live_send = parse_bool_string(value, cfg->confirm_live_send);
+    } else if (strcmp(key, "STARTUP_NOTICE") == 0) {
+        cfg->startup_notice = parse_bool_string(value, cfg->startup_notice);
+    } else if (strcmp(key, "SESSION_AUTO_TITLE") == 0) {
+        cfg->session_auto_title = parse_bool_string(value, cfg->session_auto_title);
+    } else if (strcmp(key, "PROMPT_SESSION_NAME") == 0) {
+        cfg->prompt_session_name = parse_bool_string(value, cfg->prompt_session_name);
+    } else if (strcmp(key, "WEB_SEARCH") == 0) {
+        cfg->web_search = parse_bool_string(value, cfg->web_search);
+    } else if (strcmp(key, "WEB_SEARCH_ENGINE") == 0) {
+        free(cfg->web_search_engine);
+        cfg->web_search_engine = xstrdup(value);
+    } else if (strcmp(key, "WEB_SEARCH_MAX_RESULTS") == 0) {
+        cfg->web_search_max_results = parse_bounded_number(value, 0, 25, key);
+    } else if (strcmp(key, "WEB_SEARCH_MAX_USES") == 0) {
+        cfg->web_search_max_uses = parse_bounded_number(value, 0, 25, key);
+    } else if (strcmp(key, "STREAM") == 0) {
+        cfg->stream = parse_bool_string(value, cfg->stream);
+    } else if (strcmp(key, "STATUS_UPDATES") == 0 || strcmp(key, "PROGRESS_UPDATES") == 0) {
+        cfg->status_updates = parse_bool_string(value, cfg->status_updates);
+    } else if (strcmp(key, "VOICE_OUTPUT") == 0 || strcmp(key, "TTS") == 0) {
+        cfg->voice_output = parse_bool_string(value, cfg->voice_output);
+    } else if (strcmp(key, "DEMO_MODE") == 0) {
+        cfg->demo_mode_default = parse_bool_string(value, cfg->demo_mode_default);
+    } else if (strcmp(key, "LOOPBACK") == 0) {
+        cfg->loopback_default = parse_bool_string(value, cfg->loopback_default);
+    }
+}
+
+static bool config_load_file(TCConfig *cfg, const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return false;
+    char *line = NULL;
+    size_t capacity = 0;
+    while (getline(&line, &capacity, f) >= 0) {
+        char *s = trim_in_place(line);
+        if (!*s || *s == '#') continue;
+        if (starts_with(s, "export ")) s = trim_in_place(s + 7);
+        char *eq = strchr(s, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        char *key = trim_in_place(s);
+        char *value = trim_in_place(eq + 1);
+        config_set(cfg, key, value);
+    }
+    if (ferror(f)) die("could not read config %s", path);
+    free(line);
+    fclose(f);
+    return true;
+}
+
+static void config_load(TCConfig *cfg) {
+    bool loaded = config_load_file(cfg, cfg->config_file);
+
+    /*
+     * 0.6.1 moves the C client into the shared OpenRouter namespace used by
+     * the ncurses, Bash, and Bash+Python clients.  Existing C-only users may
+     * still have ~/.config/ttychatter/config, so read that file only as a
+     * compatibility fallback when the new provider-specific config is absent.
+     * Writes continue to go to cfg->config_file, which is the OpenRouter path.
+     */
+    char *legacy_config = legacy_xdg_config_file();
+    if (!loaded && file_exists(legacy_config)) config_load_file(cfg, legacy_config);
+    free(legacy_config);
+
+    {
+        const char *k = getenv("OPENROUTER_API_KEY");
+        if (!k || !*k) k = getenv("TTYCHATTER_API_KEY");
+        if (k && *k) {
+            free(cfg->api_key);
+            cfg->api_key = xstrdup(k);
+        }
+    }
+
+    if (!cfg->api_key && cfg->api_key_gpg_file && file_exists(cfg->api_key_gpg_file)) {
+        cfg->api_key = gpg_decrypt_file(cfg->api_key_gpg_file);
+    }
+    if (!cfg->api_key) {
+        char *legacy_gpg = legacy_xdg_api_key_gpg_file();
+        if (legacy_gpg && (!cfg->api_key_gpg_file || strcmp(legacy_gpg, cfg->api_key_gpg_file) != 0) && file_exists(legacy_gpg)) {
+            cfg->api_key = gpg_decrypt_file(legacy_gpg);
+        }
+        free(legacy_gpg);
+    }
+}
+
+static void config_write_key_value(const TCConfig *cfg, const char *key, const char *value) {
+    char *dircopy = xstrdup(cfg->config_file);
+    char *slash = strrchr(dircopy, '/');
+    if (slash) {
+        *slash = '\0';
+        mkdir_p(dircopy);
+    }
+    free(dircopy);
+
+    TCBuffer out;
+    buffer_init(&out);
+    bool replaced = false;
+    FILE *f = fopen(cfg->config_file, "r");
+    if (f) {
+        char *line = NULL;
+        size_t capacity = 0;
+        while (getline(&line, &capacity, f) >= 0) {
+            char *copy = xstrdup(line);
+            char *s = trim_in_place(copy);
+            if (starts_with(s, key) && s[strlen(key)] == '=') {
+                buffer_appendf(&out, "%s=%s\n", key, value);
+                replaced = true;
+            } else {
+                buffer_append(&out, line);
+            }
+            free(copy);
+        }
+        if (ferror(f)) die("could not read %s; config unchanged", cfg->config_file);
+        free(line);
+        fclose(f);
+    } else if (errno != ENOENT) die("could not read %s: %s; config unchanged", cfg->config_file, strerror(errno));
+    if (!replaced) {
+        if (out.len && out.data[out.len - 1] != '\n') buffer_append(&out, "\n");
+        buffer_appendf(&out, "%s=%s\n", key, value);
+    }
+    write_file_mode(cfg->config_file, out.data, 0600);
+    free(out.data);
+}
+
+static void config_remove_key(const TCConfig *cfg, const char *key) {
+    if (!file_exists(cfg->config_file)) return;
+    TCBuffer out;
+    buffer_init(&out);
+    FILE *f = fopen(cfg->config_file, "r");
+    if (!f) return;
+    char *line = NULL;
+    size_t capacity = 0;
+    while (getline(&line, &capacity, f) >= 0) {
+        char *copy = xstrdup(line);
+        char *s = trim_in_place(copy);
+        if (!(starts_with(s, key) && s[strlen(key)] == '=')) buffer_append(&out, line);
+        free(copy);
+    }
+    if (ferror(f)) die("could not read %s; config unchanged", cfg->config_file);
+    free(line);
+    fclose(f);
+    write_file_mode(cfg->config_file, out.data, 0600);
+    free(out.data);
+}
+
+
+static bool effective_stream(const TCConfig *cfg, const TCArgs *args) {
+    if (args && args->stream_set) return args->stream;
+    return cfg && cfg->stream;
+}
+
+static bool effective_web_search(const TCConfig *cfg, const TCArgs *args) {
+    if (args && args->web_set) return args->web_search;
+    return cfg && cfg->web_search;
+}
+
+static const char *effective_ai_file_download_mode(const TCConfig *cfg, const TCArgs *args) {
+    if (args && args->ai_file_download_mode && *args->ai_file_download_mode) return args->ai_file_download_mode;
+    if (cfg && cfg->ai_file_download_mode && *cfg->ai_file_download_mode) return cfg->ai_file_download_mode;
+    return "ask";
+}
+
+static bool effective_status_updates(const TCConfig *cfg, const TCArgs *args) {
+    if (args && args->status_set) return args->status_updates;
+    return cfg && cfg->status_updates;
+}
+
+static bool effective_speak(const TCConfig *cfg, const TCArgs *args) {
+    if (args && args->speak_set) return args->speak;
+    return cfg && cfg->voice_output;
+}
+
+static void status_update(const TCConfig *cfg, const TCArgs *args, const char *fmt, ...) {
+    if (!effective_status_updates(cfg, args)) return;
+    fprintf(stderr, "[ttychatter] ");
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    fputc('\n', stderr);
+}
+
+/* ------------------------------------------------------------------------- */
+/* HTTP via libcurl                                                          */
+/* ------------------------------------------------------------------------- */
+
+static size_t curl_write_cb(void *ptr, size_t size, size_t nmemb, void *userdata) {
+    TCBuffer *b = userdata;
+    buffer_append_n(b, ptr, size * nmemb);
+    return size * nmemb;
+}
+
+static TCHttpResponse http_request(const char *url, const char *method, const char *api_key, const char *body) {
+    TCHttpResponse r = {0};
+    CURL *curl = curl_easy_init();
+    if (!curl) die("curl_easy_init failed");
+    TCBuffer b;
+    buffer_init(&b);
+    struct curl_slist *headers = NULL;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    headers = curl_slist_append(headers, "X-Title: ttychatter");
+    if (api_key && *api_key) {
+        TCBuffer auth;
+        buffer_init(&auth);
+        buffer_appendf(&auth, "Authorization: Bearer %s", api_key);
+        headers = curl_slist_append(headers, auth.data);
+        free(auth.data);
+    }
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &b);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "ttychatter/" TC_VERSION);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 20L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 120L);
+    if (strcmp(method, "POST") == 0) {
+        curl_easy_setopt(curl, CURLOPT_POST, 1L);
+        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body ? body : "{}");
+    }
+    CURLcode rc = curl_easy_perform(curl);
+    if (rc != CURLE_OK) {
+        free(b.data);
+        r.status = 0;
+        r.body = xstrdup(curl_easy_strerror(rc));
+    } else {
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &r.status);
+        r.body = buffer_take(&b);
+    }
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    return r;
+}
+
+
+
+static const char *json_string_member(json_object *obj, const char *key) {
+    json_object *v = NULL;
+    if (!obj || !json_object_is_type(obj, json_type_object)) return NULL;
+    if (!json_object_object_get_ex(obj, key, &v) || !v || json_object_is_type(v, json_type_null)) return NULL;
+    if (json_object_is_type(v, json_type_string)) return json_object_get_string(v);
+    return NULL;
+}
+
+
+/* Keep provider annotations and accounting outside conversational context.
+ * In SSE these fields may arrive after finish_reason, before [DONE]. */
+static void response_metadata_collect(json_object *metadata, json_object *obj) {
+    if (!metadata || !obj || !json_object_is_type(obj, json_type_object)) return;
+    const char *scalar_keys[] = {"id", "model", "provider", "usage", "system_fingerprint", NULL};
+    for (size_t i = 0; scalar_keys[i]; i++) {
+        json_object *value = NULL;
+        if (json_object_object_get_ex(obj, scalar_keys[i], &value) && value &&
+            !json_object_is_type(value, json_type_null))
+            json_object_object_add(metadata, scalar_keys[i], json_object_get(value));
+    }
+    const char *array_keys[] = {"annotations", "reasoning_details", NULL};
+    for (size_t i = 0; array_keys[i]; i++) {
+        json_object *values = NULL, *saved = NULL;
+        if (!json_object_object_get_ex(obj, array_keys[i], &values) ||
+            !json_object_is_type(values, json_type_array)) continue;
+        if (!json_object_object_get_ex(metadata, array_keys[i], &saved)) {
+            saved = json_object_new_array();
+            json_object_object_add(metadata, array_keys[i], saved);
+        }
+        for (size_t j = 0; j < json_object_array_length(values); j++) {
+            json_object *entry = json_object_array_get_idx(values, j);
+            bool seen = false;
+            for (size_t k = 0; k < json_object_array_length(saved); k++) {
+                if (json_object_equal(entry, json_object_array_get_idx(saved, k))) { seen = true; break; }
+            }
+            if (!seen) json_object_array_add(saved, json_object_get(entry));
+        }
+    }
+}
+
+static void append_safe_inline(TCBuffer *out, const char *text) {
+    for (const unsigned char *p = (const unsigned char *)(text ? text : ""); *p; p++) {
+        if (*p == '\n' || *p == '\r' || *p == '\t') buffer_append(out, " ");
+        else if (*p >= 32 && *p != 127) buffer_append_n(out, (const char *)p, 1);
+    }
+}
+
+static char *response_source_notes(json_object *metadata) {
+    TCBuffer out;
+    buffer_init(&out);
+    json_object *annotations = NULL;
+    if (!metadata || !json_object_object_get_ex(metadata, "annotations", &annotations) ||
+        !json_object_is_type(annotations, json_type_array)) return buffer_take(&out);
+    json_object *seen = json_object_new_object();
+    size_t count = 0;
+    for (size_t i = 0; i < json_object_array_length(annotations); i++) {
+        json_object *annotation = json_object_array_get_idx(annotations, i), *citation = NULL;
+        const char *type = json_string_member(annotation, "type");
+        if (!type || strcmp(type, "url_citation") != 0) continue;
+        if (!json_object_object_get_ex(annotation, "url_citation", &citation)) citation = annotation;
+        const char *url = json_string_member(citation, "url");
+        const char *title = json_string_member(citation, "title");
+        json_object *duplicate = NULL;
+        if (!url || !*url || json_object_object_get_ex(seen, url, &duplicate)) continue;
+        json_object_object_add(seen, url, json_object_new_boolean(true));
+        if (count == 0) buffer_append(&out, "\n\nSources:\n");
+        buffer_appendf(&out, "[%zu] ", ++count);
+        if (title && *title) { append_safe_inline(&out, title); buffer_append(&out, "\n    "); }
+        append_safe_inline(&out, url);
+        buffer_append(&out, "\n");
+    }
+    json_object_put(seen);
+    return buffer_take(&out);
+}
+
+static char *provider_error_message(json_object *obj) {
+    json_object *error = NULL;
+    if (!obj || !json_object_object_get_ex(obj, "error", &error) || !error ||
+        json_object_is_type(error, json_type_null)) return NULL;
+    const char *message = json_string_member(error, "message");
+    if (!message && json_object_is_type(error, json_type_string)) message = json_object_get_string(error);
+    return xstrdup(message && *message ? message : "provider reported an error");
+}
+
+typedef struct TCStreamState {
+    TCBuffer raw;
+    TCBuffer pending;
+    TCBuffer text;
+    json_object *metadata;
+    char *error;
+    bool display;
+    bool done;
+    bool saw_event;
+    bool cancelled;
+    bool cancel_enabled;
+    bool termios_active;
+    bool previous_cr;
+    size_t pending_scan;
+    struct termios old_termios;
+} TCStreamState;
+
+/* Only one synchronous C request can own the terminal. Keep a scoped guard
+ * while ESC cancellation disables canonical input and echo. Signal handlers
+ * restore the terminal, then perform the original default signal action. */
+static const int stream_signals[] = {SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGTSTP};
+#define TC_STREAM_SIGNAL_COUNT (sizeof(stream_signals) / sizeof(stream_signals[0]))
+static struct {
+    volatile sig_atomic_t active;
+    struct termios original;
+    struct termios streaming;
+    struct sigaction previous[TC_STREAM_SIGNAL_COUNT];
+    bool installed[TC_STREAM_SIGNAL_COUNT];
+    struct sigaction handler;
+    sigset_t mask;
+} stream_signal_guard;
+
+static void stream_restore_terminal(const struct termios *settings) {
+    /* Restoring a background job must not turn a requested termination into
+     * a SIGTTOU stop. Only the restore operation suppresses that job-control
+     * signal; entering streaming mode keeps the normal foreground rules. */
+    sigset_t tty_signal, previous_mask;
+    sigemptyset(&tty_signal);
+    sigaddset(&tty_signal, SIGTTOU);
+    bool blocked = sigprocmask(SIG_BLOCK, &tty_signal, &previous_mask) == 0;
+    while (tcsetattr(STDIN_FILENO, TCSANOW, settings) != 0 && errno == EINTR) {}
+    if (blocked) sigprocmask(SIG_SETMASK, &previous_mask, NULL);
+}
+
+static void stream_signal_handler(int signum) {
+    int saved_errno = errno;
+    if (stream_signal_guard.active)
+        stream_restore_terminal(&stream_signal_guard.original);
+    for (size_t i = 0; i < TC_STREAM_SIGNAL_COUNT; i++) {
+        if (stream_signals[i] != signum) continue;
+        if (sigaction(signum, &stream_signal_guard.previous[i], NULL) != 0)
+            _exit(128 + signum);
+        if (raise(signum) != 0) _exit(128 + signum);
+        if (signum == SIGTSTP) {
+            /* Deliver the queued default stop now. Execution resumes here on
+             * SIGCONT, after the shell has had a usable terminal while stopped. */
+            sigset_t stop, before;
+            sigemptyset(&stop);
+            sigaddset(&stop, SIGTSTP);
+            if (sigprocmask(SIG_UNBLOCK, &stop, &before) != 0) _exit(128 + signum);
+            sigprocmask(SIG_SETMASK, &before, NULL);
+            sigaction(SIGTSTP, &stream_signal_guard.handler, NULL);
+            if (stream_signal_guard.active)
+                tcsetattr(STDIN_FILENO, TCSANOW, &stream_signal_guard.streaming);
+        }
+        break;
+    }
+    errno = saved_errno;
+}
+
+static void stream_cancel_end(TCStreamState *st);
+
+static void streamstate_init(TCStreamState *st, bool display) {
+    memset(st, 0, sizeof(*st));
+    buffer_init(&st->raw);
+    buffer_init(&st->pending);
+    buffer_init(&st->text);
+    st->metadata = json_object_new_object();
+    st->display = display;
+}
+
+static void streamstate_free(TCStreamState *st) {
+    stream_cancel_end(st);
+    free(st->raw.data);
+    free(st->pending.data);
+    free(st->text.data);
+    free(st->error);
+    if (st->metadata) json_object_put(st->metadata);
+    memset(st, 0, sizeof(*st));
+}
+
+static void stream_cancel_begin(TCStreamState *st) {
+    if (!st || !st->display || !isatty(STDIN_FILENO)) return;
+    struct termios raw;
+    if (tcgetattr(STDIN_FILENO, &st->old_termios) != 0) return;
+    raw = st->old_termios;
+    raw.c_lflag &= ~(ICANON | ECHO);
+    raw.c_cc[VMIN] = 0;
+    raw.c_cc[VTIME] = 0;
+
+    memset(&stream_signal_guard, 0, sizeof(stream_signal_guard));
+    sigemptyset(&stream_signal_guard.mask);
+    for (size_t i = 0; i < TC_STREAM_SIGNAL_COUNT; i++)
+        sigaddset(&stream_signal_guard.mask, stream_signals[i]);
+    sigset_t previous_mask;
+    if (sigprocmask(SIG_BLOCK, &stream_signal_guard.mask, &previous_mask) != 0) return;
+    stream_signal_guard.original = st->old_termios;
+    stream_signal_guard.streaming = raw;
+    stream_signal_guard.handler.sa_handler = stream_signal_handler;
+    stream_signal_guard.handler.sa_mask = stream_signal_guard.mask;
+    stream_signal_guard.handler.sa_flags = SA_RESTART;
+    bool ready = true;
+    for (size_t i = 0; i < TC_STREAM_SIGNAL_COUNT; i++) {
+        if (sigaction(stream_signals[i], NULL, &stream_signal_guard.previous[i]) != 0) { ready = false; break; }
+        /* Respect inherited ignored/custom dispositions instead of rebinding
+         * them. Normal command-line execution uses the default dispositions. */
+        if (stream_signal_guard.previous[i].sa_handler != SIG_DFL) continue;
+        if (sigaction(stream_signals[i], &stream_signal_guard.handler, NULL) != 0) { ready = false; break; }
+        stream_signal_guard.installed[i] = true;
+    }
+    if (ready && tcsetattr(STDIN_FILENO, TCSANOW, &raw) == 0) {
+        st->termios_active = true;
+        st->cancel_enabled = true;
+        stream_signal_guard.active = 1;
+    } else {
+        for (size_t i = 0; i < TC_STREAM_SIGNAL_COUNT; i++)
+            if (stream_signal_guard.installed[i])
+                sigaction(stream_signals[i], &stream_signal_guard.previous[i], NULL);
+    }
+    sigprocmask(SIG_SETMASK, &previous_mask, NULL);
+}
+
+static void stream_cancel_end(TCStreamState *st) {
+    if (!st || !st->termios_active) return;
+    sigset_t previous_mask;
+    bool blocked = sigprocmask(SIG_BLOCK, &stream_signal_guard.mask, &previous_mask) == 0;
+    stream_restore_terminal(&st->old_termios);
+    st->termios_active = false;
+    st->cancel_enabled = false;
+    stream_signal_guard.active = 0;
+    for (size_t i = 0; i < TC_STREAM_SIGNAL_COUNT; i++)
+        if (stream_signal_guard.installed[i])
+            sigaction(stream_signals[i], &stream_signal_guard.previous[i], NULL);
+    if (blocked) sigprocmask(SIG_SETMASK, &previous_mask, NULL);
+}
+
+static bool stream_cancel_poll(TCStreamState *st) {
+    if (!st || !st->cancel_enabled || st->cancelled) return st && st->cancelled;
+    fd_set rfds;
+    struct timeval tv;
+    unsigned char ch;
+    for (;;) {
+        FD_ZERO(&rfds);
+        FD_SET(STDIN_FILENO, &rfds);
+        tv.tv_sec = 0;
+        tv.tv_usec = 0;
+        int ready = select(STDIN_FILENO + 1, &rfds, NULL, NULL, &tv);
+        if (ready <= 0) break;
+        ssize_t n = read(STDIN_FILENO, &ch, 1);
+        if (n <= 0) break;
+        if (ch == 27) {
+            st->cancelled = true;
+            break;
+        }
+    }
+    return st->cancelled;
+}
+
+static void sse_append_delta(TCStreamState *st, const char *delta) {
+    if (!delta || !*delta) return;
+    buffer_append(&st->text, delta);
+    if (st->display) {
+        fputs(delta, stdout);
+        fflush(stdout);
+    }
+}
+
+static void sse_append_content(TCStreamState *st, json_object *content) {
+    if (!content) return;
+    if (json_object_is_type(content, json_type_string)) {
+        sse_append_delta(st, json_object_get_string(content));
+    } else if (json_object_is_type(content, json_type_array)) {
+        for (size_t i = 0; i < json_object_array_length(content); i++) {
+            json_object *part = json_object_array_get_idx(content, i);
+            const char *type = json_string_member(part, "type");
+            if (type && (strcmp(type, "text") == 0 || strcmp(type, "output_text") == 0))
+                sse_append_delta(st, json_string_member(part, "text"));
+        }
+    }
+}
+
+static void sse_handle_json(TCStreamState *st, const char *data) {
+    json_object *obj = json_tokener_parse(data);
+    if (!obj || !json_object_is_type(obj, json_type_object)) {
+        if (obj) json_object_put(obj);
+        if (!st->error) st->error = xstrdup("invalid JSON in streamed response");
+        return;
+    }
+    st->saw_event = true;
+    response_metadata_collect(st->metadata, obj);
+    char *error = provider_error_message(obj);
+    if (error) { free(st->error); st->error = error; }
+    json_object *choices = NULL;
+    if (json_object_object_get_ex(obj, "choices", &choices) && json_object_is_type(choices, json_type_array) && json_object_array_length(choices) > 0) {
+        json_object *choice = json_object_array_get_idx(choices, 0);
+        response_metadata_collect(st->metadata, choice);
+        json_object *delta = NULL;
+        if (json_object_object_get_ex(choice, "delta", &delta)) {
+            response_metadata_collect(st->metadata, delta);
+            json_object *content = NULL;
+            if (json_object_object_get_ex(delta, "content", &content) && !json_object_is_type(content, json_type_null)) {
+                sse_append_content(st, content);
+            }
+        }
+        json_object *message = NULL;
+        if (json_object_object_get_ex(choice, "message", &message)) {
+            response_metadata_collect(st->metadata, message);
+            json_object *content = NULL;
+            if (json_object_object_get_ex(message, "content", &content) && !json_object_is_type(content, json_type_null)) {
+                sse_append_content(st, content);
+            }
+        }
+        json_object *text = NULL;
+        if (json_object_object_get_ex(choice, "text", &text) && !json_object_is_type(text, json_type_null)) {
+            sse_append_content(st, text);
+        }
+        const char *finish = json_string_member(choice, "finish_reason");
+        if (finish && strcmp(finish, "error") == 0 && !st->error)
+            st->error = xstrdup("provider stopped the stream with finish_reason=error");
+    }
+    json_object_put(obj);
+}
+
+static void sse_process_event_block(TCStreamState *st, const char *block) {
+    TCBuffer data;
+    buffer_init(&data);
+    char *copy = xstrdup(block ? block : "");
+    char *save = NULL;
+    for (char *line = strtok_r(copy, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+        char *t = trim_in_place(line);
+        if (!*t || *t == ':') continue;
+        if (starts_with(t, "data:")) {
+            char *payload = trim_in_place(t + 5);
+            if (data.len > 0) buffer_append(&data, "\n");
+            buffer_append(&data, payload);
+        }
+    }
+    free(copy);
+    char *payload = trim_in_place(data.data);
+    if (strcmp(payload, "[DONE]") == 0) {
+        st->done = true;
+    } else if (*payload) {
+        sse_handle_json(st, payload);
+    }
+    free(data.data);
+}
+
+static bool sse_process_pending(TCStreamState *st) {
+    /* Search only newly arrived bytes, and compact once per callback. Repeated
+     * full-buffer searches and per-event memmoves made large events quadratic. */
+    size_t consumed = 0;
+    for (size_t i = st->pending_scan; i + 1 < st->pending.len; i++) {
+        if (st->pending.data[i] != '\n' || st->pending.data[i + 1] != '\n') continue;
+        if (i - consumed > 8 * 1024 * 1024) {
+            if (!st->error) st->error = xstrdup("stream event exceeds 8 MiB");
+            return false;
+        }
+        st->pending.data[i] = '\0';
+        sse_process_event_block(st, st->pending.data + consumed);
+        st->pending.data[i] = '\n';
+        consumed = i + 2;
+        if (st->done) { consumed = st->pending.len; break; }
+        i++;
+    }
+    if (consumed) {
+        st->pending.len -= consumed;
+        memmove(st->pending.data, st->pending.data + consumed, st->pending.len + 1);
+    }
+    st->pending_scan = st->pending.len ? st->pending.len - 1 : 0;
+    /* At the exact limit, a final LF may be the first half of the separator.
+     * Its acceptance must not depend on whether the next LF shares a chunk. */
+    size_t pending_content = st->pending.len;
+    if (pending_content && st->pending.data[pending_content - 1] == '\n') pending_content--;
+    if (pending_content > 8 * 1024 * 1024) {
+        if (!st->error) st->error = xstrdup("stream event exceeds 8 MiB");
+        return false;
+    }
+    return true;
+}
+
+static size_t curl_sse_write_cb(void *ptr, size_t size, size_t nmemb, void *userdata) {
+    TCStreamState *st = userdata;
+    if (size && nmemb > SIZE_MAX / size) return 0;
+    size_t n = size * nmemb;
+    if (stream_cancel_poll(st)) return 0;
+    if (st->done) return n;
+    /* An error body needs only a bounded diagnostic prefix. Keeping every SSE
+     * frame duplicated the complete reply and reasoning in memory. */
+    if (st->raw.len < 65536) {
+        size_t keep = 65536 - st->raw.len;
+        buffer_append_n(&st->raw, ptr, n < keep ? n : keep);
+    }
+    const char *s = ptr;
+    buffer_reserve(&st->pending, n);
+    for (size_t i = 0; i < n; i++) {
+        char c = s[i];
+        /* SSE accepts CR, LF, and CRLF, including CRLF split across callbacks. */
+        if (c == '\n' && st->previous_cr) { st->previous_cr = false; continue; }
+        st->previous_cr = c == '\r';
+        st->pending.data[st->pending.len++] = c == '\r' ? '\n' : c;
+    }
+    st->pending.data[st->pending.len] = '\0';
+    if (!sse_process_pending(st)) return 0;
+    if (stream_cancel_poll(st)) return 0;
+    return n;
+}
+
+static int curl_sse_xferinfo_cb(void *userdata, curl_off_t dltotal, curl_off_t dlnow, curl_off_t ultotal, curl_off_t ulnow) {
+    (void)dltotal;
+    (void)dlnow;
+    (void)ultotal;
+    (void)ulnow;
+    TCStreamState *st = userdata;
+    return st->done || st->error || stream_cancel_poll(st) ? 1 : 0;
+}
+
+static TCHttpResponse sse_finish_response(TCStreamState *st, CURLcode rc, long status) {
+    TCHttpResponse r = {0};
+    r.status = status;
+    if (st->pending.len > 0 && !st->cancelled && !st->done && !st->error)
+        sse_process_event_block(st, st->pending.data);
+    if (st->cancelled || st->saw_event || st->done || st->text.len) {
+        r.displayed = st->display;
+        char *sources = response_source_notes(st->metadata);
+        sse_append_delta(st, sources);
+        free(sources);
+        if (st->cancelled) {
+            r.status = 200;
+            sse_append_delta(st, "\n" TC_STREAM_INTERRUPT_MARKER "\n");
+        } else {
+            /* The progress callback ends a completed stream immediately; it
+             * need not wait for the provider to close a keep-alive response. */
+            if (!st->error && rc != CURLE_OK && !(st->done && rc == CURLE_ABORTED_BY_CALLBACK))
+                st->error = xstrdup(curl_easy_strerror(rc));
+            if (!st->error && !st->done) st->error = xstrdup("connection ended before [DONE]; reply may be incomplete");
+            if (st->error) {
+                TCBuffer note;
+                buffer_init(&note);
+                buffer_append(&note, "\n[OpenRouter stream error: ");
+                append_safe_inline(&note, st->error);
+                buffer_append(&note, "]\n");
+                sse_append_delta(st, note.data);
+                free(note.data);
+                r.failed = true;
+            } else if (st->text.len == 0) {
+                sse_append_delta(st, "[No text response returned by OpenRouter]\n");
+                r.failed = true;
+            }
+        }
+        r.body = buffer_take(&st->text);
+    } else {
+        r.failed = true;
+        if (st->error) r.body = xstrdup(st->error);
+        else if (rc != CURLE_OK) r.body = xstrdup(curl_easy_strerror(rc));
+        else r.body = xstrdup(st->raw.len ? st->raw.data : "No streaming response returned by OpenRouter");
+    }
+    r.metadata = st->metadata;
+    st->metadata = NULL;
+    return r;
+}
+
+static TCHttpResponse http_request_stream(const char *url, const char *api_key, const char *body, bool display) {
+    TCHttpResponse r = {0};
+    CURL *curl = curl_easy_init();
+    if (!curl) die("curl_easy_init failed");
+    TCStreamState st;
+    streamstate_init(&st, display);
+    stream_cancel_begin(&st);
+    struct curl_slist *headers = NULL;
+    headers = curl_slist_append(headers, "Content-Type: application/json");
+    headers = curl_slist_append(headers, "Accept: text/event-stream");
+    headers = curl_slist_append(headers, "X-Title: ttychatter");
+    if (api_key && *api_key) {
+        TCBuffer auth;
+        buffer_init(&auth);
+        buffer_appendf(&auth, "Authorization: Bearer %s", api_key);
+        headers = curl_slist_append(headers, auth.data);
+        free(auth.data);
+    }
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_sse_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &st);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "ttychatter/" TC_VERSION);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 20L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 0L);
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L);
+    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 180L);
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, curl_sse_xferinfo_cb);
+    curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &st);
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body ? body : "{}");
+    CURLcode rc = curl_easy_perform(curl);
+    stream_cancel_end(&st);
+    long status = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+    r = sse_finish_response(&st, rc, status);
+    curl_slist_free_all(headers);
+    curl_easy_cleanup(curl);
+    streamstate_free(&st);
+    return r;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Demo-mode model data                                                      */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * Demo mode exists so users and maintainers can exercise the command-line
+ * workflow without spending OpenRouter requests or needing network access.  It
+ * is deliberately implemented at the same layer as the real provider boundary:
+ * listing models returns a small local catalog, and chat completion returns a
+ * deterministic response that includes both a short code block and a long code
+ * block.  That means demo mode can test the code-block threshold and session log
+ * plumbing without fake special cases in the caller.
+ */
+static const char *TC_DEMO_MODELS_JSON =
+    "{\"data\":["
+    "{\"id\":\"openrouter/auto\",\"name\":\"Demo Auto Router\",\"context_length\":128000,\"top_provider\":{\"max_completion_tokens\":8192}},"
+    "{\"id\":\"openrouter/free\",\"name\":\"Demo Free Router\",\"context_length\":64000,\"top_provider\":{\"max_completion_tokens\":4096}},"
+    "{\"id\":\"demo/fixed-small\",\"name\":\"Demo Fixed Small\",\"context_length\":16000,\"top_provider\":{\"max_completion_tokens\":2048}},"
+    "{\"id\":\"demo/fixed-large\",\"name\":\"Demo Fixed Large\",\"context_length\":256000,\"top_provider\":{\"max_completion_tokens\":16384}}"
+    "]}";
+
+static char *demo_chat_response(const char *model, const char *user_text) {
+    TCBuffer b;
+    buffer_init(&b);
+    buffer_appendf(&b, "Demo response from model %s.\n\n", model ? model : "openrouter/auto");
+    buffer_append(&b, "This response was generated locally by ttychatter --demo. No network call was made.\n\n");
+    buffer_append(&b, "Short inline code block:\n```sh\necho demo\n```\n\n");
+    buffer_append(&b, "Long code block intended to exercise attachment extraction:\n```c\n");
+    buffer_append(&b, "#include <stdio.h>\n");
+    buffer_append(&b, "int main(void) {\n");
+    buffer_append(&b, "    puts(\"ttychatter demo attachment block\");\n");
+    buffer_append(&b, "    return 0;\n");
+    buffer_append(&b, "}\n```\n\n");
+    if (user_text && *user_text) {
+        buffer_append(&b, "You sent this input file content:\n");
+        buffer_append(&b, user_text);
+        buffer_append(&b, "\n");
+    }
+    return buffer_take(&b);
+}
+
+/* ------------------------------------------------------------------------- */
+/* Model catalog helpers                                                     */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * The mature ttychatter clients treat the model catalog as more than a raw list
+ * of opaque strings.  OpenRouter entries may be fixed models, routers such as
+ * openrouter/auto, free variants, or other provider-specific aliases.  The C
+ * client therefore carries enough metadata to sort and filter the list instead
+ * of forcing users to scan a raw JSON dump.  This remains line-oriented and
+ * scriptable, but it mirrors the same "model browser" concept used by the
+ * ncurses version.
+ */
+typedef struct TCModelRow {
+    char *id;
+    char *name;
+    long context;
+    long output;
+    bool favorite;
+} TCModelRow;
+
+typedef struct TCModelRows {
+    TCModelRow *items;
+    size_t count;
+    size_t cap;
+} TCModelRows;
+
+static bool favorite_contains(const TCConfig *cfg, const char *model);
+
+
+static const char *model_type_of(const char *id) {
+    if (!id) return "fixed";
+    if (strcmp(id, "openrouter/auto") == 0) return "auto-router";
+    if (strcmp(id, "openrouter/free") == 0) return "free-router";
+    if (strstr(id, ":free")) return "free-fixed";
+    return "fixed";
+}
+
+static bool model_type_matches(const char *id, const char *filter) {
+    if (!filter || !*filter || strcmp(filter, "all") == 0) return true;
+    const char *type = model_type_of(id);
+    if (strcmp(filter, "routers") == 0) return strstr(type, "router") != NULL;
+    if (strcmp(filter, "fixed") == 0) return strcmp(type, "fixed") == 0 || strcmp(type, "free-fixed") == 0;
+    if (strcmp(filter, "free") == 0) return strstr(type, "free") != NULL;
+    if (strcmp(filter, "auto") == 0) return strstr(type, "auto") != NULL;
+    return true;
+}
+
+static bool contains_casefold(const char *hay, const char *needle) {
+    if (!needle || !*needle) return true;
+    if (!hay) return false;
+    size_t nl = strlen(needle);
+    for (const char *p = hay; *p; p++) {
+        size_t i = 0;
+        while (i < nl && p[i] && tolower((unsigned char)p[i]) == tolower((unsigned char)needle[i])) i++;
+        if (i == nl) return true;
+    }
+    return false;
+}
+
+static long json_object_get_long_key(json_object *obj, const char *key) {
+    json_object *v = NULL;
+    if (!obj || !json_object_object_get_ex(obj, key, &v)) return 0;
+    if (json_object_is_type(v, json_type_int)) return json_object_get_int64(v);
+    if (json_object_is_type(v, json_type_double)) return (long)json_object_get_double(v);
+    if (json_object_is_type(v, json_type_string)) return atol(json_object_get_string(v));
+    return 0;
+}
+
+static long model_output_token_limit(json_object *model) {
+    long out = json_object_get_long_key(model, "max_completion_tokens");
+    if (out <= 0) out = json_object_get_long_key(model, "max_output_tokens");
+    json_object *top_provider = NULL;
+    if (out <= 0 && json_object_object_get_ex(model, "top_provider", &top_provider)) {
+        out = json_object_get_long_key(top_provider, "max_completion_tokens");
+        if (out <= 0) out = json_object_get_long_key(top_provider, "max_output_tokens");
+    }
+    return out > 0 ? out : 0;
+}
+
+static int update_models(const TCConfig *cfg, bool demo) {
+    if (demo) {
+        write_file_mode(cfg->model_cache_file, TC_DEMO_MODELS_JSON, 0600);
+        fprintf(stderr, "wrote demo model cache: %s\n", cfg->model_cache_file);
+        return 0;
+    }
+    TCHttpResponse r = http_request(TC_OPENROUTER_MODELS_URL, "GET", cfg->api_key, NULL);
+    if (r.status < 200 || r.status >= 300) {
+        fprintf(stderr, "model update failed: HTTP %ld\n%s\n", r.status, r.body ? r.body : "");
+        free(r.body);
+        return 1;
+    }
+    write_file_mode(cfg->model_cache_file, r.body, 0600);
+    fprintf(stderr, "wrote model cache: %s\n", cfg->model_cache_file);
+    free(r.body);
+    return 0;
+}
+
+static void modelrows_add(TCModelRows *rows, const char *id, const char *name, long context, long output, bool favorite) {
+    if (rows->count == rows->cap) {
+        rows->cap = rows->cap ? rows->cap * 2 : 32;
+        rows->items = realloc(rows->items, rows->cap * sizeof(rows->items[0]));
+        if (!rows->items) die("out of memory");
+    }
+    rows->items[rows->count].id = xstrdup(id ? id : "");
+    rows->items[rows->count].name = xstrdup(name ? name : "");
+    rows->items[rows->count].context = context;
+    rows->items[rows->count].output = output;
+    rows->items[rows->count].favorite = favorite;
+    rows->count++;
+}
+
+static void modelrows_free(TCModelRows *rows) {
+    for (size_t i = 0; i < rows->count; i++) {
+        free(rows->items[i].id);
+        free(rows->items[i].name);
+    }
+    free(rows->items);
+}
+
+static const char *g_model_sort_key = "name";
+
+static int modelrow_cmp(const void *a, const void *b) {
+    const TCModelRow *ra = a;
+    const TCModelRow *rb = b;
+    if (strcmp(g_model_sort_key, "context") == 0 || strcmp(g_model_sort_key, "tokens") == 0) {
+        if (ra->context < rb->context) return 1;
+        if (ra->context > rb->context) return -1;
+        if (ra->output < rb->output) return 1;
+        if (ra->output > rb->output) return -1;
+        return strcasecmp(ra->id, rb->id);
+    }
+    if (strcmp(g_model_sort_key, "type") == 0) {
+        int t = strcasecmp(model_type_of(ra->id), model_type_of(rb->id));
+        if (t) return t;
+        return strcasecmp(ra->id, rb->id);
+    }
+    if (strcmp(g_model_sort_key, "favorites") == 0) {
+        if (ra->favorite != rb->favorite) return ra->favorite ? -1 : 1;
+        return strcasecmp(ra->id, rb->id);
+    }
+    return strcasecmp(ra->id, rb->id);
+}
+
+
+static int select_model_command(TCConfig *cfg, bool demo) {
+    /*
+     * The Bash/Python clients have a numbered model selector.  The C CLI is not
+     * a full-screen program, but a small numbered prompt is still worth having:
+     * it lets users choose a model without copying a long model ID by hand.  The
+     * selector deliberately reuses the same cache and demo-data path as
+     * --models, so it never performs surprise network access.  Users who want a
+     * fresh catalog run --update-models first.
+     */
+    char *json = NULL;
+    if (demo) {
+        json = xstrdup(TC_DEMO_MODELS_JSON);
+    } else {
+        if (!file_exists(cfg->model_cache_file)) {
+            fprintf(stderr, "No model cache found: %s\n", cfg->model_cache_file);
+            fprintf(stderr, "Run: %s --update-models\n", TC_PROGRAM);
+            return 1;
+        }
+        size_t len = 0;
+        json = read_file(cfg->model_cache_file, &len);
+    }
+    json_object *root = json_tokener_parse(json);
+    free(json);
+    if (!root) die("could not parse model cache JSON");
+    json_object *data = NULL;
+    if (!json_object_object_get_ex(root, "data", &data) || !json_object_is_type(data, json_type_array)) {
+        json_object_put(root);
+        die("model cache does not contain data[]");
+    }
+    TCModelRows rows = {0};
+    size_t n = json_object_array_length(data);
+    for (size_t i = 0; i < n; i++) {
+        json_object *m = json_object_array_get_idx(data, i);
+        json_object *jid = NULL, *jname = NULL, *jctx = NULL;
+        json_object_object_get_ex(m, "id", &jid);
+        json_object_object_get_ex(m, "name", &jname);
+        json_object_object_get_ex(m, "context_length", &jctx);
+        const char *id = jid ? json_object_get_string(jid) : "";
+        const char *name = jname ? json_object_get_string(jname) : "";
+        long ctx = jctx ? json_object_get_int64(jctx) : 0;
+        long out = model_output_token_limit(m);
+        if (!model_type_matches(id, cfg->model_type_filter)) continue;
+        if (cfg->model_filter_require_tokens && (ctx <= 0 || out <= 0)) continue;
+        if (cfg->model_min_input_tokens > 0 && ctx < cfg->model_min_input_tokens) continue;
+        if (cfg->model_min_output_tokens > 0 && out < cfg->model_min_output_tokens) continue;
+        if (cfg->model_filter_hide_preview && (contains_casefold(id, "preview") || contains_casefold(name, "preview") || contains_casefold(id, "experimental") || contains_casefold(name, "experimental"))) continue;
+        modelrows_add(&rows, id, name, ctx, out, favorite_contains(cfg, id));
+    }
+    json_object_put(root);
+    g_model_sort_key = cfg->model_sort_order;
+    qsort(rows.items, rows.count, sizeof(rows.items[0]), modelrow_cmp);
+    if (rows.count == 0) {
+        fprintf(stderr, "No models matched current filters.\n");
+        modelrows_free(&rows);
+        return 1;
+    }
+    for (size_t i = 0; i < rows.count; i++) printf("%3zu) %-42.42s %-14s ctx=%ld out=%ld\n", i + 1, rows.items[i].id, model_type_of(rows.items[i].id), rows.items[i].context, rows.items[i].output);
+    fprintf(stderr, "Select model number: ");
+    char line[64];
+    if (!fgets(line, sizeof(line), stdin)) { modelrows_free(&rows); return 1; }
+    long choice = atol(line);
+    if (choice < 1 || (size_t)choice > rows.count) {
+        fprintf(stderr, "selection out of range\n");
+        modelrows_free(&rows);
+        return 1;
+    }
+    const char *selected = rows.items[(size_t)choice - 1].id;
+    free(cfg->model);
+    cfg->model = xstrdup(selected);
+    fprintf(stderr, "Selected model: %s\n", selected);
+    fprintf(stderr, "Save MODEL=%s to config? [y/N] ", selected);
+    if (fgets(line, sizeof(line), stdin) && (line[0] == 'y' || line[0] == 'Y')) {
+        config_write_key_value(cfg, "MODEL", selected);
+        fprintf(stderr, "saved MODEL=%s\n", selected);
+    }
+    modelrows_free(&rows);
+    return 0;
+}
+
+static int list_models(const TCConfig *cfg, const char *search, const char *type_filter, const char *sort_key, bool favorites_only, bool demo) {
+    char *json = NULL;
+    if (demo) {
+        json = xstrdup(TC_DEMO_MODELS_JSON);
+    } else {
+        if (!file_exists(cfg->model_cache_file)) {
+            fprintf(stderr, "No model cache found: %s\n", cfg->model_cache_file);
+            fprintf(stderr, "Run: %s --update-models\n", TC_PROGRAM);
+            return 1;
+        }
+        size_t len = 0;
+        json = read_file(cfg->model_cache_file, &len);
+    }
+
+    json_object *root = json_tokener_parse(json);
+    free(json);
+    if (!root) die("could not parse model cache JSON");
+    json_object *data = NULL;
+    if (!json_object_object_get_ex(root, "data", &data) || !json_object_is_type(data, json_type_array)) {
+        json_object_put(root);
+        die("model cache does not contain data[]");
+    }
+
+    TCModelRows rows = {0};
+    size_t n = json_object_array_length(data);
+    for (size_t i = 0; i < n; i++) {
+        json_object *m = json_object_array_get_idx(data, i);
+        json_object *jid = NULL, *jname = NULL, *jctx = NULL;
+        json_object_object_get_ex(m, "id", &jid);
+        json_object_object_get_ex(m, "name", &jname);
+        json_object_object_get_ex(m, "context_length", &jctx);
+        const char *id = jid ? json_object_get_string(jid) : "";
+        const char *name = jname ? json_object_get_string(jname) : "";
+        long ctx = jctx ? json_object_get_int64(jctx) : 0;
+        long out = model_output_token_limit(m);
+        bool fav = favorite_contains(cfg, id);
+        const char *effective_type = (type_filter && *type_filter) ? type_filter : cfg->model_type_filter;
+        if (!model_type_matches(id, effective_type)) continue;
+        if (favorites_only && !fav) continue;
+        if (cfg->model_filter_require_tokens && (ctx <= 0 || out <= 0)) continue;
+        if (cfg->model_min_input_tokens > 0 && ctx < cfg->model_min_input_tokens) continue;
+        if (cfg->model_min_output_tokens > 0 && out < cfg->model_min_output_tokens) continue;
+        if (cfg->model_filter_hide_preview && (contains_casefold(id, "preview") || contains_casefold(name, "preview") || contains_casefold(id, "experimental") || contains_casefold(name, "experimental"))) continue;
+        if (search && *search && !contains_casefold(id, search) && !contains_casefold(name, search)) continue;
+        modelrows_add(&rows, id, name, ctx, out, fav);
+    }
+    json_object_put(root);
+
+    g_model_sort_key = sort_key && *sort_key ? sort_key : cfg->model_sort_order;
+    qsort(rows.items, rows.count, sizeof(rows.items[0]), modelrow_cmp);
+
+    printf("%-2s %-42s %-14s %-10s %-10s %s\n", "F", "MODEL", "TYPE", "CONTEXT", "OUTPUT", "NAME");
+    printf("%-2s %-42s %-14s %-10s %-10s %s\n", "-", "-----", "----", "-------", "------", "----");
+    for (size_t i = 0; i < rows.count; i++) {
+        printf("%-2s %-42.42s %-14s %-10ld %-10ld %s\n",
+               rows.items[i].favorite ? "*" : "",
+               rows.items[i].id,
+               model_type_of(rows.items[i].id),
+               rows.items[i].context,
+               rows.items[i].output,
+               rows.items[i].name);
+    }
+    modelrows_free(&rows);
+    return 0;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Session parsing and context reconstruction                                */
+/* ------------------------------------------------------------------------- */
+
+static void msglist_add(TCMessageList *list, const char *role, const char *content) {
+    if (list->count == list->cap) {
+        list->cap = list->cap ? list->cap * 2 : 16;
+        list->items = realloc(list->items, list->cap * sizeof(list->items[0]));
+        if (!list->items) die("out of memory");
+    }
+    list->items[list->count].role = xstrdup(role ? role : "user");
+    list->items[list->count].content = xstrdup(content ? content : "");
+    list->count++;
+}
+
+static void msglist_free(TCMessageList *list) {
+    for (size_t i = 0; i < list->count; i++) {
+        free(list->items[i].role);
+        free(list->items[i].content);
+    }
+    free(list->items);
+    list->items = NULL;
+    list->count = 0;
+    list->cap = 0;
+}
+
+static size_t context_message_limit(long context_turns) {
+    if (context_turns <= 1) return 2;
+    if ((uintmax_t)context_turns > SIZE_MAX / 2) return SIZE_MAX;
+    return (size_t)context_turns * 2;
+}
+
+static TCMessageList msglist_clip_take(TCMessageList *all, long context_turns) {
+    size_t max_messages = context_message_limit(context_turns);
+    if (all->count <= max_messages) {
+        TCMessageList keep = *all;
+        all->items = NULL;
+        all->count = 0;
+        all->cap = 0;
+        return keep;
+    }
+
+    TCMessageList clipped = {0};
+    size_t start = all->count - max_messages;
+    for (size_t i = start; i < all->count; i++) {
+        msglist_add(&clipped, all->items[i].role, all->items[i].content);
+    }
+    msglist_free(all);
+    return clipped;
+}
+
+static char *snapshot_safe_line(const char *s) {
+    TCBuffer b;
+    buffer_init(&b);
+    for (const char *p = s ? s : ""; *p; p++) {
+        char c = *p;
+        if (c == '\r' || c == '\n' || c == '\t') c = ' ';
+        buffer_append_n(&b, &c, 1);
+    }
+    return buffer_take(&b);
+}
+
+typedef struct TCLogEntry {
+    char *speaker;
+    TCBuffer text;
+} TCLogEntry;
+
+typedef struct TCLogEntryList {
+    TCLogEntry *items;
+    size_t count;
+    size_t cap;
+} TCLogEntryList;
+
+static void logentries_add(TCLogEntryList *list, const char *speaker, const char *text) {
+    if (list->count == list->cap) {
+        list->cap = list->cap ? list->cap * 2 : 32;
+        list->items = realloc(list->items, list->cap * sizeof(list->items[0]));
+        if (!list->items) die("out of memory");
+    }
+    list->items[list->count].speaker = xstrdup(speaker ? speaker : "");
+    buffer_init(&list->items[list->count].text);
+    buffer_append(&list->items[list->count].text, text ? text : "");
+    list->count++;
+}
+
+static void logentries_free(TCLogEntryList *list) {
+    for (size_t i = 0; i < list->count; i++) {
+        free(list->items[i].speaker);
+        free(list->items[i].text.data);
+    }
+    free(list->items);
+    list->items = NULL;
+    list->count = 0;
+    list->cap = 0;
+}
+
+static bool parse_shared_log_header(const char *line, char *speaker, size_t speaker_size, const char **content_out) {
+    size_t n = strlen(line);
+    if (n < 12) return false;
+    if (line[0] != '[' || line[3] != ':' || line[6] != ':' || line[9] != ']' || line[10] != ' ') return false;
+    if (!isdigit((unsigned char)line[1]) || !isdigit((unsigned char)line[2]) ||
+        !isdigit((unsigned char)line[4]) || !isdigit((unsigned char)line[5]) ||
+        !isdigit((unsigned char)line[7]) || !isdigit((unsigned char)line[8])) return false;
+    const char *sp = line + 11;
+    const char *colon = strchr(sp, ':');
+    if (!colon || colon == sp) return false;
+    size_t slen = (size_t)(colon - sp);
+    if (slen >= speaker_size) slen = speaker_size - 1;
+    memcpy(speaker, sp, slen);
+    speaker[slen] = '\0';
+    const char *content = colon + 1;
+    if (*content == ' ') content++;
+    *content_out = content;
+    return true;
+}
+
+static TCLogEntryList parse_shared_log_entries(const char *text) {
+    TCLogEntryList entries = {0};
+    const char *p = text ? text : "";
+    while (*p) {
+        const char *e = strchr(p, '\n');
+        size_t n = e ? (size_t)(e - p) : strlen(p);
+        char *line = xcalloc(n + 1, 1);
+        memcpy(line, p, n);
+        if (n > 0 && line[n - 1] == '\r') line[n - 1] = '\0';
+
+        char speaker[256];
+        const char *content = NULL;
+        if (parse_shared_log_header(line, speaker, sizeof(speaker), &content)) {
+            logentries_add(&entries, speaker, content);
+        } else if (entries.count > 0) {
+            buffer_append(&entries.items[entries.count - 1].text, "\n");
+            buffer_append(&entries.items[entries.count - 1].text, line);
+        }
+        free(line);
+        if (!e) break;
+        p = e + 1;
+    }
+    return entries;
+}
+
+static const char *role_from_shared_speaker(const char *speaker) {
+    if (!speaker || !*speaker) return NULL;
+    if (strcasecmp(speaker, "system") == 0) return NULL;
+    if (strcasecmp(speaker, "AI") == 0 || strcasecmp(speaker, "OpenRouter") == 0 || strcasecmp(speaker, "Assistant") == 0) return "assistant";
+    return "user";
+}
+
+static bool is_shared_project_notice(const TCLogEntry *entry) {
+    if (strcmp(entry->speaker, "remfan1994") != 0) return false;
+    size_t n = strlen(TC_PRECHAT_LINE);
+    if (strncmp(entry->text.data, TC_PRECHAT_LINE, n) != 0) return false;
+    const char *tail = entry->text.data + n;
+    while (*tail && isspace((unsigned char)*tail)) tail++;
+    return *tail == '\0';
+}
+
+static bool parse_context_snapshot_text(const char *text, TCMessageList *out, bool *closed) {
+    bool saw_begin = false;
+    *closed = false;
+    TCBuffer current;
+    buffer_init(&current);
+    const char *current_role = NULL;
+    const char *p = text ? text : "";
+    while (*p) {
+        const char *e = strchr(p, '\n');
+        size_t n = e ? (size_t)(e - p) : strlen(p);
+        char *line = xcalloc(n + 1, 1);
+        memcpy(line, p, n);
+        if (n > 0 && line[n - 1] == '\r') line[n - 1] = '\0';
+        char *marker = xstrdup(line);
+        char *t = trim_in_place(marker);
+
+        if (!saw_begin) {
+            if (strcmp(t, "CONTEXT_BEGIN") == 0 || strcmp(t, TC_CONTEXT_BEGIN) == 0) {
+                saw_begin = true;
+                free(marker);
+                free(line);
+                if (!e) break;
+                p = e + 1;
+                continue;
+            }
+            free(marker); free(line); free(current.data);
+            return false;
+        }
+
+        if (strcmp(t, "CONTEXT_END") == 0 || strcmp(t, TC_CONTEXT_END) == 0) {
+            *closed = true;
+            free(marker); free(line);
+            break;
+        }
+        free(marker);
+        const char *role = NULL, *content = NULL;
+        if (starts_with_casefold(line, "User: ")) { role = "user"; content = line + 6; }
+        else if (starts_with_casefold(line, "Assistant: ")) { role = "assistant"; content = line + 11; }
+        if (role) {
+            if (current_role) msglist_add(out, current_role, current.data);
+            current.len = 0;
+            current.data[0] = '\0';
+            current_role = role;
+            buffer_append(&current, content);
+        } else if (current_role) {
+            buffer_append(&current, "\n");
+            buffer_append(&current, line);
+        }
+
+        free(line);
+        if (!e) break;
+        p = e + 1;
+    }
+    if (current_role) msglist_add(out, current_role, current.data);
+    free(current.data);
+    return saw_begin;
+}
+
+static bool parse_context_snapshot_json(const char *text, TCMessageList *out) {
+    const char *prefix = "CONTEXT_SNAPSHOT_JSON ";
+    if (!starts_with(text, prefix)) return false;
+    json_object *array = json_tokener_parse(text + strlen(prefix));
+    if (!array || !json_object_is_type(array, json_type_array)) {
+        if (array) json_object_put(array);
+        return false;
+    }
+    bool valid = true;
+    for (size_t i = 0; i < json_object_array_length(array); i++) {
+        json_object *item = json_object_array_get_idx(array, i);
+        if (!json_object_is_type(item, json_type_string)) { valid = false; break; }
+        const char *line = json_object_get_string(item);
+        if (starts_with_casefold(line, "User: ")) msglist_add(out, "user", line + 6);
+        else if (starts_with_casefold(line, "Assistant: ")) msglist_add(out, "assistant", line + 11);
+        else { valid = false; break; }
+    }
+    json_object_put(array);
+    if (!valid) msglist_free(out);
+    return valid;
+}
+
+static TCMessageList load_context_from_shared_entries(TCLogEntryList *entries, long context_turns, bool *parsed_shared) {
+    *parsed_shared = false;
+    TCMessageList all = {0};
+    for (size_t i = 0; i < entries->count; i++) {
+        TCLogEntry *entry = &entries->items[i];
+        if (is_shared_project_notice(entry)) continue;
+        if (strcasecmp(entry->speaker, "system") == 0) {
+            TCMessageList snap = {0};
+            bool closed = false;
+            if (parse_context_snapshot_json(entry->text.data, &snap)) {
+                msglist_free(&all);
+                all = snap;
+                *parsed_shared = true;
+            } else if (parse_context_snapshot_text(entry->text.data, &snap, &closed)) {
+                if (!closed && i + 1 < entries->count && strcasecmp(entries->items[i + 1].speaker, "system") == 0) {
+                    char *end = xstrdup(entries->items[i + 1].text.data);
+                    closed = strcmp(trim_in_place(end), "CONTEXT_END") == 0;
+                    free(end);
+                    if (closed) i++;
+                }
+                if (closed) {
+                    msglist_free(&all);
+                    all = snap;
+                    *parsed_shared = true;
+                } else msglist_free(&snap);
+            }
+            continue;
+        }
+        const char *role = role_from_shared_speaker(entry->speaker);
+        if (role) { msglist_add(&all, role, entry->text.data); *parsed_shared = true; }
+    }
+    return msglist_clip_take(&all, context_turns);
+}
+
+static char *extract_between(const char *start, const char *begin_marker, const char *end_marker, const char **after) {
+    const char *b = strstr(start, begin_marker);
+    if (!b) return NULL;
+    b += strlen(begin_marker);
+    if (*b == '\r') b++;
+    if (*b == '\n') b++;
+    const char *e = strstr(b, end_marker);
+    if (!e) return NULL;
+    size_t n = (size_t)(e - b);
+    char *out = xcalloc(n + 1, 1);
+    memcpy(out, b, n);
+    out[n] = '\0';
+    if (after) *after = e + strlen(end_marker);
+    return out;
+}
+
+static TCMessageList load_context_from_legacy_c_log(const char *text, long context_turns) {
+    TCMessageList all = {0};
+    const char *start_scan = text;
+
+    const char *last_snapshot = NULL;
+    const char *scan_snap = text;
+    while ((scan_snap = strstr(scan_snap, TC_CONTEXT_BEGIN))) {
+        last_snapshot = scan_snap;
+        scan_snap += strlen(TC_CONTEXT_BEGIN);
+    }
+    if (last_snapshot) {
+        const char *body = last_snapshot + strlen(TC_CONTEXT_BEGIN);
+        const char *end = strstr(body, TC_CONTEXT_END);
+        if (end) {
+            TCMessageList snap = {0};
+            bool closed = false;
+            if (parse_context_snapshot_text(last_snapshot, &snap, &closed) && closed) {
+                all = snap;
+                start_scan = end + strlen(TC_CONTEXT_END);
+            } else {
+                msglist_free(&snap);
+            }
+        }
+    }
+
+    const char *last_clear = NULL;
+    const char *scan_clear = text;
+    while ((scan_clear = strstr(scan_clear, TC_MEMORY_CLEAR))) {
+        last_clear = scan_clear;
+        scan_clear += strlen(TC_MEMORY_CLEAR);
+    }
+    if (last_clear && last_clear >= start_scan) {
+        msglist_free(&all);
+        start_scan = last_clear + strlen(TC_MEMORY_CLEAR);
+    }
+
+    const char *p = start_scan;
+    while ((p = strstr(p, TC_TURN_BEGIN))) {
+        const char *turn_end = strstr(p, TC_TURN_END);
+        if (!turn_end) break;
+        char *user = extract_between(p, TC_USER_BEGIN, TC_USER_END, NULL);
+        char *ai = extract_between(p, TC_AI_BEGIN, TC_AI_END, NULL);
+        if (user) msglist_add(&all, "user", trim_in_place(user));
+        if (ai) msglist_add(&all, "assistant", trim_in_place(ai));
+        free(user);
+        free(ai);
+        p = turn_end + strlen(TC_TURN_END);
+    }
+    return msglist_clip_take(&all, context_turns);
+}
+
+static char *latest_shared_context_start(char *text, size_t length) {
+    /* Each successful turn stores a complete context snapshot. Older entries
+     * cannot affect replay after the newest valid snapshot; do not allocate a
+     * 4 KiB entry buffer (and parse JSON) for every obsolete historical entry.
+     * Keep the full parser below for legacy logs and later text snapshots. */
+    char *end = text + length;
+    while (end > text) {
+        if (end[-1] == '\n') end--;
+        char *begin = end;
+        while (begin > text && begin[-1] != '\n') begin--;
+        char saved = *end;
+        *end = '\0';
+        char speaker[256];
+        const char *content = NULL;
+        TCMessageList snapshot = {0};
+        bool valid = parse_shared_log_header(begin, speaker, sizeof(speaker), &content) &&
+                     strcasecmp(speaker, "system") == 0 &&
+                     parse_context_snapshot_json(content, &snapshot);
+        msglist_free(&snapshot);
+        *end = saved;
+        if (valid) return begin;
+        end = begin;
+    }
+    return text;
+}
+
+static TCMessageList load_context_from_session(const char *output_path, long context_turns) {
+    TCMessageList empty = {0};
+    if (!file_exists(output_path)) return empty;
+    size_t len = 0;
+    char *text = read_file(output_path, &len);
+
+    /*
+     * ttychatter's OpenRouter clients use a shared, line-oriented transcript:
+     *     [HH:MM:SS] User: ...
+     *     [HH:MM:SS] AI: ...
+     *     [HH:MM:SS] system: CONTEXT_BEGIN
+     *     User: ...
+     *     Assistant: ...
+     *     [HH:MM:SS] system: CONTEXT_END
+     * 0.6.1 makes the C client read that format first, then falls back to the
+     * earlier C marker blocks so existing C-only session logs remain resumable.
+     */
+    TCLogEntryList entries = parse_shared_log_entries(latest_shared_context_start(text, len));
+    bool parsed_shared = false;
+    TCMessageList shared = load_context_from_shared_entries(&entries, context_turns, &parsed_shared);
+    logentries_free(&entries);
+    if (parsed_shared) {
+        free(text);
+        return shared;
+    }
+    msglist_free(&shared);
+
+    TCMessageList legacy = load_context_from_legacy_c_log(text, context_turns);
+    free(text);
+    return legacy;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Attachment handling                                                       */
+/* ------------------------------------------------------------------------- */
+
+static const char *mime_from_ext(const char *path) {
+    const char *dot = strrchr(path, '.');
+    if (!dot) return "application/octet-stream";
+    if (strcasecmp(dot, ".txt") == 0 || strcasecmp(dot, ".md") == 0 || strcasecmp(dot, ".log") == 0) return "text/plain";
+    if (strcasecmp(dot, ".json") == 0) return "application/json";
+    if (strcasecmp(dot, ".csv") == 0) return "text/csv";
+    if (strcasecmp(dot, ".c") == 0 || strcasecmp(dot, ".h") == 0 || strcasecmp(dot, ".sh") == 0 || strcasecmp(dot, ".py") == 0) return "text/plain";
+    if (strcasecmp(dot, ".png") == 0) return "image/png";
+    if (strcasecmp(dot, ".jpg") == 0 || strcasecmp(dot, ".jpeg") == 0) return "image/jpeg";
+    if (strcasecmp(dot, ".webp") == 0) return "image/webp";
+    if (strcasecmp(dot, ".gif") == 0) return "image/gif";
+    if (strcasecmp(dot, ".pdf") == 0) return "application/pdf";
+    return "application/octet-stream";
+}
+
+static bool is_text_mime(const char *mime) {
+    return starts_with(mime, "text/") || strcmp(mime, "application/json") == 0 || strcmp(mime, "text/csv") == 0;
+}
+
+static bool is_image_mime(const char *mime) {
+    return starts_with(mime, "image/");
+}
+
+static void add_attachments_to_user_content(TCBuffer *text_part, json_object *parts, const TCConfig *cfg, const TCArgs *args) {
+    for (size_t i = 0; i < args->attachment_count; i++) {
+        const char *path = args->attachments[i];
+        long sz = file_size(path);
+        const char *mime = mime_from_ext(path);
+        if (sz < 0) {
+            buffer_appendf(text_part, "\n\n[Attachment not found: %s]\n", path);
+            continue;
+        }
+        if (sz > cfg->max_attachment_bytes) {
+            buffer_appendf(text_part, "\n\n[Attachment too large for inline send: %s (%ld bytes)]\n", path, sz);
+            continue;
+        }
+        size_t len = 0;
+        char *data = read_file(path, &len);
+        if (is_text_mime(mime)) {
+            buffer_appendf(text_part, "\n\n----- ATTACHED FILE: %s (%s) -----\n", path, mime);
+            buffer_append_n(text_part, data, len);
+            buffer_appendf(text_part, "\n----- END ATTACHED FILE: %s -----\n", path);
+        } else if (is_image_mime(mime)) {
+            char *b64 = base64_encode((const unsigned char *)data, len);
+            TCBuffer url;
+            buffer_init(&url);
+            buffer_appendf(&url, "data:%s;base64,%s", mime, b64);
+            json_object *part = json_object_new_object();
+            json_object_object_add(part, "type", json_object_new_string("image_url"));
+            json_object *iu = json_object_new_object();
+            json_object_object_add(iu, "url", json_object_new_string(url.data));
+            json_object_object_add(part, "image_url", iu);
+            json_object_array_add(parts, part);
+            buffer_appendf(text_part, "\n\n[Image attachment sent: %s (%s, %ld bytes)]\n", path, mime, sz);
+            free(b64);
+            free(url.data);
+        } else {
+            buffer_appendf(text_part, "\n\n[Attachment listed but not embedded: %s (%s, %ld bytes)]\n", path, mime, sz);
+        }
+        free(data);
+    }
+}
+
+/* ------------------------------------------------------------------------- */
+/* Code fence extraction                                                     */
+/* ------------------------------------------------------------------------- */
+
+static const char *ext_for_lang(const char *lang) {
+    if (!lang || !*lang) return ".txt";
+    if (strcasecmp(lang, "bash") == 0 || strcasecmp(lang, "sh") == 0 || strcasecmp(lang, "shell") == 0) return ".sh";
+    if (strcasecmp(lang, "python") == 0 || strcasecmp(lang, "py") == 0) return ".py";
+    if (strcasecmp(lang, "json") == 0) return ".json";
+    if (strcasecmp(lang, "yaml") == 0 || strcasecmp(lang, "yml") == 0) return ".yml";
+    if (strcasecmp(lang, "c") == 0) return ".c";
+    if (strcasecmp(lang, "cpp") == 0 || strcasecmp(lang, "c++") == 0) return ".cpp";
+    return ".txt";
+}
+
+static long count_lines(const char *s, size_t n) {
+    long lines = 1;
+    for (size_t i = 0; i < n; i++) if (s[i] == '\n') lines++;
+    return lines;
+}
+
+static char *clean_lang(const char *s, size_t n) {
+    TCBuffer b;
+    buffer_init(&b);
+    for (size_t i = 0; i < n && i < 32; i++) {
+        char c = s[i];
+        if (isalnum((unsigned char)c) || c == '_' || c == '-' || c == '+') buffer_append_n(&b, &c, 1);
+    }
+    if (b.len == 0) buffer_append(&b, "text");
+    return buffer_take(&b);
+}
+
+static char *extract_code_blocks(const TCConfig *cfg, const char *session_base, const char *raw) {
+    TCBuffer out;
+    buffer_init(&out);
+    const char *p = raw;
+    int counter = 1;
+    while (*p) {
+        const char *fence_open = strstr(p, "```");
+        if (!fence_open) {
+            buffer_append(&out, p);
+            break;
+        }
+        buffer_append_n(&out, p, (size_t)(fence_open - p));
+        const char *lang_start = fence_open + 3;
+        const char *line_end = strchr(lang_start, '\n');
+        if (!line_end) {
+            buffer_append(&out, fence_open);
+            break;
+        }
+        const char *fence_close = strstr(line_end + 1, "```");
+        if (!fence_close) {
+            buffer_append(&out, fence_open);
+            break;
+        }
+        char *lang = clean_lang(lang_start, (size_t)(line_end - lang_start));
+        const char *code = line_end + 1;
+        size_t code_len = (size_t)(fence_close - code);
+        if (count_lines(code, code_len) >= cfg->code_attachment_min_lines) {
+            mkdir_p(cfg->attachment_dir);
+            char filename[PATH_MAX];
+            int fd = -1;
+            while (counter < 100000) {
+                int len = snprintf(filename, sizeof(filename), "%s/%s-code-%02d%s", cfg->attachment_dir, session_base, counter++, ext_for_lang(lang));
+                if (len < 0 || (size_t)len >= sizeof(filename)) break;
+                fd = open(filename, O_WRONLY | O_CREAT | O_EXCL, 0600);
+                if (fd >= 0 || errno != EEXIST) break;
+            }
+            FILE *f = fd >= 0 ? fdopen(fd, "wb") : NULL;
+            if (f) {
+                bool saved = fwrite(code, 1, code_len, f) == code_len;
+                if (fclose(f) != 0) saved = false;
+                if (saved) buffer_appendf(&out, "\n[code attachment saved: %s]\n", filename);
+                else { unlink(filename); buffer_append_n(&out, fence_open, (size_t)(fence_close + 3 - fence_open)); }
+            } else {
+                if (fd >= 0) { close(fd); unlink(filename); }
+                buffer_append_n(&out, fence_open, (size_t)(fence_close + 3 - fence_open));
+            }
+        } else {
+            buffer_append_n(&out, fence_open, (size_t)(fence_close + 3 - fence_open));
+        }
+        free(lang);
+        p = fence_close + 3;
+    }
+    return buffer_take(&out);
+}
+
+
+/* ------------------------------------------------------------------------- */
+/* Assistant-returned file attachment receipt                                */
+/* ------------------------------------------------------------------------- */
+
+typedef struct TCAIFile {
+    char *name;
+    char *mime;
+    char *url;
+    char *data;
+    char *file_id;
+    char *source;
+} TCAIFile;
+
+typedef struct TCAIFileList {
+    TCAIFile *items;
+    size_t count;
+    size_t cap;
+} TCAIFileList;
+
+static void ai_files_init(TCAIFileList *list) {
+    memset(list, 0, sizeof(*list));
+}
+
+static void ai_file_free(TCAIFile *f) {
+    if (!f) return;
+    free(f->name); free(f->mime); free(f->url); free(f->data); free(f->file_id); free(f->source);
+    memset(f, 0, sizeof(*f));
+}
+
+static void ai_files_free(TCAIFileList *list) {
+    if (!list) return;
+    for (size_t i = 0; i < list->count; i++) ai_file_free(&list->items[i]);
+    free(list->items);
+    memset(list, 0, sizeof(*list));
+}
+
+
+static char *json_dup_first_string(json_object *obj, const char **keys) {
+    for (size_t i = 0; keys[i]; i++) {
+        const char *s = json_string_member(obj, keys[i]);
+        if (s && *s) return xstrdup(s);
+    }
+    return NULL;
+}
+
+static bool is_ai_file_type(const char *type) {
+    if (!type) return false;
+    return strcasecmp(type, "file") == 0 || strcasecmp(type, "output_file") == 0 ||
+           strcasecmp(type, "attachment") == 0 || strcasecmp(type, "artifact") == 0 ||
+           strcasecmp(type, "image_url") == 0 || strcasecmp(type, "image") == 0 ||
+           strcasecmp(type, "audio") == 0 || strcasecmp(type, "video") == 0;
+}
+
+static bool ai_file_seen(TCAIFileList *list, const char *url, const char *data, const char *file_id) {
+    for (size_t i = 0; i < list->count; i++) {
+        TCAIFile *f = &list->items[i];
+        if (url && f->url && strcmp(url, f->url) == 0) return true;
+        if (data && f->data && strcmp(data, f->data) == 0) return true;
+        if (file_id && f->file_id && strcmp(file_id, f->file_id) == 0) return true;
+    }
+    return false;
+}
+
+static void ai_files_add(TCAIFileList *list, char *name, char *mime, char *url, char *data, char *file_id, const char *source) {
+    if ((!url || !*url) && (!data || !*data) && (!file_id || !*file_id)) {
+        free(name); free(mime); free(url); free(data); free(file_id);
+        return;
+    }
+    if (ai_file_seen(list, url, data, file_id)) {
+        free(name); free(mime); free(url); free(data); free(file_id);
+        return;
+    }
+    if (list->count == list->cap) {
+        list->cap = list->cap ? list->cap * 2 : 8;
+        TCAIFile *p = realloc(list->items, list->cap * sizeof(*list->items));
+        if (!p) die("out of memory");
+        list->items = p;
+    }
+    TCAIFile *f = &list->items[list->count++];
+    memset(f, 0, sizeof(*f));
+    f->name = (name && *name) ? name : xstrdup("assistant-file");
+    if (name && !*name) free(name);
+    f->mime = (mime && *mime) ? mime : xstrdup("application/octet-stream");
+    if (mime && !*mime) free(mime);
+    f->url = url;
+    f->data = data;
+    f->file_id = file_id;
+    f->source = xstrdup(source ? source : "provider response");
+}
+
+static void collect_ai_file_from_object(json_object *obj, TCAIFileList *files, const char *source) {
+    if (!obj || !json_object_is_type(obj, json_type_object)) return;
+    const char *type = json_string_member(obj, "type");
+
+    json_object *nested = NULL;
+    if (json_object_object_get_ex(obj, "image_url", &nested) && json_object_is_type(nested, json_type_object)) {
+        const char *url = json_string_member(nested, "url");
+        if (url && *url) ai_files_add(files, json_dup_first_string(obj, (const char *[]) {"filename", "name", NULL}), xstrdup("image/*"), xstrdup(url), NULL, NULL, "message.image_url");
+    }
+    if (json_object_object_get_ex(obj, "audio", &nested) && json_object_is_type(nested, json_type_object)) {
+        const char *data = json_string_member(nested, "data");
+        const char *fmt = json_string_member(nested, "format");
+        if (data && *data) {
+            char nm[64];
+            snprintf(nm, sizeof(nm), "assistant-audio.%s", (fmt && *fmt) ? fmt : "bin");
+            char mt[64];
+            snprintf(mt, sizeof(mt), "audio/%s", (fmt && *fmt) ? fmt : "octet-stream");
+            ai_files_add(files, xstrdup(nm), xstrdup(mt), NULL, xstrdup(data), NULL, "message.audio");
+        }
+    }
+    if (json_object_object_get_ex(obj, "file", &nested) && json_object_is_type(nested, json_type_object)) {
+        collect_ai_file_from_object(nested, files, "message.file");
+    }
+
+    const char *name_keys[] = {"filename", "file_name", "name", "title", NULL};
+    const char *mime_keys[] = {"mime_type", "mime", "content_type", "media_type", NULL};
+    const char *url_keys[] = {"download_url", "file_url", "content_url", "url", "href", NULL};
+    const char *data_keys[] = {"data", "base64", "b64_json", "bytes", NULL};
+    const char *id_keys[] = {"file_id", "id", NULL};
+    char *name = json_dup_first_string(obj, name_keys);
+    char *mime = json_dup_first_string(obj, mime_keys);
+    char *url = json_dup_first_string(obj, url_keys);
+    char *data = json_dup_first_string(obj, data_keys);
+    char *file_id = json_dup_first_string(obj, id_keys);
+    bool looks_like_file = is_ai_file_type(type) || name || url || data || (file_id && type && strstr(type, "file"));
+    if (looks_like_file) {
+        ai_files_add(files, name, mime, url, data, file_id, source);
+    } else {
+        free(name); free(mime); free(url); free(data); free(file_id);
+    }
+}
+
+static void collect_ai_files_from_member(json_object *obj, const char *key, TCAIFileList *files, const char *source) {
+    json_object *v = NULL;
+    if (!obj || !json_object_object_get_ex(obj, key, &v) || !v) return;
+    if (json_object_is_type(v, json_type_array)) {
+        size_t n = json_object_array_length(v);
+        for (size_t i = 0; i < n; i++) collect_ai_file_from_object(json_object_array_get_idx(v, i), files, source);
+    } else if (json_object_is_type(v, json_type_object)) {
+        collect_ai_file_from_object(v, files, source);
+    }
+}
+
+static void append_text_and_collect_files(json_object *content, TCBuffer *text, TCAIFileList *files) {
+    if (!content || json_object_is_type(content, json_type_null)) return;
+    if (json_object_is_type(content, json_type_string)) {
+        buffer_append(text, json_object_get_string(content));
+        return;
+    }
+    if (json_object_is_type(content, json_type_array)) {
+        size_t n = json_object_array_length(content);
+        for (size_t i = 0; i < n; i++) {
+            json_object *part = json_object_array_get_idx(content, i);
+            if (json_object_is_type(part, json_type_string)) {
+                buffer_append(text, json_object_get_string(part));
+                continue;
+            }
+            if (!json_object_is_type(part, json_type_object)) continue;
+            const char *type = json_string_member(part, "type");
+            const char *txt = json_string_member(part, "text");
+            if (!txt) txt = json_string_member(part, "content");
+            if (txt && (!type || strcasecmp(type, "text") == 0 || !is_ai_file_type(type))) {
+                if (text->len > 0) buffer_append(text, "\n");
+                buffer_append(text, txt);
+            }
+            if (is_ai_file_type(type) || json_string_member(part, "url") || json_string_member(part, "download_url") || json_string_member(part, "data")) {
+                collect_ai_file_from_object(part, files, "message.content part");
+            }
+        }
+        return;
+    }
+    if (json_object_is_type(content, json_type_object)) {
+        const char *txt = json_string_member(content, "text");
+        if (!txt) txt = json_string_member(content, "content");
+        if (txt) buffer_append(text, txt);
+        collect_ai_file_from_object(content, files, "message.content object");
+    }
+}
+
+static int b64_value(unsigned char c) {
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+static unsigned char *base64_decode_alloc(const char *input, size_t *out_len) {
+    TCBuffer clean;
+    buffer_init(&clean);
+    if (out_len) *out_len = 0;
+    for (const unsigned char *p = (const unsigned char *)(input ? input : ""); *p; p++) {
+        if (isspace(*p)) continue;
+        if (b64_value(*p) < 0 && *p != '=') { free(clean.data); return NULL; }
+        buffer_append_n(&clean, (const char *)p, 1);
+    }
+    if (clean.len % 4 == 1) { free(clean.data); return NULL; }
+    while (clean.len % 4) buffer_append(&clean, "=");
+    size_t len = clean.len;
+    unsigned char *out = xcalloc((len / 4) * 3 + 1, 1);
+    size_t o = 0;
+    for (size_t i = 0; i < len; i += 4) {
+        int a = b64_value((unsigned char)clean.data[i]);
+        int b = b64_value((unsigned char)clean.data[i + 1]);
+        int c = clean.data[i + 2] == '=' ? -2 : b64_value((unsigned char)clean.data[i + 2]);
+        int d = clean.data[i + 3] == '=' ? -2 : b64_value((unsigned char)clean.data[i + 3]);
+        if (a < 0 || b < 0 || c == -1 || d == -1 ||
+            (c == -2 && (d != -2 || (b & 15))) ||
+            (c >= 0 && d == -2 && (c & 3)) ||
+            ((c == -2 || d == -2) && i + 4 != len)) {
+            free(clean.data); free(out); return NULL;
+        }
+        out[o++] = (unsigned char)((a << 2) | (b >> 4));
+        if (c >= 0) out[o++] = (unsigned char)(((b & 15) << 4) | (c >> 2));
+        if (c >= 0 && d >= 0) out[o++] = (unsigned char)(((c & 3) << 6) | d);
+    }
+    free(clean.data);
+    if (out_len) *out_len = o;
+    return out;
+}
+
+static const char *ext_for_mime(const char *mime) {
+    if (!mime) return ".bin";
+    if (strstr(mime, "json")) return ".json";
+    if (strstr(mime, "tar")) return ".tar";
+    if (strstr(mime, "gzip") || strstr(mime, "gz")) return ".gz";
+    if (strstr(mime, "zip")) return ".zip";
+    if (starts_with(mime, "text/")) return ".txt";
+    if (strcmp(mime, "image/png") == 0) return ".png";
+    if (strcmp(mime, "image/jpeg") == 0) return ".jpg";
+    if (strcmp(mime, "image/gif") == 0) return ".gif";
+    if (strcmp(mime, "application/pdf") == 0) return ".pdf";
+    if (starts_with(mime, "audio/wav") || strcmp(mime, "audio/x-wav") == 0) return ".wav";
+    if (starts_with(mime, "audio/mpeg") || strcmp(mime, "audio/mp3") == 0) return ".mp3";
+    if (starts_with(mime, "audio/flac")) return ".flac";
+    return ".bin";
+}
+
+static char *sanitize_file_leaf(const char *name) {
+    TCBuffer b;
+    buffer_init(&b);
+    const char *base = name && *name ? name : "assistant-file";
+    const char *slash = strrchr(base, '/');
+    if (slash) base = slash + 1;
+    for (const char *p = base; *p && b.len < 96; p++) {
+        char c = *p;
+        if (isalnum((unsigned char)c) || c == '.' || c == '-' || c == '_') buffer_append_n(&b, &c, 1);
+        else if (isspace((unsigned char)c)) buffer_append(&b, "-");
+    }
+    if (b.len == 0 || strcmp(b.data, ".") == 0 || strcmp(b.data, "..") == 0) {
+        free(b.data);
+        return xstrdup("assistant-file");
+    }
+    return buffer_take(&b);
+}
+
+static char *unique_ai_file_path(const TCConfig *cfg, const TCAIFile *file) {
+    char *dir = path_join2(cfg->attachment_dir, "received");
+    mkdir_p(dir);
+    char *leaf = sanitize_file_leaf(file->name);
+    if (!strchr(leaf, '.')) {
+        char *with_ext;
+        const char *ext = ext_for_mime(file->mime);
+        TCBuffer tmp;
+        buffer_init(&tmp);
+        buffer_append(&tmp, leaf);
+        buffer_append(&tmp, ext);
+        with_ext = buffer_take(&tmp);
+        free(leaf);
+        leaf = with_ext;
+    }
+    char *path = path_join2(dir, leaf);
+    if (!file_exists(path)) { free(dir); free(leaf); return path; }
+    char *stem = xstrdup(leaf);
+    char *dot = strrchr(stem, '.');
+    char *ext = NULL;
+    if (dot && dot != stem) { ext = xstrdup(dot); *dot = '\0'; } else ext = xstrdup("");
+    free(path);
+    for (int i = 1; i < 10000; i++) {
+        TCBuffer candidate;
+        buffer_init(&candidate);
+        buffer_appendf(&candidate, "%s/%s-%03d%s", dir, stem, i, ext);
+        path = buffer_take(&candidate);
+        if (!file_exists(path)) break;
+        free(path); path = NULL;
+    }
+    free(dir); free(leaf); free(stem); free(ext);
+    return path;
+}
+
+static bool parse_data_url(const char *url, char **mime_out, char **b64_out) {
+    if (!url || !starts_with(url, "data:")) return false;
+    const char *comma = strchr(url, ',');
+    if (!comma) return false;
+    const char *semi = strstr(url, ";base64");
+    if (!semi || semi > comma) return false;
+    size_t mime_len = (size_t)(semi - (url + 5));
+    char *mime = xcalloc(mime_len + 1, 1);
+    memcpy(mime, url + 5, mime_len);
+    *mime_out = mime;
+    *b64_out = xstrdup(comma + 1);
+    return true;
+}
+
+static size_t curl_file_write_cb(char *ptr, size_t size, size_t nmemb, void *userdata) {
+    FILE *f = userdata;
+    return fwrite(ptr, 1, size * nmemb, f);
+}
+
+static bool http_download_to_path(const char *url, const char *path, char **err_out) {
+    CURL *curl = curl_easy_init();
+    if (!curl) { if (err_out) *err_out = xstrdup("curl init failed"); return false; }
+    int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (fd < 0) { if (err_out) *err_out = xstrdup(strerror(errno)); curl_easy_cleanup(curl); return false; }
+    FILE *f = fdopen(fd, "wb");
+    if (!f) { close(fd); unlink(path); if (err_out) *err_out = xstrdup(strerror(errno)); curl_easy_cleanup(curl); return false; }
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_file_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, f);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
+#if LIBCURL_VERSION_NUM >= 0x075500
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "http,https");
+    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
+#else
+    curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+    curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
+#endif
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "ttychatter/" TC_VERSION);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 120L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 20L);
+    CURLcode rc = curl_easy_perform(curl);
+    long status = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+    bool written = fclose(f) == 0;
+    curl_easy_cleanup(curl);
+    if (!written || rc != CURLE_OK || (status && (status < 200 || status >= 300))) {
+        unlink(path);
+        if (err_out) {
+            TCBuffer e; buffer_init(&e);
+            if (!written) buffer_append(&e, "could not finish writing download");
+            else if (rc != CURLE_OK) buffer_append(&e, curl_easy_strerror(rc));
+            else buffer_appendf(&e, "HTTP %ld", status);
+            *err_out = buffer_take(&e);
+        }
+        return false;
+    }
+    return true;
+}
+
+static bool write_ai_file_payload(const TCConfig *cfg, TCAIFile *file, char **path_out, char **err_out) {
+    char *path = unique_ai_file_path(cfg, file);
+    if (!path) { if (err_out) *err_out = xstrdup("no unused attachment filename available"); return false; }
+    char *mime_from_url = NULL;
+    char *b64_from_url = NULL;
+    const char *b64 = file->data;
+    if (file->url && starts_with(file->url, "data:")) {
+        if (parse_data_url(file->url, &mime_from_url, &b64_from_url)) {
+            b64 = b64_from_url;
+            if (mime_from_url && *mime_from_url) { free(file->mime); file->mime = xstrdup(mime_from_url); }
+        }
+    }
+    if (b64 && *b64) {
+        size_t n = 0;
+        unsigned char *bytes = base64_decode_alloc(b64, &n);
+        if (!bytes) {
+            if (err_out) *err_out = xstrdup("invalid base64 attachment payload");
+            free(path); free(mime_from_url); free(b64_from_url);
+            return false;
+        }
+        int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+        FILE *f = fd >= 0 ? fdopen(fd, "wb") : NULL;
+        if (!f) {
+            if (fd >= 0) { close(fd); unlink(path); }
+            if (err_out) *err_out = xstrdup(strerror(errno));
+            free(bytes); free(path); free(mime_from_url); free(b64_from_url);
+            return false;
+        }
+        bool saved = fwrite(bytes, 1, n, f) == n;
+        if (fclose(f) != 0) saved = false;
+        free(bytes);
+        if (!saved) {
+            unlink(path);
+            if (err_out) *err_out = xstrdup("could not finish writing attachment");
+            free(path); free(mime_from_url); free(b64_from_url);
+            return false;
+        }
+        *path_out = path;
+        free(mime_from_url); free(b64_from_url);
+        return true;
+    }
+    if (file->url && (starts_with(file->url, "http://") || starts_with(file->url, "https://"))) {
+        bool ok = http_download_to_path(file->url, path, err_out);
+        if (ok) *path_out = path;
+        else free(path);
+        free(mime_from_url); free(b64_from_url);
+        return ok;
+    }
+    if (err_out) *err_out = xstrdup(file->file_id ? "provider returned only a file id; no download endpoint is configured" : "no downloadable URL or base64 data");
+    free(path); free(mime_from_url); free(b64_from_url);
+    return false;
+}
+
+static bool ai_file_should_download(const char *mode, size_t index, const TCAIFile *file) {
+    if (strcasecmp(mode, "auto") == 0 || strcasecmp(mode, "all") == 0) return true;
+    if (strcasecmp(mode, "ask") != 0) return false;
+    if (!isatty(STDIN_FILENO)) return false;
+    fprintf(stderr, "AI attachment %zu: %s (%s). Download? [y/N] ", index + 1, file->name ? file->name : "assistant-file", file->mime ? file->mime : "application/octet-stream");
+    fflush(stderr);
+    char line[32];
+    if (!fgets(line, sizeof(line), stdin)) return false;
+    char *t = trim_in_place(line);
+    return parse_bool_string(t, false);
+}
+
+static char *append_ai_file_receipt_notes(const TCConfig *cfg, const TCArgs *args, const char *text, TCAIFileList *files) {
+    const char *mode = effective_ai_file_download_mode(cfg, args);
+    if (!mode || !*mode) mode = "ask";
+    if (files->count == 0 || strcasecmp(mode, "off") == 0) return xstrdup(text ? text : "");
+    TCBuffer out;
+    buffer_init(&out);
+    buffer_append(&out, text ? text : "");
+    if (out.len > 0 && out.data[out.len - 1] != '\n') buffer_append(&out, "\n");
+    buffer_append(&out, "\n[AI file attachments]\n");
+    if (strcasecmp(mode, "ask") == 0 && !isatty(STDIN_FILENO)) {
+        buffer_append(&out, "download mode ask is noninteractive here; recording metadata only.\n");
+    }
+    for (size_t i = 0; i < files->count; i++) {
+        TCAIFile *f = &files->items[i];
+        bool dl = ai_file_should_download(mode, i, f);
+        if (dl) {
+            char *path = NULL;
+            char *err = NULL;
+            if (write_ai_file_payload(cfg, f, &path, &err)) {
+                buffer_appendf(&out, "saved %zu: %s (%s) -> %s\n", i + 1, f->name, f->mime, path);
+                free(path);
+            } else {
+                buffer_appendf(&out, "not saved %zu: %s (%s): %s\n", i + 1, f->name, f->mime, err ? err : "download failed");
+                free(err);
+            }
+        } else {
+            const char *loc = f->url ? f->url : (f->file_id ? f->file_id : "embedded data");
+            buffer_appendf(&out, "available %zu: %s (%s) [%s] %s\n", i + 1, f->name, f->mime, f->source ? f->source : "provider", loc);
+        }
+    }
+    return buffer_take(&out);
+}
+
+/* ------------------------------------------------------------------------- */
+/* OpenRouter chat request                                                   */
+/* ------------------------------------------------------------------------- */
+
+static json_object *build_chat_request(const TCConfig *cfg, const char *model, const char *user_text,
+                                        const TCMessageList *context, const TCArgs *args) {
+    json_object *root = json_object_new_object();
+    json_object_object_add(root, "model", json_object_new_string(model));
+    json_object *messages = json_object_new_array();
+
+    for (size_t i = 0; i < context->count; i++) {
+        json_object *msg = json_object_new_object();
+        json_object_object_add(msg, "role", json_object_new_string(context->items[i].role));
+        json_object_object_add(msg, "content", json_object_new_string(context->items[i].content));
+        json_object_array_add(messages, msg);
+    }
+
+    json_object *user = json_object_new_object();
+    json_object_object_add(user, "role", json_object_new_string("user"));
+
+    if (args->attachment_count == 0) {
+        json_object_object_add(user, "content", json_object_new_string(user_text));
+    } else {
+        json_object *parts = json_object_new_array();
+        TCBuffer text;
+        buffer_init(&text);
+        buffer_append(&text, user_text);
+        add_attachments_to_user_content(&text, parts, cfg, args);
+        json_object *textpart = json_object_new_object();
+        json_object_object_add(textpart, "type", json_object_new_string("text"));
+        json_object_object_add(textpart, "text", json_object_new_string(text.data));
+        json_object_array_add(parts, textpart);
+        json_object_object_add(user, "content", parts);
+        free(text.data);
+    }
+
+    json_object_array_add(messages, user);
+    json_object_object_add(root, "messages", messages);
+    if (effective_stream(cfg, args)) json_object_object_add(root, "stream", json_object_new_boolean(1));
+    if (args && args->session_id)
+        json_object_object_add(root, "session_id", json_object_new_string(args->session_id));
+    if (effective_web_search(cfg, args)) {
+        const char *engine = args && args->web_search_engine ? args->web_search_engine : cfg->web_search_engine;
+        long results = args && args->web_search_max_results_set ? args->web_search_max_results : cfg->web_search_max_results;
+        long uses = args && args->web_search_max_uses_set ? args->web_search_max_uses : cfg->web_search_max_uses;
+        if (strcmp(engine, "perplexity") == 0 && results > 20) results = 20;
+        json_object *tools = json_object_new_array();
+        json_object *tool = json_object_new_object();
+        json_object *parameters = json_object_new_object();
+        json_object_object_add(tool, "type", json_object_new_string("openrouter:web_search"));
+        json_object_object_add(parameters, "engine", json_object_new_string(engine));
+        if (results > 0) json_object_object_add(parameters, "max_results", json_object_new_int64(results));
+        json_object_object_add(tool, "parameters", parameters);
+        json_object_array_add(tools, tool);
+        json_object_object_add(root, "tools", tools);
+        if (uses > 0) json_object_object_add(root, "max_tool_calls", json_object_new_int64(uses));
+    }
+    return root;
+}
+
+static char *parse_chat_response(const TCConfig *cfg, TCArgs *args, const char *response_body) {
+    json_object *resp = json_tokener_parse(response_body);
+    if (!resp || !json_object_is_type(resp, json_type_object)) {
+        if (resp) json_object_put(resp);
+        args->request_failed = true;
+        return xstrdup("[OpenRouter error: invalid JSON response]");
+    }
+    if (args->response_metadata) json_object_put(args->response_metadata);
+    args->response_metadata = json_object_new_object();
+    response_metadata_collect(args->response_metadata, resp);
+    char *error = provider_error_message(resp);
+    if (error) {
+        args->request_failed = true;
+        TCBuffer note;
+        buffer_init(&note);
+        buffer_append(&note, "[OpenRouter error: ");
+        append_safe_inline(&note, error);
+        buffer_append(&note, "]");
+        free(error);
+        json_object_put(resp);
+        return buffer_take(&note);
+    }
+    json_object *choices = NULL;
+    if (!json_object_object_get_ex(resp, "choices", &choices) || !json_object_is_type(choices, json_type_array) || json_object_array_length(choices) == 0) {
+        json_object_put(resp);
+        args->request_failed = true;
+        return xstrdup("[No choices returned by OpenRouter]");
+    }
+    TCBuffer text;
+    buffer_init(&text);
+    TCAIFileList ai_files;
+    ai_files_init(&ai_files);
+    size_t choice_count = json_object_array_length(choices);
+    for (size_t i = 0; i < choice_count; i++) {
+        json_object *choice = json_object_array_get_idx(choices, i);
+        response_metadata_collect(args->response_metadata, choice);
+        json_object *msg = NULL, *content = NULL;
+        if (json_object_object_get_ex(choice, "message", &msg)) {
+            response_metadata_collect(args->response_metadata, msg);
+            if (json_object_object_get_ex(msg, "content", &content)) {
+                if (text.len > 0) buffer_append(&text, "\n");
+                append_text_and_collect_files(content, &text, &ai_files);
+            }
+            collect_ai_files_from_member(msg, "files", &ai_files, "message.files");
+            collect_ai_files_from_member(msg, "attachments", &ai_files, "message.attachments");
+            collect_ai_files_from_member(msg, "output_files", &ai_files, "message.output_files");
+            collect_ai_files_from_member(msg, "artifacts", &ai_files, "message.artifacts");
+        }
+        collect_ai_files_from_member(choice, "files", &ai_files, "choice.files");
+        collect_ai_files_from_member(choice, "attachments", &ai_files, "choice.attachments");
+        collect_ai_files_from_member(choice, "output_files", &ai_files, "choice.output_files");
+        collect_ai_files_from_member(choice, "artifacts", &ai_files, "choice.artifacts");
+        json_object *plain_text = NULL;
+        if (json_object_object_get_ex(choice, "text", &plain_text) && json_object_is_type(plain_text, json_type_string)) {
+            if (text.len > 0) buffer_append(&text, "\n");
+            buffer_append(&text, json_object_get_string(plain_text));
+        }
+    }
+    collect_ai_files_from_member(resp, "files", &ai_files, "response.files");
+    collect_ai_files_from_member(resp, "attachments", &ai_files, "response.attachments");
+    collect_ai_files_from_member(resp, "output_files", &ai_files, "response.output_files");
+    collect_ai_files_from_member(resp, "artifacts", &ai_files, "response.artifacts");
+    char *sources = response_source_notes(args->response_metadata);
+    buffer_append(&text, sources);
+    free(sources);
+    char *out = append_ai_file_receipt_notes(cfg, args, text.data, &ai_files);
+    free(text.data);
+    ai_files_free(&ai_files);
+    json_object_put(resp);
+    status_update(cfg, args, "response complete");
+    if (!out || !*out) { free(out); args->request_failed = true; return xstrdup("[No text response returned by OpenRouter]"); }
+    return out;
+}
+
+static char *openrouter_chat(const TCConfig *cfg, const char *model, const char *user_text, const TCMessageList *context, TCArgs *args) {
+    args->request_failed = false;
+    if (args->response_metadata) json_object_put(args->response_metadata);
+    args->response_metadata = NULL;
+    bool stream = effective_stream(cfg, args);
+    status_update(cfg, args, "preparing request for %s", model ? model : "(default model)");
+    if (args && args->demo) {
+        char *demo = demo_chat_response(model, user_text);
+        if (stream) {
+            fputs(demo, stdout);
+            fputc('\n', stdout);
+            fflush(stdout);
+        }
+        return demo;
+    }
+    json_object *root = build_chat_request(cfg, model, user_text, context, args);
+    const char *payload = json_object_to_json_string_ext(root, JSON_C_TO_STRING_PLAIN);
+    char *payload_copy = xstrdup(payload);
+    json_object_put(root);
+
+    status_update(cfg, args, stream ? "waiting for streaming response" : "waiting for response");
+    TCHttpResponse r = stream ? http_request_stream(TC_OPENROUTER_CHAT_URL, cfg->api_key, payload_copy, true)
+                              : http_request(TC_OPENROUTER_CHAT_URL, "POST", cfg->api_key, payload_copy);
+    free(payload_copy);
+    if (stream && r.status >= 200 && r.status < 300) {
+        fputc('\n', stdout);
+        fflush(stdout);
+    }
+    args->request_failed = r.failed || r.status < 200 || r.status >= 300;
+    if (r.metadata) args->response_metadata = r.metadata;
+    if (r.status < 200 || r.status >= 300) {
+        TCBuffer err;
+        buffer_init(&err);
+        buffer_appendf(&err, "OpenRouter HTTP %ld\n%s", r.status, r.body ? r.body : "");
+        free(r.body);
+        fprintf(stderr, "%s\n", err.data);
+        return buffer_take(&err);
+    }
+    if (stream) {
+        if (r.failed && !r.displayed) fprintf(stderr, "OpenRouter stream failed: %s\n", r.body);
+        status_update(cfg, args, args->request_failed ? "stream failed; diagnostic saved" : "stream complete");
+        return r.body;
+    }
+    char *out = parse_chat_response(cfg, args, r.body);
+    free(r.body);
+    if (args->request_failed) fprintf(stderr, "%s\n", out);
+    return out;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Session log append                                                        */
+/* ------------------------------------------------------------------------- */
+
+static void append_snapshot_message(json_object *snapshot, const char *role, const char *content) {
+    const char *label = (role && strcasecmp(role, "assistant") == 0) ? "Assistant" : "User";
+    TCBuffer line;
+    buffer_init(&line);
+    buffer_appendf(&line, "%s: %s", label, content ? content : "");
+    json_object_array_add(snapshot, json_object_new_string(line.data));
+    free(line.data);
+}
+
+static void append_shared_context_snapshot(TCBuffer *b, const char *ts, const TCMessageList *previous_context,
+                                           long context_turns, const char *user_text, const char *ai_text) {
+    size_t max_messages = context_message_limit(context_turns);
+    size_t prev_count = previous_context ? previous_context->count : 0;
+    size_t added_count = (user_text ? 1 : 0) + (ai_text ? 1 : 0);
+    size_t drop = 0;
+    if (prev_count > max_messages - added_count) drop = prev_count - (max_messages - added_count);
+    if (drop > prev_count) drop = prev_count;
+
+    json_object *snapshot = json_object_new_array();
+    for (size_t i = drop; i < prev_count; i++) {
+        append_snapshot_message(snapshot, previous_context->items[i].role, previous_context->items[i].content);
+    }
+    if (user_text) append_snapshot_message(snapshot, "user", user_text);
+    if (ai_text) append_snapshot_message(snapshot, "assistant", ai_text);
+    buffer_appendf(b, "[%s] system: CONTEXT_SNAPSHOT_JSON %s\n", ts,
+                   json_object_to_json_string_ext(snapshot, JSON_C_TO_STRING_PLAIN));
+    json_object_put(snapshot);
+}
+
+static void append_turn(const char *output_path, const char *model, const char *input_path, TCArgs *args,
+                        const char *user_text, const char *ai_text, const TCMessageList *previous_context,
+                        long context_turns) {
+    TCBuffer b;
+    buffer_init(&b);
+    char *ts = now_hms();
+
+    if (model && *model) buffer_appendf(&b, "[%s] system: model: %s\n", ts, model);
+    if (input_path && *input_path) buffer_appendf(&b, "[%s] system: input-file: %s\n", ts, input_path);
+    if (args) {
+        for (size_t i = 0; i < args->attachment_count; i++) {
+            buffer_appendf(&b, "[%s] system: attachment: %s\n", ts, args->attachments[i]);
+        }
+    }
+
+    buffer_appendf(&b, "[%s] User: %s\n", ts, user_text ? user_text : "");
+    if (args && args->request_failed) {
+        buffer_appendf(&b, "[%s] system: request-error: %s\n", ts, ai_text ? ai_text : "");
+    } else buffer_appendf(&b, "[%s] AI: %s\n", ts, ai_text ? ai_text : "");
+    if (args && args->response_metadata && json_object_object_length(args->response_metadata)) {
+        buffer_appendf(&b, "[%s] system: openrouter-response: %s\n", ts,
+                       json_object_to_json_string_ext(args->response_metadata, JSON_C_TO_STRING_PLAIN));
+    }
+    append_shared_context_snapshot(&b, ts, previous_context, context_turns,
+                                   args && args->request_failed ? NULL : (user_text ? user_text : ""),
+                                   args && args->request_failed ? NULL : (ai_text ? ai_text : ""));
+    buffer_append(&b, "\n");
+
+    append_file_text(output_path, b.data);
+    free(ts);
+    free(b.data);
+}
+
+
+static char *session_title_clean(const char *raw, long max_words) {
+    if (!raw) return NULL;
+
+    TCBuffer b;
+    buffer_init(&b);
+    bool prev_space = false;
+    for (const char *p = raw; *p; p++) {
+        unsigned char uc = (unsigned char)*p;
+        char c = *p;
+        if (c == '\r' || c == '\n' || c == '\t') c = ' ';
+        if (iscntrl(uc)) continue;
+        if (isspace((unsigned char)c)) {
+            if (!prev_space && b.len > 0) buffer_append(&b, " ");
+            prev_space = true;
+        } else {
+            buffer_append_n(&b, &c, 1);
+            prev_space = false;
+        }
+    }
+
+    char *out = buffer_take(&b);
+    char *t = trim_in_place(out);
+    if (starts_with_casefold(t, "session title:")) t = trim_in_place(t + strlen("session title:"));
+    else if (starts_with_casefold(t, "title:")) t = trim_in_place(t + strlen("title:"));
+
+    while (*t == '"' || *t == '\'' || *t == '`' || *t == '*' || *t == '-') t++;
+    char *end = t + strlen(t);
+    while (end > t && (isspace((unsigned char)end[-1]) || end[-1] == '"' || end[-1] == '\'' || end[-1] == '`' || end[-1] == '*' || end[-1] == '.' || end[-1] == '-')) end--;
+    *end = '\0';
+
+    if (max_words <= 0) max_words = 8;
+    long words = 0;
+    bool in_word = false;
+    for (char *p = t; *p; p++) {
+        if (isspace((unsigned char)*p)) {
+            in_word = false;
+            continue;
+        }
+        if (!in_word) {
+            words++;
+            if (words > max_words) {
+                char *cut = p;
+                while (cut > t && !isspace((unsigned char)cut[-1])) cut--;
+                *cut = '\0';
+                break;
+            }
+            in_word = true;
+        }
+    }
+
+    size_t max_chars = 96;
+    if (strlen(t) > max_chars) {
+        char *cut = t + max_chars;
+        while (cut > t && !isspace((unsigned char)*cut)) cut--;
+        if (cut == t) cut = t + max_chars;
+        *cut = '\0';
+    }
+    t = trim_in_place(t);
+    if (!*t) {
+        free(out);
+        return NULL;
+    }
+    if (t != out) memmove(out, t, strlen(t) + 1);
+    return out;
+}
+
+/* Human titles are not subject to the AI title generator's word/length limits. */
+static char *session_title_normalize(const char *raw) {
+    TCBuffer out;
+    buffer_init(&out);
+    bool space = false;
+    for (const unsigned char *p = (const unsigned char *)(raw ? raw : ""); *p; p++) {
+        if (isspace(*p)) { space = out.len > 0; continue; }
+        if (iscntrl(*p)) continue;
+        if (space) buffer_append(&out, " ");
+        buffer_append_n(&out, (const char *)p, 1);
+        space = false;
+    }
+    if (out.len == 0) { free(out.data); return NULL; }
+    return buffer_take(&out);
+}
+
+static char *session_metadata_from_file(const char *path, const char *key) {
+    if (!path) return NULL;
+    FILE *f = fopen(path, "r");
+    if (!f) return NULL;
+    char *line = NULL, *result = NULL;
+    size_t capacity = 0, keylen = strlen(key);
+    while (getline(&line, &capacity, f) >= 0) {
+        char speaker[256];
+        const char *content = NULL;
+        if (parse_shared_log_header(line, speaker, sizeof(speaker), &content)) {
+            if (strcasecmp(speaker, "system") != 0) continue;
+        } else content = trim_in_place(line);
+        if (strncasecmp(content, key, keylen) == 0 && content[keylen] == ':') {
+            char *clean = session_title_normalize(content + keylen + 1);
+            if (clean) { free(result); result = clean; }
+        }
+    }
+    free(line);
+    fclose(f);
+    return result;
+}
+
+static char *session_title_from_file(const char *path) {
+    return session_metadata_from_file(path, "session-title");
+}
+
+static bool session_has_alias(const char *path, const char *alias) {
+    FILE *f = fopen(path, "r");
+    if (!f) return false;
+    char *line = NULL;
+    size_t capacity = 0;
+    bool found = false;
+    while (getline(&line, &capacity, f) >= 0) {
+        char speaker[256];
+        const char *content = NULL;
+        if (!parse_shared_log_header(line, speaker, sizeof(speaker), &content) || strcasecmp(speaker, "system") != 0) continue;
+        if (!starts_with(content, "session-alias: ")) continue;
+        char *value = session_title_normalize(content + strlen("session-alias: "));
+        found = value && strcasecmp(value, alias) == 0;
+        free(value);
+        if (found) break;
+    }
+    free(line);
+    fclose(f);
+    return found;
+}
+
+static bool session_has_title(const char *path) {
+    char *title = session_title_from_file(path);
+    bool ok = title && *title;
+    free(title);
+    return ok;
+}
+
+static bool write_session_title_metadata(const char *path, const char *title) {
+    char *clean = session_title_normalize(title);
+    if (!path || !clean) { free(clean); return false; }
+    TCBuffer b;
+    buffer_init(&b);
+    char *ts = now_hms();
+    buffer_appendf(&b, "[%s] system: session-title: %s\n", ts, clean);
+    bool ok = append_file_text_checked(path, b.data);
+    free(ts); free(clean); free(b.data);
+    return ok;
+}
+
+static bool write_session_rename_metadata(const char *path, const char *title, const char *old_path, const char *old_title) {
+    char *stem = basename_no_ext(old_path);
+    TCBuffer b;
+    buffer_init(&b);
+    char *ts = now_hms();
+    buffer_appendf(&b, "[%s] system: session-title: %s\n", ts, title);
+    if (*stem && strcmp(stem, title) != 0 && !session_has_alias(path, stem)) {
+        buffer_appendf(&b, "[%s] system: session-alias: %s\n", ts, stem);
+    }
+    if (old_title && *old_title && strcmp(old_title, title) != 0 && strcmp(old_title, stem) != 0 && !session_has_alias(path, old_title)) {
+        buffer_appendf(&b, "[%s] system: session-alias: %s\n", ts, old_title);
+    }
+    bool ok = append_file_text_checked(path, b.data);
+    free(stem); free(ts); free(b.data);
+    return ok;
+}
+
+static bool valid_session_id(const char *id) {
+    if (!id || strlen(id) != 32) return false;
+    for (const char *p = id; *p; p++) {
+        if (!(*p >= '0' && *p <= '9') && !(*p >= 'a' && *p <= 'f')) return false;
+    }
+    return true;
+}
+
+static char *ensure_session_id(const char *path) {
+    int lockfd = open(path, O_RDWR);
+    if (lockfd < 0 || flock(lockfd, LOCK_EX) != 0) die("could not lock session for its ID: %s", path);
+    struct stat info;
+    if (fstat(lockfd, &info) != 0) die("could not inspect session before appending its ID: %s", path);
+    if (S_ISREG(info.st_mode) && info.st_size > 0) {
+        char last;
+        if (pread(lockfd, &last, 1, info.st_size - 1) != 1) die("could not read the session's final byte: %s", path);
+        if (last != '\n') append_file_text(path, "\n");
+    }
+    char *id = session_metadata_from_file(path, "session-id");
+    if (valid_session_id(id)) { flock(lockfd, LOCK_UN); close(lockfd); return id; }
+    free(id);
+    unsigned char bytes[16];
+    FILE *random = fopen("/dev/urandom", "rb");
+    if (!random) die("could not open the system random source for a session ID");
+    size_t count = fread(bytes, 1, sizeof(bytes), random);
+    fclose(random);
+    if (count != sizeof(bytes)) die("could not read a random session ID");
+    id = xcalloc(33, 1);
+    for (size_t i = 0; i < sizeof(bytes); i++) snprintf(id + i * 2, 3, "%02x", bytes[i]);
+    TCBuffer line;
+    buffer_init(&line);
+    char *ts = now_hms();
+    buffer_appendf(&line, "[%s] system: session-id: %s\n", ts, id);
+    append_file_text(path, line.data);
+    free(ts); free(line.data);
+    flock(lockfd, LOCK_UN);
+    close(lockfd);
+    return id;
+}
+
+static void bind_session_id(TCArgs *args, const char *path) {
+    free(args->session_id);
+    args->session_id = ensure_session_id(path);
+}
+
+static char *safe_session_slug(const char *title) {
+    TCBuffer slug;
+    buffer_init(&slug);
+    bool separator = false;
+    for (const unsigned char *p = (const unsigned char *)title; p && *p && slug.len < 80; p++) {
+        if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+            (*p >= '0' && *p <= '9') || *p == '_' || *p == '.' || *p == '-') {
+            if (separator && slug.len && slug.len < 79) buffer_append(&slug, "-");
+            buffer_append_n(&slug, (const char *)p, 1);
+            separator = false;
+        } else separator = slug.len > 0;
+    }
+    while (slug.len && (slug.data[slug.len - 1] == '.' || slug.data[slug.len - 1] == '-')) slug.data[--slug.len] = '\0';
+    char *start = slug.data;
+    while (*start == '.' || *start == '-') start++;
+    char *out = xstrdup(*start ? start : "session");
+    free(slug.data);
+    return out;
+}
+
+static bool is_managed_session_path(const TCConfig *cfg, const char *path) {
+    char actual[PATH_MAX], directory[PATH_MAX];
+    if (!realpath(path, actual) || !realpath(cfg->session_dir, directory)) return false;
+    size_t len = strlen(directory);
+    return strncmp(actual, directory, len) == 0 && actual[len] == '/' && !strchr(actual + len + 1, '/');
+}
+
+/* Hard-link plus unlink implements a no-clobber move on POSIX file systems.
+ * A crash between the two leaves two links to the same complete transcript;
+ * no existing destination is overwritten, and concurrent appends are retained. */
+static char *rename_session_file(const char *path, const char *title) {
+    char *clean = session_title_normalize(title);
+    struct stat source;
+    if (!clean) { fprintf(stderr, "session name must contain visible text\n"); return NULL; }
+    if (lstat(path, &source) != 0 || !S_ISREG(source.st_mode)) {
+        fprintf(stderr, "cannot rename session: expected a regular file: %s\n", path);
+        free(clean); return NULL;
+    }
+    char *id = ensure_session_id(path);
+    char *old_title = session_title_from_file(path);
+    char *slug = safe_session_slug(clean);
+    char *directory = xstrdup(path);
+    char *slash = strrchr(directory, '/');
+    if (slash) { if (slash == directory) slash[1] = '\0'; else *slash = '\0'; }
+    else { free(directory); directory = xstrdup("."); }
+    char *result = NULL;
+    for (int i = 0; i < 10000; i++) {
+        char leaf[128];
+        if (i == 0) snprintf(leaf, sizeof(leaf), "%s--%.12s.log", slug, id);
+        else snprintf(leaf, sizeof(leaf), "%s--%.12s-%03d.log", slug, id, i);
+        char *candidate = path_join2(directory, leaf);
+        struct stat target;
+        if (lstat(candidate, &target) == 0 && target.st_dev == source.st_dev && target.st_ino == source.st_ino) {
+            if (write_session_rename_metadata(path, clean, path, old_title)) result = xstrdup(path);
+            free(candidate); break;
+        }
+        if (link(path, candidate) == 0) {
+            if (!write_session_rename_metadata(candidate, clean, path, old_title)) { unlink(candidate); free(candidate); break; }
+            if (unlink(path) != 0) {
+                int saved_errno = errno;
+                unlink(candidate);
+                fprintf(stderr, "session title saved, but could not remove old filename %s: %s\n", path, strerror(saved_errno));
+                free(candidate); break;
+            }
+            result = candidate;
+            break;
+        }
+        int saved_errno = errno;
+        free(candidate);
+        if (saved_errno != EEXIST) {
+            fprintf(stderr, "could not rename session %s: %s\n", path, strerror(saved_errno));
+            break;
+        }
+    }
+    free(id); free(slug); free(directory); free(clean); free(old_title);
+    return result;
+}
+
+static void emit_session_path(const char *path) {
+    char absolute[PATH_MAX];
+    if (realpath(path, absolute)) fprintf(stderr, "session: %s\n", absolute);
+    else fprintf(stderr, "session: %s\n", path);
+}
+
+static void maybe_prompt_session_name(const TCConfig *cfg, char **pathp) {
+    if (!cfg->prompt_session_name || !isatty(STDIN_FILENO) || !isatty(STDERR_FILENO) || session_has_title(*pathp)) return;
+    fprintf(stderr, "This session is unnamed. Name it now (renames the log; Enter skips): ");
+    fflush(stderr);
+    char *line = NULL;
+    size_t capacity = 0;
+    if (getline(&line, &capacity, stdin) >= 0) {
+        char *name = session_title_normalize(line);
+        if (name) {
+            char *renamed = rename_session_file(*pathp, name);
+            if (renamed) { free(*pathp); *pathp = renamed; emit_session_path(*pathp); }
+            free(name);
+        }
+    }
+    free(line);
+}
+
+static void append_title_excerpt(TCBuffer *b, const char *label, const char *text, size_t max_chars) {
+    char *safe = snapshot_safe_line(text ? text : "");
+    if (strlen(safe) > max_chars) safe[max_chars] = '\0';
+    buffer_appendf(b, "%s: %s\n", label, safe);
+    free(safe);
+}
+
+static char *demo_session_title(const char *user_text, long max_words) {
+    char *clean = session_title_clean(user_text, max_words);
+    if (clean) return clean;
+    return xstrdup("Demo Session");
+}
+
+static char *generate_session_title(const TCConfig *cfg, const char *user_text, const char *ai_text, bool demo) {
+    if (!cfg->session_auto_title) return NULL;
+    if (demo) return demo_session_title(user_text, cfg->session_title_max_words);
+    if (!cfg->api_key || !cfg->session_title_model || !*cfg->session_title_model) return NULL;
+
+    TCBuffer prompt;
+    buffer_init(&prompt);
+    buffer_appendf(&prompt, "Generate a concise topical title for this ttychatter session. Reply with only the title, no quotes, no punctuation-only decoration, no explanation, maximum %ld words.\n\n", cfg->session_title_max_words > 0 ? cfg->session_title_max_words : 8);
+    append_title_excerpt(&prompt, "User", user_text, 2000);
+    append_title_excerpt(&prompt, "Assistant", ai_text, 2000);
+
+    TCMessageList ctx = {0};
+    TCArgs title_args;
+    memset(&title_args, 0, sizeof(title_args));
+    title_args.model_type = xstrdup("all");
+    title_args.stream_set = true;
+    title_args.stream = false;
+    title_args.web_set = true;
+    title_args.web_search = false;
+    title_args.status_set = true;
+    title_args.status_updates = false;
+    title_args.speak_set = true;
+    title_args.speak = false;
+    char *reply = openrouter_chat(cfg, cfg->session_title_model, prompt.data, &ctx, &title_args);
+    free(prompt.data);
+    free(title_args.model_type);
+    if (title_args.response_metadata) json_object_put(title_args.response_metadata);
+    msglist_free(&ctx);
+
+    if (!reply || title_args.request_failed) { free(reply); return NULL; }
+    if (starts_with(reply, "OpenRouter HTTP") || starts_with(reply, "[No ")) {
+        free(reply);
+        return NULL;
+    }
+    char *title = session_title_clean(reply, cfg->session_title_max_words);
+    free(reply);
+    return title;
+}
+
+static void maybe_generate_session_title(const TCConfig *cfg, const TCArgs *args, char **output_pathp,
+                                         const char *user_text, const char *ai_text) {
+    if (!cfg->session_auto_title || !output_pathp || !*output_pathp || (args && args->request_failed)) return;
+    if (session_has_title(*output_pathp)) return;
+    char *title = generate_session_title(cfg, user_text, ai_text, args && args->demo);
+    if (title && *title) {
+        if ((!args || !args->preserve_session_path) && is_managed_session_path(cfg, *output_pathp)) {
+            char *renamed = rename_session_file(*output_pathp, title);
+            if (renamed) { free(*output_pathp); *output_pathp = renamed; }
+        } else write_session_title_metadata(*output_pathp, title);
+    }
+    free(title);
+}
+
+
+/* ------------------------------------------------------------------------- */
+/* Config inspection and model favorites                                     */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * These helper commands keep the C edition useful as a real Unix tool rather
+ * than merely a single-shot network wrapper.  They also preserve feature parity
+ * with the ncurses and shell clients where that parity makes sense on a plain
+ * command line: users can inspect config, set/unset config keys, and maintain a
+ * simple model favorites file.  The favorites file is intentionally just one
+ * model ID per line so it remains editable with vi, ed, awk, sed, or any other
+ * traditional Unix text tool.
+ */
+static void print_config_summary(const TCConfig *cfg) {
+    printf("config_file=%s\n", cfg->config_file);
+    printf("model=%s\n", cfg->model);
+    printf("session_auto_title=%s\n", cfg->session_auto_title ? "1" : "0");
+    printf("prompt_session_name=%s\n", cfg->prompt_session_name ? "1" : "0");
+    printf("web_search=%s\n", cfg->web_search ? "1" : "0");
+    printf("web_search_engine=%s\n", cfg->web_search_engine);
+    printf("web_search_max_results=%ld\n", cfg->web_search_max_results);
+    printf("web_search_max_uses=%ld\n", cfg->web_search_max_uses);
+    printf("session_title_model=%s\n", cfg->session_title_model);
+    printf("session_title_max_words=%ld\n", cfg->session_title_max_words);
+    printf("model_cache_file=%s\n", cfg->model_cache_file);
+    printf("model_favorites_file=%s\n", cfg->model_favorites_file);
+    printf("session_dir=%s\n", cfg->session_dir);
+    printf("attachment_dir=%s\n", cfg->attachment_dir);
+    printf("api_key=%s\n", cfg->api_key ? "loaded" : "missing");
+    printf("api_key_gpg_file=%s\n", cfg->api_key_gpg_file);
+    printf("context_turns=%ld\n", cfg->context_turns);
+    printf("code_attachment_min_lines=%ld\n", cfg->code_attachment_min_lines);
+    printf("max_attachment_bytes=%ld\n", cfg->max_attachment_bytes);
+    printf("theme=%s\n", cfg->theme);
+    printf("send_input=%s\n", cfg->send_input);
+    printf("editor=%s\n", cfg->editor_cmd);
+    printf("voice_input_cmd=%s\n", cfg->voice_input_cmd);
+    printf("voice_output_cmd=%s\n", cfg->voice_output_cmd);
+    printf("model_test_prompt=%s\n", cfg->model_test_prompt);
+    printf("model_sort_order=%s\n", cfg->model_sort_order);
+    printf("model_type_filter=%s\n", cfg->model_type_filter);
+    printf("model_filter_generate_content=%s\n", cfg->model_filter_generate_content ? "1" : "0");
+    printf("model_filter_require_tokens=%s\n", cfg->model_filter_require_tokens ? "1" : "0");
+    printf("model_filter_hide_preview=%s\n", cfg->model_filter_hide_preview ? "1" : "0");
+    printf("model_min_input_tokens=%ld\n", cfg->model_min_input_tokens);
+    printf("model_min_output_tokens=%ld\n", cfg->model_min_output_tokens);
+    printf("confirm_live_send=%s\n", cfg->confirm_live_send ? "1" : "0");
+    printf("startup_notice=%s\n", cfg->startup_notice ? "1" : "0");
+    printf("stream=%s\n", cfg->stream ? "1" : "0");
+    printf("ai_file_download_mode=%s\n", cfg->ai_file_download_mode ? cfg->ai_file_download_mode : "ask");
+    printf("status_updates=%s\n", cfg->status_updates ? "1" : "0");
+    printf("voice_output=%s\n", cfg->voice_output ? "1" : "0");
+    printf("demo_mode=%s\n", cfg->demo_mode_default ? "1" : "0");
+    printf("loopback=%s\n", cfg->loopback_default ? "1" : "0");
+}
+
+static bool favorite_contains(const TCConfig *cfg, const char *model) {
+    if (!cfg->model_favorites_file || !file_exists(cfg->model_favorites_file)) return false;
+    FILE *f = fopen(cfg->model_favorites_file, "r");
+    if (!f) return false;
+    char line[4096];
+    bool found = false;
+    while (fgets(line, sizeof(line), f)) {
+        char *s = trim_in_place(line);
+        if (strcmp(s, model) == 0) { found = true; break; }
+    }
+    fclose(f);
+    return found;
+}
+
+static int list_favorites(const TCConfig *cfg) {
+    if (!cfg->model_favorites_file || !file_exists(cfg->model_favorites_file)) {
+        fprintf(stderr, "No favorites file yet: %s\n", cfg->model_favorites_file ? cfg->model_favorites_file : "(unset)");
+        return 0;
+    }
+    size_t len = 0;
+    char *text = read_file(cfg->model_favorites_file, &len);
+    printf("%s", text);
+    free(text);
+    return 0;
+}
+
+static int add_favorite(const TCConfig *cfg, const char *model) {
+    if (!model || !*model) return 1;
+    if (favorite_contains(cfg, model)) {
+        fprintf(stderr, "favorite already present: %s\n", model);
+        return 0;
+    }
+    char *dircopy = xstrdup(cfg->model_favorites_file);
+    char *slash = strrchr(dircopy, '/');
+    if (slash) { *slash = '\0'; mkdir_p(dircopy); }
+    free(dircopy);
+    TCBuffer b; buffer_init(&b);
+    buffer_appendf(&b, "%s\n", model);
+    append_file_text(cfg->model_favorites_file, b.data);
+    free(b.data);
+    fprintf(stderr, "added favorite: %s\n", model);
+    return 0;
+}
+
+static int remove_favorite(const TCConfig *cfg, const char *model) {
+    if (!model || !*model || !file_exists(cfg->model_favorites_file)) return 0;
+    FILE *f = fopen(cfg->model_favorites_file, "r");
+    if (!f) return 1;
+    TCBuffer out; buffer_init(&out);
+    char line[4096];
+    while (fgets(line, sizeof(line), f)) {
+        char copy[4096];
+        snprintf(copy, sizeof(copy), "%s", line);
+        char *s = trim_in_place(copy);
+        if (strcmp(s, model) != 0) buffer_append(&out, line);
+    }
+    fclose(f);
+    write_file_mode(cfg->model_favorites_file, out.data, 0600);
+    free(out.data);
+    fprintf(stderr, "removed favorite: %s\n", model);
+    return 0;
+}
+
+/* ------------------------------------------------------------------------- */
+/* API key commands                                                          */
+/* ------------------------------------------------------------------------- */
+
+static char *prompt_secret(const char *prompt) {
+    fprintf(stderr, "%s", prompt);
+    fflush(stderr);
+    struct termios oldt, newt;
+    bool tty = isatty(STDIN_FILENO) && tcgetattr(STDIN_FILENO, &oldt) == 0;
+    if (tty) {
+        newt = oldt;
+        newt.c_lflag &= ~(ECHO);
+        tcsetattr(STDIN_FILENO, TCSANOW, &newt);
+    }
+    char buf[8192];
+    if (!fgets(buf, sizeof(buf), stdin)) buf[0] = '\0';
+    if (tty) {
+        tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
+        fprintf(stderr, "\n");
+    }
+    return xstrdup(trim_in_place(buf));
+}
+
+static int cmd_set_api_key(TCConfig *cfg, bool use_gpg) {
+    char *key = prompt_secret("Paste OpenRouter API key: ");
+    if (!key || !*key) {
+        free(key);
+        fprintf(stderr, "No key entered.\n");
+        return 1;
+    }
+    if (use_gpg) {
+        if (!command_exists("gpg")) {
+            fprintf(stderr, "gpg not found. Install gpg or save plaintext.\n");
+            free(key);
+            return 1;
+        }
+        if (!gpg_encrypt_text_to_file(key, cfg->api_key_gpg_file)) {
+            fprintf(stderr, "GPG encryption failed.\n");
+            free(key);
+            return 1;
+        }
+        config_write_key_value(cfg, "API_KEY_GPG_FILE", cfg->api_key_gpg_file);
+        config_remove_key(cfg, "OPENROUTER_API_KEY");
+        config_remove_key(cfg, "TTYCHATTER_API_KEY");
+        config_remove_key(cfg, "API_KEY");
+        fprintf(stderr, "Encrypted API key saved to %s\n", cfg->api_key_gpg_file);
+    } else {
+        fprintf(stderr, "WARNING: saving API key in plaintext config.\n");
+        config_write_key_value(cfg, "OPENROUTER_API_KEY", key);
+        fprintf(stderr, "Plaintext API key saved to %s\n", cfg->config_file);
+    }
+    free(key);
+    return 0;
+}
+
+static int cmd_forget_api_key(TCConfig *cfg) {
+    config_remove_key(cfg, "OPENROUTER_API_KEY");
+    config_remove_key(cfg, "TTYCHATTER_API_KEY");
+    config_remove_key(cfg, "API_KEY");
+    if (cfg->api_key_gpg_file && file_exists(cfg->api_key_gpg_file)) unlink(cfg->api_key_gpg_file);
+    fprintf(stderr, "Removed stored API key entries.\n");
+    return 0;
+}
+
+/* ------------------------------------------------------------------------- */
+/* CLI display helpers                                                       */
+/* ------------------------------------------------------------------------- */
+
+static void print_help(void) {
+    printf("%s %s\n", TC_PROGRAM, TC_VERSION);
+    printf("\n");
+    printf("Usage:\n");
+    printf("  ttychatter\n");
+    printf("  ttychatter [options] input.txt [output.log]\n");
+    printf("  ttychatter --prompt TEXT [--session SESSION|--output output.log]\n");
+    printf("  ttychatter --input input.txt [--session SESSION|--output output.log]\n");
+    printf("  ttychatter -i|--interactive|--chat [SESSION|./session.log]\n");
+    printf("  ttychatter --resume SESSION\n");
+    printf("  ttychatter --new\n");
+    printf("  ttychatter --set-api-key [--gpg]\n");
+    printf("  ttychatter --forget-api-key\n");
+    printf("  ttychatter --models [filters]\n");
+    printf("  ttychatter --update-models\n");
+    printf("  ttychatter --routers\n");
+    printf("  ttychatter --select-model\n");
+    printf("  ttychatter --test-model MODEL [--save]\n");
+    printf("  ttychatter --favorites | --favorite-model MODEL | --unfavorite-model MODEL\n");
+    printf("  ttychatter --list | --rename-session SESSION TITLE\n");
+    printf("  ttychatter --turns SESSION | --branch SESSION TURN | --edit-turn SESSION TURN\n");
+    printf("  ttychatter --export SESSION [--format markdown|text|json] [--output FILE]\n");
+    printf("  ttychatter --show-memory SESSION | --clear-memory SESSION | --edit-memory SESSION\n");
+    printf("  ttychatter --editor-prompt [output.log]\n");
+    printf("  ttychatter --search TEXT [--all-sessions]\n");
+    printf("  ttychatter --search-sessions TEXT\n");
+    printf("  ttychatter --config | --set KEY=VALUE | --unset KEY\n");
+    printf("  ttychatter --doctor | --credits | --version | --help\n");
+    printf("\nGeneral:\n");
+    printf("  -h, --help                   show this help\n");
+    printf("  -v, --version                show version\n");
+    printf("      --demo                   use local demo models/responses; no network/API key\n");
+    printf("      --doctor                 run local diagnostics\n");
+    printf("      --credits                show project notice\n");
+    printf("      --config                 print config summary\n");
+    printf("\nChat and sessions:\n");
+    printf("  -m, --model MODEL            model/router to use (default from config)\n");
+    printf("  -a, --attach FILE            attach file; repeatable\n");
+    printf("      --stream / --no-stream   print assistant output as it arrives\n");
+    printf("      --web / --no-web         enable/disable OpenRouter server web search\n");
+    printf("      --web-engine ENGINE     auto, native, exa, parallel, perplexity, firecrawl\n");
+    printf("      --web-max-results N     web results per search (0..25; 0=provider default)\n");
+    printf("      --web-max-uses N        web search rounds (0..25; 0=no ttychatter cap)\n");
+    printf("      --ai-download MODE     AI file receipt: ask, auto, metadata, off\n");
+    printf("      --status / --no-status   print local progress/status updates to stderr\n");
+    printf("      --progress / --no-progress alias for --status / --no-status\n");
+    printf("      --voice-input FILE       transcribe FILE with VOICE_INPUT_CMD and send\n");
+    printf("      --transcribe FILE        alias for --voice-input FILE\n");
+    printf("      --speak / --no-speak     run VOICE_OUTPUT_CMD/TTS_CMD for replies\n");
+    printf("  -l, --loopback               also print AI output to stdout\n");
+    printf("      --loopback-file FILE     mirror clean AI output to FILE\n");
+    printf("  -o, --output FILE            explicit output/session log for batch mode\n");
+    printf("  -s, --session SESSION        named session under SESSION_DIR\n");
+    printf("  -p, --prompt TEXT            send TEXT instead of reading an input file\n");
+    printf("      --input FILE             input file; use - for stdin\n");
+    printf("  -n, --new                    start a new interactive timestamped session\n");
+    printf("  -i, --interactive            line-oriented chat loop with colon commands\n");
+    printf("      --chat                   alias for --interactive\n");
+    printf("      --resume SESSION         resume named or explicit interactive session\n");
+    printf("      --list                   list session logs with friendly titles\n");
+    printf("      --rename-session SESSION TITLE rename the log and save its title\n");
+    printf("      --turns SESSION          list message numbers in a session\n");
+    printf("      --branch SESSION TURN    create branch after TURN; also accepts SESSION:TURN\n");
+    printf("      --edit-turn SESSION TURN edit user TURN; also accepts SESSION:TURN\n");
+    printf("      --export SESSION         export a session as markdown/text/json\n");
+    printf("      --format FORMAT          export format: markdown, text, or json\n");
+    printf("      --show-memory SESSION    print reconstructed context/memory\n");
+    printf("      --clear-memory SESSION   append a memory-clear marker\n");
+    printf("      --edit-memory SESSION    edit reconstructed context in editor\n");
+    printf("      --editor-prompt [LOG]    compose one message in editor and send it\n");
+    printf("      --search TEXT            filter --models, otherwise search session logs\n");
+    printf("      --search-sessions TEXT   search all session logs\n");
+    printf("      --all-sessions           with --search, search all sessions\n");
+    printf("      --yes                    confirm live send when CONFIRM_LIVE_SEND=1\n");
+    printf("\nModels:\n");
+    printf("      --update-models          refresh model cache from OpenRouter\n");
+    printf("      --models                 list cached models\n");
+    printf("      --routers                shorthand for --models --model-type routers\n");
+    printf("      --select-model           numbered cached model selector\n");
+    printf("      --autoscan-model         removed compatibility flag; use --models/--select-model\n");
+    printf("      --test-model MODEL       send a test prompt to MODEL\n");
+    printf("      --save                   save successful --test-model result as MODEL\n");
+    printf("      --model-type TYPE        all, routers, fixed, free, auto\n");
+    printf("      --sort KEY               name, context, tokens, type, favorites\n");
+    printf("      --min-input-tokens N     filter by input/context limit\n");
+    printf("      --min-output-tokens N    filter by output-token limit\n");
+    printf("      --hide-preview           hide preview/experimental-looking model IDs\n");
+    printf("      --show-preview           allow preview/experimental-looking model IDs\n");
+    printf("      --require-tokens         require known context/output token limits\n");
+    printf("      --allow-missing-tokens   allow rows with unknown token limits\n");
+    printf("      --all                    disable model-list filters\n");
+    printf("      --favorites-only         show only favorite models in --models\n");
+    printf("      --favorites              list favorite models\n");
+    printf("      --favorite-model MODEL   add favorite model\n");
+    printf("      --unfavorite-model MODEL remove favorite model\n");
+    printf("      --unbookmark-model MODEL alias for --unfavorite-model\n");
+    printf("\nAPI key and config writes:\n");
+    printf("      --set-api-key            save API key\n");
+    printf("      --gpg                    encrypt API key with gpg when used with --set-api-key\n");
+    printf("      --forget-api-key         remove stored plaintext/encrypted API key\n");
+    printf("      --set KEY=VALUE          write a config key\n");
+    printf("      --unset KEY              remove a config key\n");
+    printf("      --send-input VALUE       write SEND_INPUT config compatibility key\n");
+    printf("      --theme VALUE            write THEME config compatibility key\n");
+    printf("      --code-attachment-min-lines N write CODE_ATTACHMENT_MIN_LINES\n");
+    printf("\nSession addressing:\n");
+    printf("  With no arguments on a terminal, ttychatter starts interactive mode.\n");
+    printf("  input.txt output.log uses output.log exactly.\n");
+    printf("  input.txt alone auto-saves to a timestamped log in SESSION_DIR.\n");
+    printf("  --prompt TEXT and stdin input also auto-save unless --output/--session is used.\n");
+    printf("  Bare SESSION names resolve to SESSION_DIR/SESSION.log.\n");
+    printf("  SESSION values containing '/' are explicit paths. Use ./name.log for cwd.\n");
+    printf("  SESSION_AUTO_TITLE=1 enables optional AI-generated titles and named log files.\n");
+    printf("  PROMPT_SESSION_NAME=1 asks for names in interactive terminals (default).\n");
+    printf("  WEB_SEARCH=0 is the default; --web lets the model search (extra API charges may apply).\n");
+    printf("  STREAM=1 enables streaming by default; STATUS_UPDATES=1 enables local progress notes.\n");
+    printf("  AI_FILE_DOWNLOAD_MODE=ask controls provider-returned file attachments.\n");
+    printf("  VOICE_INPUT_CMD and VOICE_OUTPUT_CMD/TTS_CMD provide external audio hooks.\n");
+    printf("  Default paths honor XDG_CONFIG_HOME, XDG_DATA_HOME, and XDG_CACHE_HOME.\n");
+}
+
+static void print_version(void) {
+    printf("%s %s\n", TC_PROGRAM, TC_VERSION);
+}
+
+static int doctor(const TCConfig *cfg) {
+    printf("ttychatter doctor\n");
+    printf("config:      %s\n", cfg->config_file);
+    printf("api key:     %s\n", cfg->api_key ? "loaded" : "missing");
+    printf("gpg:         %s\n", command_exists("gpg") ? "found" : "not found");
+    printf("gpg file:    %s%s\n", cfg->api_key_gpg_file, file_exists(cfg->api_key_gpg_file) ? " (present)" : "");
+    printf("model:       %s\n", cfg->model);
+    printf("cache:       %s%s\n", cfg->model_cache_file, file_exists(cfg->model_cache_file) ? " (present)" : "");
+    printf("sessions:    %s\n", cfg->session_dir);
+    printf("title-gen:   %s (%s)\n", cfg->session_auto_title ? "enabled" : "disabled", cfg->session_title_model);
+    printf("attachments: %s\n", cfg->attachment_dir);
+    printf("streaming:   %s\n", cfg->stream ? "enabled" : "disabled");
+    printf("web search:  %s (%s; results=%ld, uses=%ld)\n", cfg->web_search ? "enabled" : "disabled", cfg->web_search_engine, cfg->web_search_max_results, cfg->web_search_max_uses);
+    printf("name prompt: %s\n", cfg->prompt_session_name ? "enabled" : "disabled");
+    printf("AI files:    %s\n", cfg->ai_file_download_mode ? cfg->ai_file_download_mode : "ask");
+    printf("status:      %s\n", cfg->status_updates ? "enabled" : "disabled");
+    printf("voice in:    %s\n", (cfg->voice_input_cmd && *cfg->voice_input_cmd) ? cfg->voice_input_cmd : "not configured");
+    printf("voice out:   %s%s\n", cfg->voice_output ? "enabled " : "disabled ", (cfg->voice_output_cmd && *cfg->voice_output_cmd) ? cfg->voice_output_cmd : "(no command)");
+    printf("libcurl:     %s\n", curl_version());
+    printf("theme:       %s\n", cfg->theme);
+    printf("confirm:     %s\n", cfg->confirm_live_send ? "enabled" : "disabled");
+    printf("startup:     %s\n", cfg->startup_notice ? "enabled" : "disabled");
+    printf("loopback:    %s\n", cfg->loopback_default ? "enabled" : "disabled");
+    printf("sort:        %s\n", cfg->model_sort_order);
+    return cfg->api_key ? 0 : 1;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Main argument parser and command dispatch                                 */
+/* ------------------------------------------------------------------------- */
+
+static void args_init(TCArgs *a) {
+    memset(a, 0, sizeof(*a));
+    a->model_type = xstrdup("all");
+    a->model_sort = NULL;
+}
+
+static void args_add_attachment(TCArgs *a, const char *path) {
+    a->attachments = realloc(a->attachments, sizeof(char *) * (a->attachment_count + 1));
+    if (!a->attachments) die("out of memory");
+    a->attachments[a->attachment_count++] = xstrdup(path);
+}
+
+
+static bool parse_session_turn_value(const char *arg, char **session_out, long *turn_out) {
+    if (!arg || !*arg) return false;
+    const char *colon = strrchr(arg, ':');
+    if (!colon || !colon[1]) return false;
+    for (const char *p = colon + 1; *p; p++) if (!isdigit((unsigned char)*p)) return false;
+    size_t slen = (size_t)(colon - arg);
+    if (slen == 0) return false;
+    char *session = xcalloc(slen + 1, 1);
+    memcpy(session, arg, slen);
+    *session_out = session;
+    *turn_out = atol(colon + 1);
+    return true;
+}
+
+static long parse_turn_operand(const char *s) {
+    if (!s || !*s) return -1;
+    for (const char *p = s; *p; p++) if (!isdigit((unsigned char)*p)) return -1;
+    return atol(s);
+}
+
+static int parse_args(int argc, char **argv, TCArgs *args) {
+    static struct option longopts[] = {
+        {"help", no_argument, 0, 'h'},
+        {"version", no_argument, 0, 'v'},
+        {"model", required_argument, 0, 'm'},
+        {"attach", required_argument, 0, 'a'},
+        {"loopback", no_argument, 0, 'l'},
+        {"output", required_argument, 0, 'o'},
+        {"session", required_argument, 0, 's'},
+        {"prompt", required_argument, 0, 'p'},
+        {"new", no_argument, 0, 'n'},
+        {"input", required_argument, 0, 1044},
+        {"set-api-key", no_argument, 0, 1000},
+        {"gpg", no_argument, 0, 1001},
+        {"forget-api-key", no_argument, 0, 1002},
+        {"models", no_argument, 0, 1003},
+        {"routers", no_argument, 0, 1039},
+        {"update-models", no_argument, 0, 1004},
+        {"search", required_argument, 0, 1005},
+        {"model-type", required_argument, 0, 1006},
+        {"test-model", required_argument, 0, 1007},
+        {"doctor", no_argument, 0, 1008},
+        {"demo", no_argument, 0, 1009},
+        {"interactive", no_argument, 0, 'i'},
+        {"chat", no_argument, 0, 'i'},
+        {"config", no_argument, 0, 1010},
+        {"set", required_argument, 0, 1011},
+        {"unset", required_argument, 0, 1012},
+        {"favorites", no_argument, 0, 1013},
+        {"favorite-model", required_argument, 0, 1014},
+        {"unfavorite-model", required_argument, 0, 1015},
+        {"unbookmark-model", required_argument, 0, 1015},
+        {"loopback-file", required_argument, 0, 1016},
+        {"sort", required_argument, 0, 1017},
+        {"favorites-only", no_argument, 0, 1018},
+        {"save", no_argument, 0, 1040},
+        {"yes", no_argument, 0, 1019},
+        {"list", no_argument, 0, 1020},
+        {"rename-session", required_argument, 0, 1021},
+        {"show-memory", required_argument, 0, 1022},
+        {"clear-memory", required_argument, 0, 1023},
+        {"edit-memory", required_argument, 0, 1024},
+        {"editor-prompt", optional_argument, 0, 1025},
+        {"credits", no_argument, 0, 1026},
+        {"all", no_argument, 0, 1027},
+        {"search-sessions", required_argument, 0, 1038},
+        {"all-sessions", no_argument, 0, 1028},
+        {"select-model", no_argument, 0, 1029},
+        {"min-input-tokens", required_argument, 0, 1030},
+        {"min-output-tokens", required_argument, 0, 1031},
+        {"hide-preview", no_argument, 0, 1032},
+        {"show-preview", no_argument, 0, 1033},
+        {"allow-missing-tokens", no_argument, 0, 1041},
+        {"require-tokens", no_argument, 0, 1034},
+        {"send-input", required_argument, 0, 1035},
+        {"resume", required_argument, 0, 1042},
+        {"autoscan-model", no_argument, 0, 1043},
+        {"theme", required_argument, 0, 1036},
+        {"code-attachment-min-lines", required_argument, 0, 1037},
+        {"stream", no_argument, 0, 1045},
+        {"no-stream", no_argument, 0, 1046},
+        {"web", no_argument, 0, 1090},
+        {"no-web", no_argument, 0, 1091},
+        {"web-engine", required_argument, 0, 1092},
+        {"web-max-results", required_argument, 0, 1093},
+        {"web-max-uses", required_argument, 0, 1094},
+        {"ai-download", required_argument, 0, 1088},
+        {"status", no_argument, 0, 1047},
+        {"progress", no_argument, 0, 1047},
+        {"no-status", no_argument, 0, 1048},
+        {"no-progress", no_argument, 0, 1048},
+        {"voice-input", required_argument, 0, 1049},
+        {"transcribe", required_argument, 0, 1049},
+        {"speak", no_argument, 0, 1050},
+        {"no-speak", no_argument, 0, 1051},
+        {"turns", required_argument, 0, 1052},
+        {"branch", required_argument, 0, 1053},
+        {"edit-turn", required_argument, 0, 1054},
+        {"export", required_argument, 0, 1055},
+        {"format", required_argument, 0, 1056},
+        {0,0,0,0}
+    };
+    int c;
+    while ((c = getopt_long(argc, argv, "hvim:a:lo:s:p:n", longopts, NULL)) != -1) {
+        switch (c) {
+            case 'h': args->show_help = true; break;
+            case 'v': args->show_version = true; break;
+            case 'i': args->interactive = true; break;
+            case 'm': args->model_override = xstrdup(optarg); break;
+            case 'a': args_add_attachment(args, optarg); break;
+            case 'l': args->loopback = true; break;
+            case 'o': args->output_path = xstrdup(optarg); break;
+            case 's': args->session_arg = xstrdup(optarg); break;
+            case 'p': args->prompt_text = xstrdup(optarg); break;
+            case 'n': args->new_session_cmd = true; args->interactive = true; break;
+            case 1044: args->input_path = xstrdup(optarg); break;
+            case 1000: args->set_api_key = true; break;
+            case 1001: args->set_api_key_gpg = true; break;
+            case 1002: args->forget_api_key = true; break;
+            case 1003: args->list_models = true; break;
+            case 1039: args->list_models = true; free(args->model_type); args->model_type = xstrdup("routers"); break;
+            case 1004: args->update_models = true; break;
+            case 1005: args->search = xstrdup(optarg); break;
+            case 1006: free(args->model_type); args->model_type = xstrdup(optarg); break;
+            case 1007: args->test_model = true; args->test_model_id = xstrdup(optarg); break;
+            case 1008: args->doctor = true; break;
+            case 1009: args->demo = true; break;
+            case 1010: args->show_config = true; break;
+            case 1011: {
+                args->config_set_cmd = true;
+                char *eq = strchr(optarg, '=');
+                if (eq) {
+                    size_t klen = (size_t)(eq - optarg);
+                    args->config_key = xcalloc(klen + 1, 1);
+                    memcpy(args->config_key, optarg, klen);
+                    args->config_value = xstrdup(eq + 1);
+                } else {
+                    args->config_key = xstrdup(optarg);
+                }
+                break;
+            }
+            case 1012: args->config_unset_cmd = true; args->config_key = xstrdup(optarg); break;
+            case 1013: args->favorites = true; break;
+            case 1014: args->favorite_model = true; args->test_model_id = xstrdup(optarg); break;
+            case 1015: args->unfavorite_model = true; args->test_model_id = xstrdup(optarg); break;
+            case 1016: args->loopback_file = xstrdup(optarg); break;
+            case 1017: args->model_sort = xstrdup(optarg); break;
+            case 1018: args->favorites_only = true; break;
+            case 1040: args->save = true; break;
+            case 1019: args->yes = true; break;
+            case 1020: args->list_sessions_cmd = true; break;
+            case 1021:
+                args->rename_session_cmd = true;
+                args->rename_old = xstrdup(optarg);
+                if (optind < argc && argv[optind][0] != '-') {
+                    TCBuffer title;
+                    buffer_init(&title);
+                    while (optind < argc && argv[optind][0] != '-') {
+                        if (title.len > 0) buffer_append(&title, " ");
+                        buffer_append(&title, argv[optind++]);
+                    }
+                    args->rename_new = buffer_take(&title);
+                }
+                break;
+            case 1022: args->show_memory_cmd = true; args->memory_path = xstrdup(optarg); break;
+            case 1023: args->clear_memory_cmd = true; args->memory_path = xstrdup(optarg); break;
+            case 1024: args->edit_memory_cmd = true; args->memory_path = xstrdup(optarg); break;
+            case 1025:
+                args->editor_prompt_cmd = true;
+                if (optarg) args->output_path = xstrdup(optarg);
+                else if (optind < argc && argv[optind][0] != '-') args->output_path = xstrdup(argv[optind++]);
+                break;
+            case 1026: args->credits_cmd = true; break;
+            case 1027: args->show_all_models = true; break;
+            case 1028: args->search_sessions_cmd = true; break;
+            case 1029: args->select_model_cmd = true; break;
+            case 1030: args->min_input_tokens = atol(optarg); break;
+            case 1031: args->min_output_tokens = atol(optarg); break;
+            case 1032: args->hide_preview = true; break;
+            case 1033: args->show_preview = true; break;
+            case 1041: args->allow_missing_tokens = true; break;
+            case 1034: args->require_tokens = true; break;
+            case 1035: args->config_set_cmd = true; args->config_key = xstrdup("SEND_INPUT"); args->config_value = xstrdup(optarg); break;
+            case 1042: args->interactive = true; args->resume_session = xstrdup(optarg); break;
+            case 1043: fprintf(stderr, "--autoscan-model has been removed. Use --models, --test-model MODEL, or --select-model.\n"); return 1;
+            case 1036: args->config_set_cmd = true; args->config_key = xstrdup("THEME"); args->config_value = xstrdup(optarg); break;
+            case 1037: args->config_set_cmd = true; args->config_key = xstrdup("CODE_ATTACHMENT_MIN_LINES"); args->config_value = xstrdup(optarg); break;
+            case 1038: args->search = xstrdup(optarg); args->search_sessions_cmd = true; break;
+            case 1045: args->stream_set = true; args->stream = true; break;
+            case 1046: args->stream_set = true; args->stream = false; break;
+            case 1090: args->web_set = true; args->web_search = true; break;
+            case 1091: args->web_set = true; args->web_search = false; break;
+            case 1092:
+                if (!valid_web_engine(optarg)) die("--web-engine must be auto, native, exa, parallel, perplexity, or firecrawl");
+                free(args->web_search_engine); args->web_search_engine = xstrdup(optarg); break;
+            case 1093: args->web_search_max_results = parse_bounded_number(optarg, 0, 25, "--web-max-results"); args->web_search_max_results_set = true; break;
+            case 1094: args->web_search_max_uses = parse_bounded_number(optarg, 0, 25, "--web-max-uses"); args->web_search_max_uses_set = true; break;
+            case 1088: args->ai_file_download_mode = xstrdup(optarg); break;
+            case 1047: args->status_set = true; args->status_updates = true; break;
+            case 1048: args->status_set = true; args->status_updates = false; break;
+            case 1049: args->voice_input_path = xstrdup(optarg); break;
+            case 1050: args->speak_set = true; args->speak = true; break;
+            case 1051: args->speak_set = true; args->speak = false; break;
+            case 1052: args->turns_cmd = true; args->turns_session = xstrdup(optarg); break;
+            case 1053:
+                args->branch_cmd = true;
+                if (!parse_session_turn_value(optarg, &args->branch_session, &args->branch_turn)) {
+                    args->branch_session = xstrdup(optarg);
+                    if (optind < argc && argv[optind][0] != '-') args->branch_turn = parse_turn_operand(argv[optind++]);
+                    else args->branch_turn = -1;
+                }
+                break;
+            case 1054:
+                args->edit_turn_cmd = true;
+                if (!parse_session_turn_value(optarg, &args->edit_turn_session, &args->edit_turn)) {
+                    args->edit_turn_session = xstrdup(optarg);
+                    if (optind < argc && argv[optind][0] != '-') args->edit_turn = parse_turn_operand(argv[optind++]);
+                    else args->edit_turn = -1;
+                }
+                break;
+            case 1055: args->export_cmd = true; args->export_session = xstrdup(optarg); break;
+            case 1056: args->export_format = xstrdup(optarg); break;
+            default: return 1;
+        }
+    }
+    if (optind < argc) {
+        if (!args->input_path && !args->prompt_text) args->input_path = xstrdup(argv[optind++]);
+        else if (!args->output_path) args->output_path = xstrdup(argv[optind++]);
+    }
+    if (optind < argc) {
+        if (!args->output_path) args->output_path = xstrdup(argv[optind++]);
+    }
+    if (optind < argc) {
+        fprintf(stderr, "unexpected extra argument: %s\n", argv[optind]);
+        return 1;
+    }
+    return 0;
+}
+
+static bool confirm_live_send_if_needed(const TCConfig *cfg, const TCArgs *args) {
+    /*
+     * CONFIRM_LIVE_SEND is the command-line counterpart to the graphical
+     * client's "first real send" protection.  A file-in/file-out Unix command
+     * is already fairly explicit, so the default is off.  Still, some users are
+     * cautious with paid providers and want a last human checkpoint before a
+     * real OpenRouter request leaves the machine.  Demo mode, model listing,
+     * and other local commands never reach this function; it guards only the
+     * final chat-completion request.
+     */
+    if (args->demo || args->yes || !cfg->confirm_live_send) return true;
+    if (!isatty(STDIN_FILENO)) {
+        fprintf(stderr, "CONFIRM_LIVE_SEND is enabled but stdin is not a terminal. Use --yes to confirm.\n");
+        return false;
+    }
+    fprintf(stderr, "About to send a live OpenRouter request using model %s. Continue? [y/N] ", args->model_override ? args->model_override : cfg->model);
+    char line[32];
+    if (!fgets(line, sizeof(line), stdin)) return false;
+    char *s = trim_in_place(line);
+    return strcasecmp(s, "y") == 0 || strcasecmp(s, "yes") == 0;
+}
+
+static void maybe_write_prechat_and_startup_notice(const TCConfig *cfg, const TCArgs *args, const char *output_path) {
+    /*
+     * Put the requested pre-chat line at byte zero of each new session log.
+     * It stays outside USER/AI/system timestamp entries, so context loading
+     * ignores it and does not replay the line to the provider as conversation
+     * memory.  STARTUP_NOTICE controls only the extra metadata marker below.
+     */
+    if (file_exists(output_path) && file_size(output_path) > 0) {
+        char *id = ensure_session_id(output_path);
+        free(id);
+        return;
+    }
+    TCBuffer b;
+    buffer_init(&b);
+    buffer_append(&b, TC_PRECHAT_LINE);
+    buffer_append(&b, "\n");
+    if (cfg->startup_notice) {
+        char *now = now_string();
+        buffer_appendf(&b, "%s\n", TC_NOTICE_BEGIN);
+        buffer_appendf(&b, "time: %s\n", now);
+        buffer_append(&b, "kind: startup-prechat\n");
+        buffer_append(&b, "This is a ttychatter session file.  Future user inputs and AI responses will be appended below.\n");
+        buffer_appendf(&b, "%s\n\n", TC_NOTICE_END);
+        free(now);
+    }
+    append_file_text(output_path, b.data);
+    free(b.data);
+    char *id = ensure_session_id(output_path);
+    free(id);
+    if (args && args->session_arg && !strchr(args->session_arg, '/')) {
+        char *title = basename_no_ext(output_path);
+        write_session_title_metadata(output_path, title);
+        free(title);
+    }
+}
+
+static int test_model_command(const TCConfig *cfg, const char *model, bool demo) {
+    TCMessageList ctx = {0};
+    TCArgs empty;
+    args_init(&empty);
+    empty.demo = demo;
+    empty.stream_set = true;
+    empty.stream = false;
+    empty.web_set = true;
+    empty.web_search = false;
+    empty.status_set = true;
+    empty.status_updates = false;
+    const char *prompt = cfg->model_test_prompt;
+    char *reply = openrouter_chat(cfg, model, prompt, &ctx, &empty);
+    printf("Model: %s\n", model);
+    printf("Response:\n%s\n", reply);
+    free(reply);
+    if (empty.response_metadata) json_object_put(empty.response_metadata);
+    free(empty.model_type);
+    return empty.request_failed ? 1 : 0;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Interactive colon-command chat loop                                       */
+/* ------------------------------------------------------------------------- */
+
+/*
+ * The earliest C command-line design was intentionally file-in/file-out:
+ *     ttychatter input.txt output.log
+ * That remains the most traditional Unix interface and is still the default.
+ *
+ * The Bash clients, however, also have a running chat loop with colon commands
+ * such as :help, :models, :attach, and :quit.  Those commands are not sent to
+ * the model; they are local client-control commands.  To keep the C edition on
+ * feature parity with the Bash editions without turning it into ncurses, the C
+ * version provides an explicit --interactive mode.
+ *
+ * In --interactive mode, ttychatter stays line-oriented.  This is not a curses
+ * screen, not a readline clone, and not an editor.  It is a simple REPL:
+ *
+ *     ttychatter --interactive session.log
+ *     ttychatter> hello
+ *     ttychatter> :models
+ *     ttychatter> :attach notes.txt
+ *     ttychatter> :quit
+ *
+ * This preserves Unix composability while making the C client usable as a
+ * genuine chat program.  The same output log remains the session file, and the
+ * same context reconstruction code is used.  Future maintainers should resist
+ * the temptation to make this function an entire terminal UI.  That job belongs
+ * to the ncurses implementation.  This REPL exists only to give the plain C CLI
+ * feature-equivalent local commands.
+ */
+
+static const char *pick_external_editor(void);
+static char *compose_with_external_editor(void);
+static char *session_path_from_arg(const TCConfig *cfg, const char *arg);
+
+static char *default_session_path(const TCConfig *cfg) {
+    mkdir_p(cfg->session_dir);
+    time_t t = time(NULL);
+    struct tm tmv;
+    localtime_r(&t, &tmv);
+    char stem[128];
+    strftime(stem, sizeof(stem), "session-%Y-%m-%d-%H-%M-%S", &tmv);
+    for (int i = 0; i < 1000; i++) {
+        char name[160];
+        if (i == 0) snprintf(name, sizeof(name), "%s.log", stem);
+        else snprintf(name, sizeof(name), "%s-%03d.log", stem, i);
+        char *path = path_join2(cfg->session_dir, name);
+        int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+        if (fd >= 0) { close(fd); return path; }
+        int saved_errno = errno;
+        free(path);
+        if (saved_errno != EEXIST) die("could not create session: %s", strerror(saved_errno));
+    }
+    die("could not reserve a unique session filename");
+    return NULL;
+}
+
+
+static char *message_preview(const char *text, size_t max_chars) {
+    TCBuffer b;
+    buffer_init(&b);
+    bool prev_space = false;
+    for (const char *p = text ? text : ""; *p && b.len < max_chars; p++) {
+        char c = *p;
+        if (c == '\r' || c == '\n' || c == '\t' || isspace((unsigned char)c)) {
+            if (!prev_space && b.len > 0) buffer_append(&b, " ");
+            prev_space = true;
+        } else {
+            buffer_append_n(&b, &c, 1);
+            prev_space = false;
+        }
+    }
+    char *out = buffer_take(&b);
+    char *t = trim_in_place(out);
+    if (t != out) memmove(out, t, strlen(t) + 1);
+    return out;
+}
+
+static TCMessageList load_messages_from_session_file(const char *path) {
+    TCMessageList out = {0};
+    if (!path || !file_exists(path)) return out;
+    size_t len = 0;
+    char *text = read_file(path, &len);
+    (void)len;
+    TCLogEntryList entries = parse_shared_log_entries(text);
+    if (entries.count > 0) {
+        for (size_t i = 0; i < entries.count; i++) {
+            if (is_shared_project_notice(&entries.items[i])) continue;
+            const char *role = role_from_shared_speaker(entries.items[i].speaker);
+            if (role) msglist_add(&out, role, entries.items[i].text.data);
+        }
+        if (out.count > 0) {
+            logentries_free(&entries);
+            free(text);
+            return out;
+        }
+    }
+    logentries_free(&entries);
+    out = load_context_from_legacy_c_log(text, 999999);
+    free(text);
+    return out;
+}
+
+static TCMessageList msglist_prefix_copy(const TCMessageList *src, size_t count) {
+    TCMessageList out = {0};
+    if (!src) return out;
+    if (count > src->count) count = src->count;
+    for (size_t i = 0; i < count; i++) msglist_add(&out, src->items[i].role, src->items[i].content);
+    return out;
+}
+
+static int print_turns_for_file(const char *path) {
+    TCMessageList msgs = load_messages_from_session_file(path);
+    if (msgs.count == 0) {
+        printf("[no user/assistant messages]\n");
+        msglist_free(&msgs);
+        return 0;
+    }
+    printf("%-5s %-5s %-10s %s\n", "MSG", "CYCLE", "ROLE", "PREVIEW");
+    printf("%-5s %-5s %-10s %s\n", "---", "-----", "----", "-------");
+    long cycle = 0;
+    for (size_t i = 0; i < msgs.count; i++) {
+        if (strcasecmp(msgs.items[i].role, "user") == 0) cycle++;
+        char *prev = message_preview(msgs.items[i].content, 88);
+        printf("%-5zu %-5ld %-10s %s\n", i + 1, cycle > 0 ? cycle : 1, msgs.items[i].role, prev);
+        free(prev);
+    }
+    msglist_free(&msgs);
+    return 0;
+}
+
+static int turns_command(const TCConfig *cfg, const char *session_name) {
+    char *path = session_path_from_arg(cfg, session_name);
+    if (!file_exists(path)) {
+        fprintf(stderr, "session not found: %s\n", path);
+        free(path);
+        return 1;
+    }
+    int rc = print_turns_for_file(path);
+    free(path);
+    return rc;
+}
+
+static void append_branch_metadata(const char *branch_path, const char *source_path, long turn, const char *reason) {
+    TCBuffer b;
+    buffer_init(&b);
+    char *ts = now_hms();
+    buffer_appendf(&b, "[%s] system: branch-from: %s\n", ts, source_path ? source_path : "");
+    buffer_appendf(&b, "[%s] system: branch-turn: %ld\n", ts, turn);
+    buffer_appendf(&b, "[%s] system: branch-reason: %s\n", ts, reason ? reason : "manual");
+    append_file_text(branch_path, b.data);
+    free(ts);
+    free(b.data);
+}
+
+static void append_message_as_log(const char *path, const TCMessage *msg) {
+    char *ts = now_hms();
+    const char *speaker = (msg && strcasecmp(msg->role, "assistant") == 0) ? "AI" : "User";
+    TCBuffer b;
+    buffer_init(&b);
+    buffer_appendf(&b, "[%s] %s: %s\n", ts, speaker, msg && msg->content ? msg->content : "");
+    append_file_text(path, b.data);
+    free(ts);
+    free(b.data);
+}
+
+static char *create_branch_file_from_prefix(const TCConfig *cfg, const TCArgs *args, const char *source_path,
+                                            const TCMessageList *msgs, size_t keep_count, long turn, const char *reason) {
+    char *branch_path = default_session_path(cfg);
+    maybe_write_prechat_and_startup_notice(cfg, args, branch_path);
+    append_branch_metadata(branch_path, source_path, turn, reason);
+    if (msgs && keep_count > msgs->count) keep_count = msgs->count;
+    for (size_t i = 0; msgs && i < keep_count; i++) append_message_as_log(branch_path, &msgs->items[i]);
+    append_file_text(branch_path, "\n");
+    return branch_path;
+}
+
+static int branch_session_command(const TCConfig *cfg, const TCArgs *args, const char *session_name, long turn) {
+    if (!session_name || !*session_name || turn < 0) {
+        fprintf(stderr, "usage: --branch SESSION TURN\n");
+        return 2;
+    }
+    char *source_path = session_path_from_arg(cfg, session_name);
+    if (!file_exists(source_path)) {
+        fprintf(stderr, "session not found: %s\n", source_path);
+        free(source_path);
+        return 1;
+    }
+    TCMessageList msgs = load_messages_from_session_file(source_path);
+    if ((size_t)turn > msgs.count) {
+        fprintf(stderr, "turn out of range: %ld (session has %zu messages)\n", turn, msgs.count);
+        msglist_free(&msgs);
+        free(source_path);
+        return 2;
+    }
+    char *branch_path = create_branch_file_from_prefix(cfg, args, source_path, &msgs, (size_t)turn, turn, "manual-branch");
+    printf("%s\n", branch_path);
+    msglist_free(&msgs);
+    free(branch_path);
+    free(source_path);
+    return 0;
+}
+
+static char *edit_text_with_external_editor(const char *initial_text) {
+    const char *editor = pick_external_editor();
+    if (!editor) {
+        fprintf(stderr, "no external editor found; set VISUAL or EDITOR\n");
+        return NULL;
+    }
+    char tmpl[PATH_MAX];
+    snprintf(tmpl, sizeof(tmpl), "/tmp/ttychatter-edit-turn.XXXXXX");
+    int fd = mkstemp(tmpl);
+    if (fd < 0) return NULL;
+    FILE *f = fdopen(fd, "wb");
+    if (!f) { close(fd); unlink(tmpl); return NULL; }
+    if (initial_text) fwrite(initial_text, 1, strlen(initial_text), f);
+    fclose(f);
+    char *qpath = shell_quote(tmpl);
+    TCBuffer cmd;
+    buffer_init(&cmd);
+    buffer_appendf(&cmd, "%s %s", editor, qpath);
+    free(qpath);
+    int rc = system(cmd.data);
+    free(cmd.data);
+    if (rc != 0) { unlink(tmpl); return NULL; }
+    size_t len = 0;
+    char *edited = read_file(tmpl, &len);
+    (void)len;
+    unlink(tmpl);
+    char *t = trim_in_place(edited);
+    if (!*t) {
+        free(edited);
+        fprintf(stderr, "edited turn is empty\n");
+        return NULL;
+    }
+    if (t != edited) memmove(edited, t, strlen(t) + 1);
+    return edited;
+}
+
+static int edit_turn_command(const TCConfig *cfg, TCArgs *args, const char *session_name, long turn) {
+    if (!session_name || !*session_name || turn <= 0) {
+        fprintf(stderr, "usage: --edit-turn SESSION TURN\n");
+        return 2;
+    }
+    if (!args->demo && !cfg->api_key) die("API key missing; set OPENROUTER_API_KEY or run --set-api-key");
+    char *source_path = session_path_from_arg(cfg, session_name);
+    if (!file_exists(source_path)) {
+        fprintf(stderr, "session not found: %s\n", source_path);
+        free(source_path);
+        return 1;
+    }
+    TCMessageList msgs = load_messages_from_session_file(source_path);
+    if ((size_t)turn > msgs.count) {
+        fprintf(stderr, "turn out of range: %ld (session has %zu messages)\n", turn, msgs.count);
+        msglist_free(&msgs);
+        free(source_path);
+        return 2;
+    }
+    TCMessage *target = &msgs.items[(size_t)turn - 1];
+    if (strcasecmp(target->role, "user") != 0) {
+        fprintf(stderr, "--edit-turn expects a user message number; run --turns SESSION first\n");
+        msglist_free(&msgs);
+        free(source_path);
+        return 2;
+    }
+    char *edited = edit_text_with_external_editor(target->content);
+    if (!edited) { msglist_free(&msgs); free(source_path); return 1; }
+    TCMessageList prefix = msglist_prefix_copy(&msgs, (size_t)turn - 1);
+    char *branch_path = create_branch_file_from_prefix(cfg, args, source_path, &msgs, (size_t)turn - 1, turn, "edited-user-turn");
+    status_update(cfg, args, "created branch %s", branch_path);
+    const char *model = args->model_override ? args->model_override : cfg->model;
+    bind_session_id(args, branch_path);
+    char *raw = openrouter_chat(cfg, model, edited, &prefix, args);
+    char *base = basename_no_ext(branch_path);
+    char *cleaned = extract_code_blocks(cfg, base, raw);
+    append_turn(branch_path, model, "edited-turn", args, edited, cleaned, &prefix, cfg->context_turns);
+    maybe_generate_session_title(cfg, args, &branch_path, edited, cleaned);
+    if (!effective_stream(cfg, args)) printf("%s\n", cleaned);
+    if (!args->request_failed && effective_speak(cfg, args)) run_voice_output_command(cfg, cleaned);
+    fprintf(stderr, "branched edited turn to %s\n", branch_path);
+    emit_session_path(branch_path);
+    free(edited); free(raw); free(base); free(cleaned); free(branch_path);
+    msglist_free(&prefix); msglist_free(&msgs); free(source_path);
+    return args->request_failed ? 1 : 0;
+}
+
+static int export_session_command(const TCConfig *cfg, const char *session_name, const char *format, const char *output_path) {
+    if (!session_name || !*session_name) {
+        fprintf(stderr, "usage: --export SESSION [--format text|markdown|json] [--output FILE]\n");
+        return 2;
+    }
+    char *path = session_path_from_arg(cfg, session_name);
+    if (!file_exists(path)) {
+        fprintf(stderr, "session not found: %s\n", path);
+        free(path);
+        return 1;
+    }
+    const char *fmt = format && *format ? format : "markdown";
+    TCMessageList msgs = load_messages_from_session_file(path);
+    char *title = session_title_from_file(path);
+    if (!title) title = basename_no_ext(path);
+    TCBuffer out;
+    buffer_init(&out);
+    if (strcasecmp(fmt, "json") == 0) {
+        json_object *root = json_object_new_object();
+        json_object_object_add(root, "session", json_object_new_string(path));
+        json_object_object_add(root, "title", json_object_new_string(title));
+        json_object *arr = json_object_new_array();
+        for (size_t i = 0; i < msgs.count; i++) {
+            json_object *m = json_object_new_object();
+            json_object_object_add(m, "role", json_object_new_string(msgs.items[i].role));
+            json_object_object_add(m, "content", json_object_new_string(msgs.items[i].content));
+            json_object_array_add(arr, m);
+        }
+        json_object_object_add(root, "messages", arr);
+        buffer_append(&out, json_object_to_json_string_ext(root, JSON_C_TO_STRING_PRETTY));
+        buffer_append(&out, "\n");
+        json_object_put(root);
+    } else if (strcasecmp(fmt, "text") == 0) {
+        buffer_appendf(&out, "Title: %s\nSession: %s\n\n", title, path);
+        for (size_t i = 0; i < msgs.count; i++) {
+            buffer_appendf(&out, "%s:\n%s\n\n", msgs.items[i].role, msgs.items[i].content);
+        }
+    } else {
+        buffer_appendf(&out, "# %s\n\n", title);
+        buffer_appendf(&out, "Source: `%s`\n\n", path);
+        for (size_t i = 0; i < msgs.count; i++) {
+            const char *label = strcasecmp(msgs.items[i].role, "assistant") == 0 ? "Assistant" : "User";
+            buffer_appendf(&out, "## %s\n\n%s\n\n", label, msgs.items[i].content);
+        }
+    }
+    if (output_path && *output_path) write_file_mode(output_path, out.data, 0600);
+    else fputs(out.data, stdout);
+    free(out.data); free(title); msglist_free(&msgs); free(path);
+    return 0;
+}
+
+static void runtime_command_help(void) {
+    printf("Runtime colon commands:\n");
+    printf("  :help                         show this command list\n");
+    printf("  :q                            alias for :quit\n");
+    printf("  :list                         list saved sessions\n");
+    printf("  :rename TITLE                 rename current log and save the full title\n");
+    printf("  :turns                        list message numbers in current session\n");
+    printf("  :branch N                     branch current session after message N\n");
+    printf("  :fork N                       alias for :branch\n");
+    printf("  :edit N                       edit user message N, branch, and resend\n");
+    printf("  :edit-turn N                  alias for :edit\n");
+    printf("  :stream [on|off]              toggle streaming assistant output\n");
+    printf("  :web [on|off|status]          show or change web search for this session\n");
+    printf("  :ai-download MODE             AI file receipt: ask, auto, metadata, off\n");
+    printf("  :status [on|off]              toggle local progress/status updates\n");
+    printf("  :progress [on|off]            alias for :status\n");
+    printf("  :voice [FILE]                 transcribe with VOICE_INPUT_CMD and send\n");
+    printf("  :transcribe FILE              alias for :voice\n");
+    printf("  :speak [on|off|last]          toggle TTS or speak last reply\n");
+    printf("  :models                       list cached models\n");
+    printf("  :routers                      list router models\n");
+    printf("  :update-models                refresh model cache from OpenRouter\n");
+    printf("  :select-model                 open numbered cached model selector\n");
+    printf("  :test-model MODEL             test one model\n");
+    printf("  :model MODEL                  use model for this run\n");
+    printf("  :model-save MODEL             use model and save MODEL config\n");
+    printf("  :favorites                    list favorite models\n");
+    printf("  :favorite MODEL               add favorite model\n");
+    printf("  :unfavorite MODEL             remove favorite model\n");
+    printf("  :unbookmark MODEL             alias for :unfavorite\n");
+    printf("  :config                       print config summary\n");
+    printf("  :set KEY VALUE                set config key\n");
+    printf("  :unset KEY                    remove config key\n");
+    printf("  :set-api-key [gpg]            store API key, optionally encrypted\n");
+    printf("  :forget-api-key               remove stored API-key material\n");
+    printf("  :memory                       show current context buffer\n");
+    printf("  :edit-memory                  edit current memory/context in external editor\n");
+    printf("  :clear-memory                 clear current context for future sends\n");
+    printf("  :attach FILE                  queue attachment for next message\n");
+    printf("  :attachments                  list pending attachments\n");
+    printf("  :pending                      alias for :attachments\n");
+    printf("  :clear-attachments            clear pending attachments\n");
+    printf("  :editor                       compose one message in $VISUAL/$EDITOR/vi\n");
+    printf("  :search TEXT                  search current session file\n");
+    printf("  :search-all TEXT              search all logs in SESSION_DIR\n");
+    printf("  :credits                      show project notice\n");
+    printf("  :doctor                       run diagnostics\n");
+    printf("  :quit                         exit interactive mode\n");
+    printf("\nTo send a literal message beginning with ':' prefix it with '\\:'.\n");
+}
+
+static void free_pending_attachments(TCArgs *a) {
+    for (size_t i = 0; i < a->attachment_count; i++) free(a->attachments[i]);
+    free(a->attachments);
+    a->attachments = NULL;
+    a->attachment_count = 0;
+}
+
+static void interactive_context_add(TCMessageList *ctx, const char *role, const char *content, long context_turns) {
+    msglist_add(ctx, role, content);
+    size_t max_messages = context_message_limit(context_turns);
+    if (ctx->count <= max_messages) return;
+
+    /*
+     * TCMessageList is a tiny grow-only vector used throughout the C CLI.
+     * In a long-running interactive loop it would otherwise grow forever.  The
+     * graphical clients use CONTEXT_TURNS as a sliding window, so the C loop
+     * does the same thing by freeing entries from the front and shifting the
+     * remaining pointers down.  This is not the most algorithmically elegant
+     * queue, but the context window is intentionally small and this keeps the
+     * representation easy for future C maintainers to inspect.
+     */
+    size_t drop = ctx->count - max_messages;
+    for (size_t i = 0; i < drop; i++) {
+        free(ctx->items[i].role);
+        free(ctx->items[i].content);
+    }
+    memmove(ctx->items, ctx->items + drop, (ctx->count - drop) * sizeof(ctx->items[0]));
+    ctx->count -= drop;
+}
+
+static void print_context_buffer(const TCMessageList *ctx) {
+    if (ctx->count == 0) {
+        printf("[memory empty]\n");
+        return;
+    }
+    for (size_t i = 0; i < ctx->count; i++) {
+        printf("%s: %s\n", ctx->items[i].role, ctx->items[i].content);
+    }
+}
+
+static void search_file_lines(const char *path, const char *needle) {
+    if (!path || !needle || !*needle) return;
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "could not open %s: %s\n", path, strerror(errno));
+        return;
+    }
+    char line[8192];
+    long n = 0;
+    while (fgets(line, sizeof(line), f)) {
+        n++;
+        if (contains_casefold(line, needle)) printf("%s:%ld:%s", path, n, line);
+    }
+    fclose(f);
+}
+
+static void search_all_sessions(const TCConfig *cfg, const char *needle) {
+    if (!needle || !*needle) return;
+    DIR *d = opendir(cfg->session_dir);
+    if (!d) {
+        fprintf(stderr, "could not open session dir %s: %s\n", cfg->session_dir, strerror(errno));
+        return;
+    }
+    struct dirent *de;
+    while ((de = readdir(d))) {
+        if (de->d_name[0] == '.') continue;
+        char *path = path_join2(cfg->session_dir, de->d_name);
+        char *title = session_title_from_file(path);
+        if (contains_casefold(de->d_name, needle)) {
+            printf("%s:0:file: %s\n", path, de->d_name);
+        }
+        if (title && *title && contains_casefold(title, needle)) {
+            printf("%s:0:title: %s\n", path, title);
+        }
+        free(title);
+        search_file_lines(path, needle);
+        free(path);
+    }
+    closedir(d);
+}
+
+
+static const char *pick_external_editor(void);
+static char *compose_with_external_editor(void);
+
+/* ------------------------------------------------------------------------- */
+/* Session utility commands                                                  */
+/* ------------------------------------------------------------------------- */
+
+static char *session_path_from_arg(const TCConfig *cfg, const char *arg) {
+    if (!arg || !*arg) return NULL;
+    if (strchr(arg, '/')) return expand_tilde(arg);
+    const char *name = arg;
+    char *with_ext = NULL;
+    if (strlen(name) >= 4 && strcmp(name + strlen(name) - 4, ".log") == 0) {
+        with_ext = xstrdup(name);
+    } else {
+        TCBuffer b;
+        buffer_init(&b);
+        buffer_appendf(&b, "%s.log", name);
+        with_ext = b.data;
+    }
+    char *out = path_join2(cfg->session_dir, with_ext);
+    free(with_ext);
+    if (!file_exists(out)) {
+        /* Titles and previous names remain usable after physical renames.
+         * An ambiguous match must never silently select or create a session. */
+        DIR *dir = opendir(cfg->session_dir);
+        char *match = NULL;
+        char *alias = xstrdup(arg);
+        size_t alias_len = strlen(alias);
+        if (alias_len >= 4 && strcmp(alias + alias_len - 4, ".log") == 0) alias[alias_len - 4] = '\0';
+        struct dirent *entry;
+        while (dir && (entry = readdir(dir))) {
+            size_t len = strlen(entry->d_name);
+            if (entry->d_name[0] == '.' || len < 4 || strcmp(entry->d_name + len - 4, ".log") != 0) continue;
+            char *candidate = path_join2(cfg->session_dir, entry->d_name);
+            struct stat st;
+            if (lstat(candidate, &st) != 0 || !S_ISREG(st.st_mode)) { free(candidate); continue; }
+            char *title = session_title_from_file(candidate);
+            bool same = (title && strcasecmp(title, arg) == 0) || session_has_alias(candidate, arg) || session_has_alias(candidate, alias);
+            free(title);
+            if (same) {
+                if (match) die("session title is ambiguous: %s; use the exact filename from --list", arg);
+                match = candidate;
+            } else free(candidate);
+        }
+        if (dir) closedir(dir);
+        free(alias);
+        if (match) { free(out); out = match; }
+    }
+    return out;
+}
+
+typedef struct TCSessionRow {
+    char *name;
+    char *path;
+    char *title;
+    time_t mtime;
+    long size;
+} TCSessionRow;
+
+typedef struct TCSessionRows {
+    TCSessionRow *items;
+    size_t count;
+    size_t cap;
+} TCSessionRows;
+
+static void sessionrows_add(TCSessionRows *rows, const char *name, const char *path, const char *title, time_t mtime, long size) {
+    if (rows->count == rows->cap) {
+        rows->cap = rows->cap ? rows->cap * 2 : 32;
+        rows->items = realloc(rows->items, rows->cap * sizeof(rows->items[0]));
+        if (!rows->items) die("out of memory");
+    }
+    rows->items[rows->count].name = xstrdup(name);
+    rows->items[rows->count].path = xstrdup(path);
+    rows->items[rows->count].title = xstrdup(title && *title ? title : "(untitled)");
+    rows->items[rows->count].mtime = mtime;
+    rows->items[rows->count].size = size;
+    rows->count++;
+}
+
+static void sessionrows_free(TCSessionRows *rows) {
+    for (size_t i = 0; i < rows->count; i++) {
+        free(rows->items[i].name);
+        free(rows->items[i].path);
+        free(rows->items[i].title);
+    }
+    free(rows->items);
+    rows->items = NULL;
+    rows->count = rows->cap = 0;
+}
+
+static int sessionrow_cmp(const void *a, const void *b) {
+    const TCSessionRow *ra = a;
+    const TCSessionRow *rb = b;
+    if (ra->mtime < rb->mtime) return 1;
+    if (ra->mtime > rb->mtime) return -1;
+    return strcasecmp(ra->name, rb->name);
+}
+
+static char *session_time_display(time_t t) {
+    struct tm tmv;
+    localtime_r(&t, &tmv);
+    char buf[64];
+    strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M", &tmv);
+    return xstrdup(buf);
+}
+
+static int list_sessions_command(const TCConfig *cfg) {
+    DIR *d = opendir(cfg->session_dir);
+    if (!d) {
+        fprintf(stderr, "could not open session dir %s: %s\n", cfg->session_dir, strerror(errno));
+        return 1;
+    }
+    TCSessionRows rows = {0};
+    struct dirent *de;
+    while ((de = readdir(d))) {
+        if (de->d_name[0] == '.') continue;
+        char *path = path_join2(cfg->session_dir, de->d_name);
+        struct stat st;
+        if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) {
+            char *title = session_title_from_file(path);
+            if (!title) title = basename_no_ext(de->d_name);
+            sessionrows_add(&rows, de->d_name, path, title, st.st_mtime, (long)st.st_size);
+            free(title);
+        }
+        free(path);
+    }
+    closedir(d);
+
+    qsort(rows.items, rows.count, sizeof(rows.items[0]), sessionrow_cmp);
+    printf("%-42s %-16s %-10s %s\n", "TITLE", "UPDATED", "BYTES", "FILE");
+    printf("%-42s %-16s %-10s %s\n", "-----", "-------", "-----", "----");
+    for (size_t i = 0; i < rows.count; i++) {
+        char *when = session_time_display(rows.items[i].mtime);
+        printf("%-42.42s %-16s %-10ld %s\n", rows.items[i].title, when, rows.items[i].size, rows.items[i].name);
+        free(when);
+    }
+    sessionrows_free(&rows);
+    return 0;
+}
+
+static int rename_session_command(const TCConfig *cfg, const char *session_name, const char *new_title) {
+    if (!session_name || !new_title || !*session_name || !*new_title) {
+        fprintf(stderr, "usage: --rename-session SESSION TITLE\n");
+        return 2;
+    }
+    char *path = session_path_from_arg(cfg, session_name);
+    if (!file_exists(path)) {
+        fprintf(stderr, "session not found: %s\n", path);
+        free(path);
+        return 1;
+    }
+    char *renamed = rename_session_file(path, new_title);
+    if (!renamed) { free(path); return 1; }
+    fprintf(stderr, "session renamed to %s\n", renamed);
+    emit_session_path(renamed);
+    free(renamed);
+    free(path);
+    return 0;
+}
+
+static void print_memory_for_file(const char *path, long context_turns) {
+    TCMessageList ctx = load_context_from_session(path, context_turns);
+    print_context_buffer(&ctx);
+    msglist_free(&ctx);
+}
+
+static bool write_context_snapshot_file(const char *path, const char *context_text) {
+    TCMessageList context = {0};
+    const char *text = context_text ? context_text : "";
+    while (*text && isspace((unsigned char)*text)) text++;
+    if (*text) {
+        TCBuffer input;
+        buffer_init(&input);
+        bool valid;
+        if (*text == '[') {
+            buffer_append(&input, "CONTEXT_SNAPSHOT_JSON ");
+            buffer_append(&input, text);
+            valid = parse_context_snapshot_json(input.data, &context);
+        } else {
+            buffer_append(&input, "CONTEXT_BEGIN\n");
+            buffer_append(&input, context_text);
+            if (input.data[input.len - 1] != '\n') buffer_append(&input, "\n");
+            buffer_append(&input, "CONTEXT_END");
+            bool closed = false;
+            valid = parse_context_snapshot_text(input.data, &context, &closed) && closed && context.count > 0;
+        }
+        free(input.data);
+        if (!valid) {
+            msglist_free(&context);
+            fprintf(stderr, "memory was not changed: use a JSON array of User:/Assistant: strings or labeled text\n");
+            return false;
+        }
+    }
+    TCBuffer b;
+    buffer_init(&b);
+    char *ts = now_hms();
+    append_shared_context_snapshot(&b, ts, &context, LONG_MAX / 2, NULL, NULL);
+    bool ok = append_file_text_checked(path, b.data);
+    msglist_free(&context);
+    free(ts); free(b.data);
+    return ok;
+}
+
+static int clear_memory_command(const char *path) {
+    if (!path || !*path) return 2;
+    if (!write_context_snapshot_file(path, "")) return 1;
+    fprintf(stderr, "empty memory snapshot appended to %s\n", path);
+    return 0;
+}
+
+static int edit_memory_command(const TCConfig *cfg, const char *path) {
+    (void)cfg;
+    if (!path || !*path) return 2;
+    TCMessageList ctx = load_context_from_session(path, 9999);
+    TCBuffer initial;
+    buffer_init(&initial);
+    json_object *snapshot = json_object_new_array();
+    for (size_t i = 0; i < ctx.count; i++) {
+        append_snapshot_message(snapshot, ctx.items[i].role, ctx.items[i].content);
+    }
+    buffer_append(&initial, json_object_to_json_string_ext(snapshot, JSON_C_TO_STRING_PRETTY));
+    buffer_append(&initial, "\n");
+    json_object_put(snapshot);
+    msglist_free(&ctx);
+
+    char tmpl[PATH_MAX];
+    snprintf(tmpl, sizeof(tmpl), "/tmp/ttychatter-memory-XXXXXX");
+    int fd = mkstemp(tmpl);
+    if (fd < 0) { free(initial.data); return 1; }
+    FILE *f = fdopen(fd, "w");
+    if (!f) { close(fd); unlink(tmpl); free(initial.data); return 1; }
+    fputs(initial.data, f);
+    fclose(f);
+    free(initial.data);
+
+    const char *ed = pick_external_editor();
+    TCBuffer cmd;
+    buffer_init(&cmd);
+    char *q = shell_quote(tmpl);
+    buffer_appendf(&cmd, "%s %s", ed, q);
+    free(q);
+    int rc = system(cmd.data);
+    free(cmd.data);
+    if (rc != 0) { unlink(tmpl); return 1; }
+    size_t len = 0;
+    char *edited = read_file(tmpl, &len);
+    unlink(tmpl);
+    bool saved = write_context_snapshot_file(path, edited);
+    free(edited);
+    if (!saved) return 1;
+    fprintf(stderr, "memory snapshot appended to %s\n", path);
+    return 0;
+}
+
+static int editor_prompt_command(const TCConfig *cfg, const char *output_path, TCArgs *base_args) {
+    if (!confirm_live_send_if_needed(cfg, base_args)) return 1;
+    char *msg = compose_with_external_editor();
+    if (!msg || !*msg) { free(msg); fprintf(stderr, "editor returned empty prompt\n"); return 1; }
+    char *session = output_path && *output_path ? xstrdup(output_path) : default_session_path(cfg);
+    maybe_write_prechat_and_startup_notice(cfg, base_args, session);
+    TCMessageList ctx = load_context_from_session(session, cfg->context_turns);
+    bind_session_id(base_args, session);
+    char *raw = openrouter_chat(cfg, base_args->model_override ? base_args->model_override : cfg->model, msg, &ctx, base_args);
+    char *base = basename_no_ext(session);
+    char *cleaned = extract_code_blocks(cfg, base, raw);
+    append_turn(session, base_args->model_override ? base_args->model_override : cfg->model, "editor", base_args, msg, cleaned, &ctx, cfg->context_turns);
+    maybe_generate_session_title(cfg, base_args, &session, msg, cleaned);
+    if (!effective_stream(cfg, base_args)) printf("%s\n", cleaned);
+    if (!base_args->request_failed && effective_speak(cfg, base_args)) run_voice_output_command(cfg, cleaned);
+    fprintf(stderr, "appended response to %s\n", session);
+    emit_session_path(session);
+    free(msg); free(raw); free(base); free(cleaned); msglist_free(&ctx); free(session);
+    return base_args->request_failed ? 1 : 0;
+}
+
+static void credits_command(void) {
+    printf("ttychatter - terminal chat clients for AI conversation.\n");
+    printf("Project Lead notice: %s\n", TC_PRECHAT_LINE);
+}
+
+static const char *pick_external_editor(void) {
+    const char *ed = getenv("VISUAL");
+    if (ed && *ed) return ed;
+    ed = getenv("EDITOR");
+    if (ed && *ed) return ed;
+    if (command_exists("vi")) return "vi";
+    return NULL;
+}
+
+static char *compose_with_external_editor(void) {
+    const char *editor = pick_external_editor();
+    if (!editor) {
+        fprintf(stderr, "no external editor found; set VISUAL or EDITOR\n");
+        return NULL;
+    }
+    char tmpl[PATH_MAX];
+    snprintf(tmpl, sizeof(tmpl), "/tmp/ttychatter-compose.XXXXXX");
+    int fd = mkstemp(tmpl);
+    if (fd < 0) {
+        fprintf(stderr, "could not create temp file for editor\n");
+        return NULL;
+    }
+    close(fd);
+    char *qpath = shell_quote(tmpl);
+    TCBuffer cmd;
+    buffer_init(&cmd);
+    buffer_appendf(&cmd, "%s %s", editor, qpath);
+    char *cmds = buffer_take(&cmd);
+    int rc = system(cmds);
+    free(cmds);
+    free(qpath);
+    if (rc != 0) {
+        unlink(tmpl);
+        fprintf(stderr, "editor exited with nonzero status\n");
+        return NULL;
+    }
+    size_t len = 0;
+    char *text = read_file(tmpl, &len);
+    unlink(tmpl);
+    if (!text || !trim_in_place(text)[0]) {
+        free(text);
+        fprintf(stderr, "editor produced no message\n");
+        return NULL;
+    }
+    return text;
+}
+
+static int interactive_send_message(TCConfig *cfg, char **output_pathp, const char *model, const char *text,
+                                    TCMessageList *ctx, TCArgs *pending_args, char **last_replyp) {
+    const char *output_path = *output_pathp;
+    if (!pending_args->demo && !cfg->api_key) {
+        fprintf(stderr, "API key missing; use :set-api-key, set OPENROUTER_API_KEY, or run --set-api-key\n");
+        return 1;
+    }
+    TCArgs confirmation = *pending_args;
+    confirmation.model_override = (char *)model;
+    if (!confirm_live_send_if_needed(cfg, &confirmation)) return 1;
+    if (!pending_args->session_id) bind_session_id(pending_args, output_path);
+    char *raw = openrouter_chat(cfg, model, text, ctx, pending_args);
+    char *session_base = basename_no_ext(output_path);
+    char *cleaned = extract_code_blocks(cfg, session_base, raw);
+    append_turn(output_path, model, "interactive", pending_args, text, cleaned, ctx, cfg->context_turns);
+    maybe_generate_session_title(cfg, pending_args, output_pathp, text, cleaned);
+    if (!pending_args->request_failed) {
+        interactive_context_add(ctx, "user", text, cfg->context_turns);
+        interactive_context_add(ctx, "assistant", cleaned, cfg->context_turns);
+    }
+    if (last_replyp && !pending_args->request_failed) {
+        free(*last_replyp);
+        *last_replyp = xstrdup(cleaned);
+    }
+    if (!effective_stream(cfg, pending_args)) printf("%s\n", cleaned);
+    if (!pending_args->request_failed && effective_speak(cfg, pending_args)) run_voice_output_command(cfg, cleaned);
+    free(raw);
+    free(cleaned);
+    free(session_base);
+    if (!pending_args->request_failed) {
+        free_pending_attachments(pending_args);
+        if (!pending_args->did_prompt_after_reply) {
+            maybe_prompt_session_name(cfg, output_pathp);
+            pending_args->did_prompt_after_reply = true;
+        }
+    }
+    emit_session_path(*output_pathp);
+    return pending_args->request_failed ? 1 : 0;
+}
+
+static int interactive_handle_command(TCConfig *cfg, TCArgs *pending_args, TCMessageList *ctx,
+                                      char **output_pathp, char **active_model, char *line, char **last_replyp) {
+    const char *output_path = *output_pathp;
+    char *cmdline = trim_in_place(line + 1);
+    char *cmd = strtok(cmdline, " \t");
+    char *rest = strtok(NULL, "");
+    rest = rest ? trim_in_place(rest) : NULL;
+    if (!cmd || strcmp(cmd, "help") == 0) { runtime_command_help(); return 0; }
+    if (strcmp(cmd, "quit") == 0 || strcmp(cmd, "q") == 0) return 1;
+    if (strcmp(cmd, "list") == 0) { list_sessions_command(cfg); return 0; }
+    if (strcmp(cmd, "rename") == 0) {
+        if (!rest || !*rest) { fprintf(stderr, "usage: :rename TITLE\n"); return 0; }
+        char *renamed = rename_session_file(*output_pathp, rest);
+        if (renamed) {
+            free(*output_pathp);
+            *output_pathp = renamed;
+            fprintf(stderr, "current session name: %s\n", rest);
+            emit_session_path(*output_pathp);
+        }
+        return 0;
+    }
+    if (strcmp(cmd, "turns") == 0) { print_turns_for_file(*output_pathp); return 0; }
+    if (strcmp(cmd, "branch") == 0 || strcmp(cmd, "fork") == 0) {
+        long turn = parse_turn_operand(rest);
+        if (turn < 0) { fprintf(stderr, "usage: :branch MESSAGE_NUMBER\n"); return 0; }
+        TCMessageList msgs = load_messages_from_session_file(*output_pathp);
+        if ((size_t)turn > msgs.count) {
+            fprintf(stderr, "turn out of range: %ld (session has %zu messages)\n", turn, msgs.count);
+            msglist_free(&msgs);
+            return 0;
+        }
+        char *old_path = xstrdup(*output_pathp);
+        char *branch_path = create_branch_file_from_prefix(cfg, pending_args, old_path, &msgs, (size_t)turn, turn, "interactive-branch");
+        free(*output_pathp);
+        *output_pathp = branch_path;
+        bind_session_id(pending_args, branch_path);
+        pending_args->preserve_session_path = false;
+        pending_args->did_prompt_after_reply = false;
+        maybe_prompt_session_name(cfg, output_pathp);
+        msglist_free(ctx);
+        *ctx = load_context_from_session(*output_pathp, cfg->context_turns);
+        fprintf(stderr, "branched from %s at message %ld; current session is %s\n", old_path, turn, *output_pathp);
+        free(old_path);
+        msglist_free(&msgs);
+        return 0;
+    }
+    if (strcmp(cmd, "edit") == 0 || strcmp(cmd, "edit-turn") == 0) {
+        long turn = parse_turn_operand(rest);
+        if (turn <= 0) { fprintf(stderr, "usage: :edit MESSAGE_NUMBER\n"); return 0; }
+        TCMessageList msgs = load_messages_from_session_file(*output_pathp);
+        if ((size_t)turn > msgs.count) {
+            fprintf(stderr, "turn out of range: %ld (session has %zu messages)\n", turn, msgs.count);
+            msglist_free(&msgs);
+            return 0;
+        }
+        TCMessage *target = &msgs.items[(size_t)turn - 1];
+        if (strcasecmp(target->role, "user") != 0) {
+            fprintf(stderr, ":edit expects a user message number; run :turns first\n");
+            msglist_free(&msgs);
+            return 0;
+        }
+        char *edited = edit_text_with_external_editor(target->content);
+        if (!edited) { msglist_free(&msgs); return 0; }
+        TCMessageList prefix = msglist_prefix_copy(&msgs, (size_t)turn - 1);
+        char *old_path = xstrdup(*output_pathp);
+        char *branch_path = create_branch_file_from_prefix(cfg, pending_args, old_path, &msgs, (size_t)turn - 1, turn, "interactive-edited-user-turn");
+        free(*output_pathp);
+        *output_pathp = branch_path;
+        bind_session_id(pending_args, branch_path);
+        pending_args->preserve_session_path = false;
+        pending_args->did_prompt_after_reply = false;
+        msglist_free(ctx);
+        *ctx = prefix;
+        fprintf(stderr, "editing message %ld; branched to %s\n", turn, *output_pathp);
+        interactive_send_message(cfg, output_pathp, *active_model, edited, ctx, pending_args, last_replyp);
+        free(edited);
+        free(old_path);
+        msglist_free(&msgs);
+        return 0;
+    }
+    if (strcmp(cmd, "voice") == 0 || strcmp(cmd, "transcribe") == 0) {
+        char *msg = run_voice_input_command(cfg, rest);
+        if (msg) { interactive_send_message(cfg, output_pathp, *active_model, msg, ctx, pending_args, last_replyp); free(msg); }
+        return 0;
+    }
+    if (strcmp(cmd, "speak") == 0) {
+        if (!rest || strcmp(rest, "last") == 0) {
+            if (last_replyp && *last_replyp) run_voice_output_command(cfg, *last_replyp);
+            else fprintf(stderr, "no last assistant reply to speak\n");
+            return 0;
+        }
+        if (strcasecmp(rest, "on") == 0) { pending_args->speak_set = true; pending_args->speak = true; fprintf(stderr, "voice output enabled for this interactive session\n"); return 0; }
+        if (strcasecmp(rest, "off") == 0) { pending_args->speak_set = true; pending_args->speak = false; fprintf(stderr, "voice output disabled for this interactive session\n"); return 0; }
+        fprintf(stderr, "usage: :speak [on|off|last]\n");
+        return 0;
+    }
+    if (strcmp(cmd, "stream") == 0) {
+        if (!rest || strcasecmp(rest, "on") == 0) { pending_args->stream_set = true; pending_args->stream = true; fprintf(stderr, "streaming enabled for this interactive session\n"); return 0; }
+        if (strcasecmp(rest, "off") == 0) { pending_args->stream_set = true; pending_args->stream = false; fprintf(stderr, "streaming disabled for this interactive session\n"); return 0; }
+        fprintf(stderr, "usage: :stream [on|off]\n");
+        return 0;
+    }
+    if (strcmp(cmd, "web") == 0) {
+        if (rest && *rest && strcasecmp(rest, "status") != 0) {
+            if (strcasecmp(rest, "on") != 0 && strcasecmp(rest, "off") != 0) {
+                fprintf(stderr, "usage: :web [on|off|status]\n"); return 0;
+            }
+            pending_args->web_set = true;
+            pending_args->web_search = strcasecmp(rest, "on") == 0;
+        }
+        fprintf(stderr, "web search: %s (engine=%s; enabling lets the model choose to search)\n",
+                effective_web_search(cfg, pending_args) ? "on" : "off",
+                pending_args->web_search_engine ? pending_args->web_search_engine : cfg->web_search_engine);
+        return 0;
+    }
+    if (strcmp(cmd, "ai-download") == 0 || strcmp(cmd, "ai-files") == 0) {
+        if (rest && *rest && (strcasecmp(rest, "ask") == 0 || strcasecmp(rest, "auto") == 0 || strcasecmp(rest, "metadata") == 0 || strcasecmp(rest, "off") == 0)) {
+            free(pending_args->ai_file_download_mode);
+            pending_args->ai_file_download_mode = xstrdup(rest);
+            fprintf(stderr, "AI file download mode set to %s for this interactive session\n", rest);
+        } else {
+            fprintf(stderr, "usage: :ai-download ask|auto|metadata|off\n");
+        }
+        return 0;
+    }
+    if (strcmp(cmd, "status") == 0 || strcmp(cmd, "progress") == 0) {
+        if (!rest || strcasecmp(rest, "on") == 0) { pending_args->status_set = true; pending_args->status_updates = true; fprintf(stderr, "status updates enabled for this interactive session\n"); return 0; }
+        if (strcasecmp(rest, "off") == 0) { pending_args->status_set = true; pending_args->status_updates = false; fprintf(stderr, "status updates disabled for this interactive session\n"); return 0; }
+        fprintf(stderr, "usage: :status [on|off]\n");
+        return 0;
+    }
+    if (strcmp(cmd, "models") == 0) { list_models(cfg, NULL, pending_args->model_type, pending_args->model_sort, false, pending_args->demo); return 0; }
+    if (strcmp(cmd, "routers") == 0) { list_models(cfg, NULL, "routers", pending_args->model_sort, false, pending_args->demo); return 0; }
+    if (strcmp(cmd, "update-models") == 0) { update_models(cfg, pending_args->demo); return 0; }
+    if (strcmp(cmd, "select-model") == 0) {
+        if (select_model_command(cfg, pending_args->demo) == 0) {
+            free(*active_model); *active_model = xstrdup(cfg->model);
+            fprintf(stderr, "runtime model: %s\n", *active_model);
+        }
+        return 0;
+    }
+    if (strcmp(cmd, "favorites") == 0) { list_favorites(cfg); return 0; }
+    if (strcmp(cmd, "favorite") == 0) { if (rest) add_favorite(cfg, rest); else fprintf(stderr, "usage: :favorite MODEL\n"); return 0; }
+    if (strcmp(cmd, "unfavorite") == 0 || strcmp(cmd, "unbookmark") == 0) { if (rest) remove_favorite(cfg, rest); else fprintf(stderr, "usage: :unfavorite MODEL\n"); return 0; }
+    if (strcmp(cmd, "test-model") == 0) { if (rest) test_model_command(cfg, rest, pending_args->demo); else fprintf(stderr, "usage: :test-model MODEL\n"); return 0; }
+    if (strcmp(cmd, "model") == 0) { if (rest) { free(*active_model); *active_model = xstrdup(rest); fprintf(stderr, "runtime model: %s\n", *active_model); } else fprintf(stderr, "usage: :model MODEL\n"); return 0; }
+    if (strcmp(cmd, "model-save") == 0) { if (rest) { free(*active_model); *active_model = xstrdup(rest); config_write_key_value(cfg, "MODEL", rest); fprintf(stderr, "saved MODEL=%s\n", rest); } else fprintf(stderr, "usage: :model-save MODEL\n"); return 0; }
+    if (strcmp(cmd, "config") == 0) { print_config_summary(cfg); return 0; }
+    if (strcmp(cmd, "set") == 0) {
+        if (!rest) { fprintf(stderr, "usage: :set KEY VALUE\n"); return 0; }
+        char *key = strtok(rest, " \t");
+        char *val = strtok(NULL, "");
+        if (!key || !val) { fprintf(stderr, "usage: :set KEY VALUE\n"); return 0; }
+        val = trim_in_place(val);
+        if (!valid_web_config(key, val)) return 0;
+        config_write_key_value(cfg, key, val);
+        config_set(cfg, key, val);
+        if (strcmp(key, "MODEL") == 0) { free(*active_model); *active_model = xstrdup(cfg->model); }
+        fprintf(stderr, "set %s\n", key);
+        return 0;
+    }
+    if (strcmp(cmd, "unset") == 0) { if (rest) { config_remove_key(cfg, rest); fprintf(stderr, "removed %s\n", rest); } else fprintf(stderr, "usage: :unset KEY\n"); return 0; }
+    if (strcmp(cmd, "set-api-key") == 0) { cmd_set_api_key(cfg, rest && strcmp(rest, "gpg") == 0); config_load(cfg); return 0; }
+    if (strcmp(cmd, "forget-api-key") == 0) { cmd_forget_api_key(cfg); free(cfg->api_key); cfg->api_key = NULL; return 0; }
+    if (strcmp(cmd, "memory") == 0) { print_context_buffer(ctx); return 0; }
+    if (strcmp(cmd, "edit-memory") == 0) {
+        edit_memory_command(cfg, output_path);
+        msglist_free(ctx);
+        *ctx = load_context_from_session(output_path, cfg->context_turns);
+        fprintf(stderr, "reloaded memory from edited snapshot\n");
+        return 0;
+    }
+    if (strcmp(cmd, "clear-memory") == 0) { msglist_free(ctx); ctx->items = NULL; ctx->count = 0; ctx->cap = 0; clear_memory_command(output_path); return 0; }
+    if (strcmp(cmd, "attach") == 0) { if (rest) { args_add_attachment(pending_args, rest); fprintf(stderr, "queued attachment: %s\n", rest); } else fprintf(stderr, "usage: :attach FILE\n"); return 0; }
+    if (strcmp(cmd, "attachments") == 0 || strcmp(cmd, "pending") == 0) { if (pending_args->attachment_count == 0) printf("[no pending attachments]\n"); for (size_t i = 0; i < pending_args->attachment_count; i++) printf("%zu: %s\n", i + 1, pending_args->attachments[i]); return 0; }
+    if (strcmp(cmd, "clear-attachments") == 0) { free_pending_attachments(pending_args); fprintf(stderr, "cleared pending attachments\n"); return 0; }
+    if (strcmp(cmd, "editor") == 0) { char *msg = compose_with_external_editor(); if (msg) { interactive_send_message(cfg, output_pathp, *active_model, msg, ctx, pending_args, last_replyp); free(msg); } return 0; }
+    if (strcmp(cmd, "search") == 0) { if (rest) search_file_lines(output_path, rest); else fprintf(stderr, "usage: :search TEXT\n"); return 0; }
+    if (strcmp(cmd, "search-all") == 0) { if (rest) search_all_sessions(cfg, rest); else fprintf(stderr, "usage: :search-all TEXT\n"); return 0; }
+    if (strcmp(cmd, "credits") == 0) { printf("ttychatter - terminal chat clients. Project Lead notice: %s\n", TC_PRECHAT_LINE); return 0; }
+    if (strcmp(cmd, "doctor") == 0) { doctor(cfg); return 0; }
+    fprintf(stderr, "unknown command: :%s (try :help)\n", cmd);
+    return 0;
+}
+
+static int interactive_loop(TCConfig *cfg, TCArgs *base_args, const char *maybe_output_path) {
+    char *output_path = maybe_output_path ? xstrdup(maybe_output_path) : default_session_path(cfg);
+    bool new_file = !file_exists(output_path) || file_size(output_path) == 0;
+    mkdir_p(cfg->session_dir);
+    mkdir_p(cfg->attachment_dir);
+    maybe_write_prechat_and_startup_notice(cfg, base_args, output_path);
+    if (new_file && maybe_output_path && !session_has_title(output_path)) {
+        const char *reference = base_args->session_arg ? base_args->session_arg :
+                                (base_args->resume_session ? base_args->resume_session : base_args->input_path);
+        if (reference && !strchr(reference, '/')) {
+            char *title = basename_no_ext(output_path);
+            write_session_title_metadata(output_path, title);
+            free(title);
+        }
+    }
+    maybe_prompt_session_name(cfg, &output_path);
+    TCMessageList ctx = load_context_from_session(output_path, cfg->context_turns);
+    TCArgs pending;
+    args_init(&pending);
+    pending.demo = base_args->demo;
+    pending.loopback = base_args->loopback;
+    pending.stream_set = base_args->stream_set;
+    pending.stream = base_args->stream;
+    pending.web_set = base_args->web_set;
+    pending.web_search = base_args->web_search;
+    pending.web_search_engine = xstrdup(base_args->web_search_engine);
+    pending.web_search_max_results = base_args->web_search_max_results;
+    pending.web_search_max_uses = base_args->web_search_max_uses;
+    pending.web_search_max_results_set = base_args->web_search_max_results_set;
+    pending.web_search_max_uses_set = base_args->web_search_max_uses_set;
+    pending.preserve_session_path = base_args->preserve_session_path;
+    pending.yes = base_args->yes;
+    pending.ai_file_download_mode = xstrdup(base_args->ai_file_download_mode);
+    for (size_t i = 0; i < base_args->attachment_count; i++) args_add_attachment(&pending, base_args->attachments[i]);
+    bind_session_id(&pending, output_path);
+    pending.status_set = base_args->status_set;
+    pending.status_updates = base_args->status_updates;
+    pending.speak_set = base_args->speak_set;
+    pending.speak = base_args->speak;
+    free(pending.model_type);
+    pending.model_type = xstrdup(base_args->model_type ? base_args->model_type : "all");
+    pending.model_sort = base_args->model_sort ? xstrdup(base_args->model_sort) : NULL;
+    char *active_model = xstrdup(base_args->model_override ? base_args->model_override : cfg->model);
+    char *last_reply = NULL;
+
+    printf("ttychatter interactive session: %s\n", output_path);
+    char *title = session_title_from_file(output_path);
+    printf("Session name: %s\n", title ? title : "UNNAMED - use :rename TITLE");
+    free(title);
+    printf("Type :help for local commands.  Lines beginning with ':' are not sent to the AI.\n");
+    printf("%s\n", TC_PRECHAT_LINE);
+    char *line = NULL;
+    size_t line_capacity = 0;
+    while (true) {
+        printf("ttychatter> ");
+        fflush(stdout);
+        if (getline(&line, &line_capacity, stdin) < 0) break;
+        char *s = trim_in_place(line);
+        if (!*s) continue;
+        if (s[0] == ':' && s[1] != '\0') {
+            int done = interactive_handle_command(cfg, &pending, &ctx, &output_path, &active_model, s, &last_reply);
+            if (done) break;
+            continue;
+        }
+        if (s[0] == '\\' && s[1] == ':') s++;
+        interactive_send_message(cfg, &output_path, active_model, s, &ctx, &pending, &last_reply);
+    }
+    free_pending_attachments(&pending);
+    emit_session_path(output_path);
+    free(line);
+    free(pending.session_id);
+    free(pending.web_search_engine);
+    free(pending.ai_file_download_mode);
+    if (pending.response_metadata) json_object_put(pending.response_metadata);
+    free(pending.model_type);
+    free(pending.model_sort);
+    free(active_model);
+    free(last_reply);
+    msglist_free(&ctx);
+    free(output_path);
+    return 0;
+}
+
+
+int main(int argc, char **argv) {
+    TCConfig cfg;
+    config_init_defaults(&cfg);
+    config_load(&cfg);
+    mkdir_p(cfg.session_dir);
+    mkdir_p(cfg.attachment_dir);
+
+    TCArgs args;
+    args_init(&args);
+    if (parse_args(argc, argv, &args) != 0) return 2;
+    args.preserve_session_path = args.output_path != NULL ||
+        (args.session_arg && strchr(args.session_arg, '/')) ||
+        (args.resume_session && strchr(args.resume_session, '/')) ||
+        (args.interactive && args.input_path && strchr(args.input_path, '/'));
+    if (cfg.demo_mode_default) args.demo = true;
+    if (cfg.loopback_default) args.loopback = true;
+
+    if (args.show_help) { print_help(); return 0; }
+    if (args.show_version) { print_version(); return 0; }
+    if (args.set_api_key) return cmd_set_api_key(&cfg, args.set_api_key_gpg);
+    if (args.forget_api_key) return cmd_forget_api_key(&cfg);
+    if (args.doctor) return doctor(&cfg);
+    if (args.credits_cmd) { credits_command(); return 0; }
+    if (args.list_sessions_cmd) return list_sessions_command(&cfg);
+    if (args.rename_session_cmd) return rename_session_command(&cfg, args.rename_old, args.rename_new);
+    if (args.turns_cmd) return turns_command(&cfg, args.turns_session);
+    if (args.branch_cmd) return branch_session_command(&cfg, &args, args.branch_session, args.branch_turn);
+    if (args.edit_turn_cmd) { if (!confirm_live_send_if_needed(&cfg, &args)) return 1; return edit_turn_command(&cfg, &args, args.edit_turn_session, args.edit_turn); }
+    if (args.export_cmd) return export_session_command(&cfg, args.export_session, args.export_format, args.output_path);
+    if (args.show_memory_cmd) { char *p = session_path_from_arg(&cfg, args.memory_path); print_memory_for_file(p, cfg.context_turns); free(p); return 0; }
+    if (args.clear_memory_cmd) { char *p = session_path_from_arg(&cfg, args.memory_path); int rc = clear_memory_command(p); free(p); return rc; }
+    if (args.edit_memory_cmd) { char *p = session_path_from_arg(&cfg, args.memory_path); int rc = edit_memory_command(&cfg, p); free(p); return rc; }
+    if (args.search_sessions_cmd || (args.search && !args.list_models)) { search_all_sessions(&cfg, args.search ? args.search : ""); return 0; }
+    if (args.editor_prompt_cmd) {
+        if (args.session_arg && args.output_path) die("use either --session SESSION or an explicit output log, not both");
+        if (!args.demo && !cfg.api_key) die("API key missing; set OPENROUTER_API_KEY or run --set-api-key");
+        char *editor_session_path = args.session_arg ? session_path_from_arg(&cfg, args.session_arg) : NULL;
+        int rc = editor_prompt_command(&cfg, editor_session_path ? editor_session_path : args.output_path, &args);
+        free(editor_session_path);
+        return rc;
+    }
+    if (args.show_config) { print_config_summary(&cfg); return 0; }
+    if (args.config_set_cmd) {
+        if (!args.config_key || !args.config_value) die("--set requires KEY=VALUE");
+        if (!valid_web_config(args.config_key, args.config_value)) return 2;
+        config_write_key_value(&cfg, args.config_key, args.config_value);
+        fprintf(stderr, "set %s in %s\n", args.config_key, cfg.config_file);
+        return 0;
+    }
+    if (args.config_unset_cmd) {
+        if (!args.config_key) die("--unset requires KEY");
+        config_remove_key(&cfg, args.config_key);
+        fprintf(stderr, "removed %s from %s\n", args.config_key, cfg.config_file);
+        return 0;
+    }
+    if (args.favorites) return list_favorites(&cfg);
+    if (args.favorite_model) return add_favorite(&cfg, args.test_model_id);
+    if (args.unfavorite_model) return remove_favorite(&cfg, args.test_model_id);
+    if (args.update_models) return update_models(&cfg, args.demo);
+    if (args.select_model_cmd) return select_model_command(&cfg, args.demo);
+    if (args.list_models) {
+        if (args.show_all_models) {
+            free(args.model_type); args.model_type = xstrdup("all");
+            cfg.model_filter_require_tokens = false;
+            cfg.model_filter_hide_preview = false;
+            cfg.model_min_input_tokens = 0;
+            cfg.model_min_output_tokens = 0;
+        }
+        if (args.require_tokens) cfg.model_filter_require_tokens = true;
+        if (args.allow_missing_tokens) cfg.model_filter_require_tokens = false;
+        if (args.hide_preview) cfg.model_filter_hide_preview = true;
+        if (args.show_preview) cfg.model_filter_hide_preview = false;
+        if (args.min_input_tokens > 0) cfg.model_min_input_tokens = args.min_input_tokens;
+        if (args.min_output_tokens > 0) cfg.model_min_output_tokens = args.min_output_tokens;
+        return list_models(&cfg, args.search, args.model_type, args.model_sort, args.favorites_only, args.demo);
+    }
+    if (args.test_model) {
+        if (!args.demo && !cfg.api_key) die("API key missing; set OPENROUTER_API_KEY or run --set-api-key");
+        int rc = test_model_command(&cfg, args.test_model_id, args.demo);
+        if (rc == 0 && args.save && args.test_model_id) {
+            config_write_key_value(&cfg, "MODEL", args.test_model_id);
+            fprintf(stderr, "saved MODEL=%s\n", args.test_model_id);
+        }
+        return rc;
+    }
+
+    if (args.voice_input_path) {
+        if (args.prompt_text || args.input_path) {
+            fprintf(stderr, "use --voice-input/--transcribe by itself, not with --prompt or an input file\n");
+            return 2;
+        }
+        args.prompt_text = run_voice_input_command(&cfg, args.voice_input_path);
+        if (!args.prompt_text) return 1;
+    }
+    if (args.prompt_text && args.input_path) {
+        fprintf(stderr, "use either --prompt TEXT or an input file, not both\n");
+        return 2;
+    }
+    if (args.session_arg && args.output_path) {
+        fprintf(stderr, "use either --session SESSION or an explicit output log, not both\n");
+        return 2;
+    }
+    if (!args.interactive && !args.prompt_text && !args.input_path && isatty(STDIN_FILENO)) {
+        args.interactive = true;
+    }
+
+    if (args.interactive) {
+        if (args.prompt_text) {
+            fprintf(stderr, "interactive mode does not accept --prompt; omit -i for one-shot sends\n");
+            return 2;
+        }
+        if (args.output_path) {
+            fprintf(stderr, "interactive mode accepts --session SESSION, --resume SESSION, or one positional session name/path, not an output log\n");
+            return 2;
+        }
+        int session_sources = 0;
+        if (args.resume_session) session_sources++;
+        if (args.session_arg) session_sources++;
+        if (args.input_path) session_sources++;
+        if (args.new_session_cmd && session_sources > 0) {
+            fprintf(stderr, "--new starts a fresh timestamped interactive session and does not accept a session name/path\n");
+            return 2;
+        }
+        if (session_sources > 1) {
+            fprintf(stderr, "interactive mode accepts only one session name/path\n");
+            return 2;
+        }
+        char *session_path = NULL;
+        if (!args.new_session_cmd && args.resume_session) session_path = session_path_from_arg(&cfg, args.resume_session);
+        else if (!args.new_session_cmd && args.session_arg) session_path = session_path_from_arg(&cfg, args.session_arg);
+        else if (!args.new_session_cmd && args.input_path) session_path = session_path_from_arg(&cfg, args.input_path);
+        if (args.resume_session && !file_exists(session_path)) die("session not found: %s", session_path);
+        int rc = interactive_loop(&cfg, &args, session_path);
+        free(session_path);
+        return rc;
+    }
+
+    if (!args.prompt_text && !args.input_path) args.input_path = xstrdup("-");
+    if (!args.output_path) {
+        if (args.session_arg) args.output_path = session_path_from_arg(&cfg, args.session_arg);
+        else args.output_path = default_session_path(&cfg);
+    }
+    if (!args.demo && !cfg.api_key) die("API key missing; set OPENROUTER_API_KEY or run --set-api-key");
+
+    if (!confirm_live_send_if_needed(&cfg, &args)) return 1;
+    maybe_write_prechat_and_startup_notice(&cfg, &args, args.output_path);
+
+    size_t input_len = 0;
+    char *input_text = args.prompt_text ? xstrdup(args.prompt_text) : read_input_source(args.input_path, &input_len);
+    const char *input_label = args.prompt_text ? "prompt" : (args.input_path ? args.input_path : "stdin");
+    TCMessageList context = load_context_from_session(args.output_path, cfg.context_turns);
+    const char *model = args.model_override ? args.model_override : cfg.model;
+
+    status_update(&cfg, &args, "loading context from %s", args.output_path);
+    bind_session_id(&args, args.output_path);
+    char *raw = openrouter_chat(&cfg, model, input_text, &context, &args);
+    char *session_base = basename_no_ext(args.output_path);
+    char *cleaned = extract_code_blocks(&cfg, session_base, raw);
+
+    append_turn(args.output_path, model, input_label, &args, input_text, cleaned, &context, cfg.context_turns);
+    maybe_generate_session_title(&cfg, &args, &args.output_path, input_text, cleaned);
+    status_update(&cfg, &args, "saving response to %s", args.output_path);
+    fprintf(stderr, "appended response to %s\n", args.output_path);
+    emit_session_path(args.output_path);
+    if (args.loopback && !effective_stream(&cfg, &args)) printf("%s\n", cleaned);
+    if (!args.request_failed && effective_speak(&cfg, &args)) run_voice_output_command(&cfg, cleaned);
+    if (args.loopback_file) {
+        append_file_text(args.loopback_file, cleaned);
+        append_file_text(args.loopback_file, "\n");
+    }
+
+    free(input_text);
+    free(raw);
+    free(cleaned);
+    free(session_base);
+    msglist_free(&context);
+    curl_global_cleanup();
+    return args.request_failed ? 1 : 0;
+}

@@ -1,0 +1,32 @@
+ttychatter stream-stop and ncurses-options update
+=================================================
+
+Implemented:
+
+- ESC stops an active streamed response in the C client.
+- ESC stops an active streamed response in ttychatter.python.
+- ESC stops an active streamed response in ttychatter.bash.
+- ESC stops an active streamed response in ttychatter.ncurses.
+- Stopped streams save partial assistant text with:
+  [assistant stream interrupted by user]
+- ncurses status bar now shows:
+  Streaming... press ESC to stop
+- ncurses Options now includes STREAM and related newly exposed config-backed settings:
+  STREAM, LOOPBACK_FILE, MAX_ATTACHMENT_BYTES, MODEL_FAVORITES_FILE, GITHUB_URL.
+- ncurses --stream and --no-stream are now CLI options.
+- C, Bash, Python-helper, and ncurses man pages/docs were updated for ESC stop behavior.
+
+Validated locally:
+
+- C make check passes.
+- bash -n ttychatter.bash passes.
+- bash -n ttychatter.python passes.
+- embedded Python streaming block in ttychatter.python compiles.
+- python3 -m py_compile ttychatter.ncurses passes.
+- ttychatter.ncurses --help exposes --stream and --no-stream.
+- Bash-only streaming was smoke-tested with a fake curl SSE stream.
+
+Not live-tested:
+
+- Real OpenRouter streaming cancellation.
+- Full ncurses interactive ESC cancellation in a real terminal emulator.

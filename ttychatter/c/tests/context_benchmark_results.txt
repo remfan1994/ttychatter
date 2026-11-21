@@ -1,0 +1,54 @@
+{
+  "fixture_bytes": 30505894,
+  "fixture_sha256": "4561107f946a63e902760000327bb44ce9254c40d58340cb8c372debf79d5658",
+  "outputs_identical": true,
+  "platform": "Linux-6.18.57-x86_64-with-glibc2.41",
+  "rss_unit": "KiB",
+  "samples": {
+    "baseline": {
+      "binary_sha256": "30d34a1706389b986da4352a97dfaeeb3ca60202014ef1505e7b28c513a4b091",
+      "median_peak_rss": 157112,
+      "median_seconds": 0.235345,
+      "runs": [
+        {
+          "elapsed_seconds": 0.235345,
+          "output_sha256": "ec17e121c5bba0127e8a2d78303108300e88bf3ee054e569c4e4f325caa9a491",
+          "peak_rss": 157112
+        },
+        {
+          "elapsed_seconds": 0.319435,
+          "output_sha256": "ec17e121c5bba0127e8a2d78303108300e88bf3ee054e569c4e4f325caa9a491",
+          "peak_rss": 157120
+        },
+        {
+          "elapsed_seconds": 0.143742,
+          "output_sha256": "ec17e121c5bba0127e8a2d78303108300e88bf3ee054e569c4e4f325caa9a491",
+          "peak_rss": 157112
+        }
+      ]
+    },
+    "updated": {
+      "binary_sha256": "a4a9635d4feb5a8249000d226a15ff883b4f0b860d179c387894fed8dce39621",
+      "median_peak_rss": 34764,
+      "median_seconds": 0.023653,
+      "runs": [
+        {
+          "elapsed_seconds": 0.021846,
+          "output_sha256": "ec17e121c5bba0127e8a2d78303108300e88bf3ee054e569c4e4f325caa9a491",
+          "peak_rss": 34752
+        },
+        {
+          "elapsed_seconds": 0.023653,
+          "output_sha256": "ec17e121c5bba0127e8a2d78303108300e88bf3ee054e569c4e4f325caa9a491",
+          "peak_rss": 34764
+        },
+        {
+          "elapsed_seconds": 0.025787,
+          "output_sha256": "ec17e121c5bba0127e8a2d78303108300e88bf3ee054e569c4e4f325caa9a491",
+          "peak_rss": 34764
+        }
+      ]
+    }
+  },
+  "turns": 10000
+}

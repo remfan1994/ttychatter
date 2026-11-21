@@ -1,0 +1,541 @@
+.TH TTYCHATTER.MAILBOT 1 "November 2026" "ttychatter.mailbot 0.7.2-stability" "User Commands"
+.SH NAME
+ttychatter.mailbot \- email transport adapter and remote control surface for ttychatter
+.SH SYNOPSIS
+.B ttychatter.mailbot
+[--config-file PATH] [--once|--daemon] [--dry-run] [--open-to-public]
+.PP
+.B ttychatter.mailbot
+[--doctor] [--list-candidates] [--cleanup-public-sessions]
+.PP
+.B ttychatter.mailbot
+[--config|--raw-config] [--sessions|--list-sessions] [--manpage]
+[--model-cache] [--model-search TEXT] [--search TEXT|--search-sessions TEXT]
+[--update-models] [--rename-session SESSION TITLE] [--delete-session SESSION]
+[--turns SESSION] [--branch SESSION TURN] [--export SESSION --format FORMAT]
+.PP
+.B ttychatter.mailbot
+[--ttychatter-backend python|c|bash|auto|command]
+[--ttychatter-command COMMAND] [--ttychatter-extra-args ARGS]
+[--web|--no-web] [--web-engine ENGINE]
+[--web-max-results N] [--web-max-uses N]
+.PP
+.B ttychatter.mailbot
+[--set KEY VALUE] [--unset KEY] [--set-imap-password [--gpg]]
+[--set-smtp-password [--gpg]]
+.SH DESCRIPTION
+ttychatter.mailbot reads unread IMAP mail, maps each accepted message to a
+chat session or an allowlisted control command, invokes a ttychatter client,
+and replies by sendmail or SMTP.
+.PP
+The mailbot is a transport adapter. It does not contain OpenRouter chat logic.
+The selected ttychatter backend owns model calls, context reconstruction,
+session logs, attachments, model selection, and exports.
+.PP
+The default backend remains
+.B ttychatter.python
+for existing deployments. The same mailbot can now use the current C CLI or the
+Bash-only client by setting TTYCHATTER_BACKEND or TTYCHATTER_COMMAND.
+.SH BACKENDS
+.TP
+.B TTYCHATTER_BACKEND=python
+Use
+.B ttychatter.python
+(default).
+.TP
+.B TTYCHATTER_BACKEND=c
+Use the C CLI command
+.B ttychatter.
+.TP
+.B TTYCHATTER_BACKEND=bash
+Use
+.B ttychatter.bash.
+.TP
+.B TTYCHATTER_BACKEND=auto
+Use the first available command in this order: ttychatter, ttychatter.python,
+ttychatter.bash.
+.TP
+.B TTYCHATTER_BACKEND=command
+Use TTYCHATTER_COMMAND exactly.
+.TP
+.B TTYCHATTER_CLIENT=python|c|bash|auto|command
+Legacy alias for TTYCHATTER_BACKEND. New configs should prefer TTYCHATTER_BACKEND.
+.TP
+.B TTYCHATTER_COMMAND=COMMAND
+Override the backend map. COMMAND is split with shell-like quoting.
+.TP
+.B TTYCHATTER_EXTRA_ARGS=ARGS
+Extra arguments added to chat and utility subprocesses. This is commonly used for local
+smoke tests, for example ARGS="--demo".
+.PP
+Chat calls use the current cross-backend form:
+.PP
+.RS
+.nf
+COMMAND [TTYCHATTER_EXTRA_ARGS] [WEB_FLAGS] --loopback --input - --attach FILE --session PATH
+.fi
+.RE
+.PP
+This works with the current C version, ttychatter.python, and ttychatter.bash.
+.SH WEB SEARCH
+All supported backends receive the same effective web options. Mailbot defaults
+are WEB_SEARCH=0, WEB_SEARCH_ENGINE=auto, WEB_SEARCH_MAX_RESULTS=5, and
+WEB_SEARCH_MAX_USES=3. Values in the sender's ttychatter config override these
+defaults. Mailbot command-line flags override both for the running process.
+.PP
+Use --web or --no-web to override enablement; --web-engine accepts auto, native,
+exa, parallel, perplexity, or firecrawl. --web-max-results accepts 0 through 25
+(clamped to 20 for Perplexity when nonzero); --web-max-uses accepts 0 through 25.
+Zero means no ttychatter-imposed value for that limit; provider limits still apply.
+.PP
+The backend enables OpenRouter's server-side web tool. The model chooses when
+to search. Search fees and result tokens are additional to chat usage, including
+with free models. Provider-native search can ignore result and search-call
+settings, so these limits do not impose a dollar spending cap.
+.PP
+Email users can send web on, web off, or web status. The four WEB_SEARCH keys
+are included in the default USER_TTYCONFIG_ALLOWED_KEYS. An operator's custom
+allowlist must add these keys if users should control their own web settings.
+.SH PRIVATE SUBJECT GRAMMAR
+.TP
+.B ordinary email subject
+Send the message body to this sender's private subject-named session when
+SUBJECT_SESSIONS=1. Reply prefixes such as Re: and Fwd: are stripped.
+.TP
+.B tc:{session-name}
+Send the message body to the named ttychatter session.
+.TP
+.B tc:{new}
+Create a new timestamped session log using the current ttychatter session naming
+style, session-YYYY-MM-DD-HH-MM-SS.log, under the active SESSION_DIR.
+The reply identifies the actual created session, so replying continues it.
+Unnamed sessions receive a prominent naming reminder.
+.TP
+.B tc:CONFIG
+Export or apply the mailbot config attachment.
+.TP
+.B tc:MODELS
+Return the existing MODEL_CACHE_FILE as models-cache.json. This is cache-only;
+it does not refresh models.
+.TP
+.B tc:MODELS TEXT
+Search the existing model cache for TEXT. This is also cache-only.
+.TP
+.B tc:CMD
+Run the first nonempty message-body line as a mailbot command.
+.TP
+.B tc:command args
+Run a mailbot command directly from the subject.
+.TP
+.B MAILBOT
+When included in BODY_COMMAND_SUBJECTS, use the first nonempty body line as
+the command or session selector. "session NAME" and "chat NAME" route the
+remaining body to that chat session.
+.SH COMMANDS
+.TP
+.B help
+Return the regular-user email command summary.
+.TP
+.B help-admin
+Return administrator/operator help. Requires ALLOWED_FROM.
+.TP
+.B manpage
+Return this manual as a plain-text email attachment. Aliases: manual,
+get-manpage, fetch-manpage.
+.TP
+.B sessions
+List saved sessions. Friendly session-title metadata is displayed when present;
+file names and readable chat previews are also shown. Internal response metadata
+is excluded from previews.
+.TP
+.B search TEXT
+Search session filenames, friendly titles, and log contents.
+.TP
+.B search-session SESSION TEXT
+Search one session log.
+.TP
+.B rename-session SESSION TITLE
+Set session-title metadata and rename the physical log through the selected
+backend. The managed filename contains a safe title and an identity suffix.
+Existing subject/session references remain aliases to the renamed log.
+Aliases include
+retitle-session, title-session, and set-session-title.
+.TP
+.B rename-session-file OLD NEW
+Legacy escape hatch that renames the session log file.
+The destination must not exist. Existing references remain aliases.
+.TP
+.B web [on|off|status]
+Enable, disable, or inspect this sender's effective web-search settings.
+Changes affect future requests. Operator command-line overrides take precedence
+for the lifetime of the mailbot process.
+.TP
+.B turns SESSION
+Run ttychatter --turns for the session.
+.TP
+.B branch SESSION TURN
+Run ttychatter --branch for the session and turn.
+.TP
+.B export SESSION [markdown|text|json]
+Export a session. Markdown is the default. JSON support depends on the selected
+backend; the Bash-only ttychatter intentionally omits JSON export.
+.TP
+.B delete-session SESSION
+Delete a session log. Aliases: delete, rm, remove-session, rm-session. The target
+must resolve inside SESSION_DIR and the supplied name must already be the exact
+sanitized session name.
+An old alias resolves to its current log. Symlink logs are refused.
+.TP
+.B archive-session [on|off|status]
+Show or change the sender's public-mode archive-on-expire preference. Aliases:
+archive-opt-in and archive-opt-out.
+.TP
+.B user
+Show this sender's registry id, private HOME, per-user config path, and API-key
+source.
+.TP
+.B prefs
+Show this sender's ttychatter configuration. Alias for ttyconfig.
+.TP
+.B tty-set KEY VALUE
+Set an allowlisted per-user ttychatter preference. The allowed list is
+USER_TTYCONFIG_ALLOWED_KEYS. Alias: set. The mailbot emits C-compatible
+--set KEY=VALUE syntax for the C backend and --set KEY VALUE for the Python and
+Bash helpers.
+.TP
+.B tty-unset KEY
+Remove an allowlisted per-user ttychatter preference. Alias: unset.
+.TP
+.B api-key KEY
+Store this sender's persistent OpenRouter API key in USER_SECRET_DIR as a chmod
+600 secret file. The key is not written to .config. Aliases include set-api-key,
+api-key-persistent, and persistent-api-key. This command is available only when
+USER_API_KEY_MODE is persistent or both and ALLOW_USER_API_KEYS=1.
+.TP
+.B api-key-session KEY
+Store this sender's temporary OpenRouter API key in USER_API_KEY_RUNTIME_DIR.
+The key expires after USER_API_KEY_TTL_MINUTES and is preferred over a
+persistent user key while valid. Aliases include temp-api-key, api-key-temp,
+temporary-api-key, and session-api-key. This command is available only when
+USER_API_KEY_MODE is session or both and ALLOW_USER_API_KEYS=1.
+.TP
+.B api-key-status
+Show this sender's API-key mode, selected API-key source, persistent-key file
+path, and temporary-key expiry status. Secret values are not printed.
+.TP
+.B forget-api-key
+Remove this sender's persistent and temporary OpenRouter API keys and then fall
+back according to USER_API_KEY_FALLBACK_TO_OPERATOR.
+.TP
+.B forget-session-api-key
+Remove only this sender's temporary runtime OpenRouter API key.
+.TP
+.B model-cache
+Return the existing MODEL_CACHE_FILE only. Never refreshes the cache.
+.TP
+.B model-search TEXT
+Search the existing model cache only. Never refreshes the cache.
+.TP
+.B update-models
+Explicitly run the selected backend with --update-models, then return the model
+cache.
+.TP
+.B models [FLAGS]
+Run the selected backend with --models. Aliases include model-list and
+list-models.
+.TP
+.B routers [FLAGS]
+Run the selected backend with --routers.
+.TP
+.B favorites
+Run ttychatter --favorites.
+.TP
+.B favorite-model MODEL
+Run ttychatter --favorite-model MODEL.
+.TP
+.B unfavorite-model MODEL
+Run ttychatter --unfavorite-model MODEL.
+.TP
+.B test-model MODEL
+Run ttychatter --test-model MODEL.
+.TP
+.B show-memory SESSION
+Run ttychatter --show-memory SESSION.
+.TP
+.B clear-memory SESSION
+Run ttychatter --clear-memory SESSION.
+.TP
+.B ttydoctor
+Run ttychatter --doctor.
+.TP
+.B credits
+Run ttychatter --credits.
+.SH SAFE MODEL-LIST FLAGS
+The mailbot allows only a bounded set of model-list flags through email:
+.PP
+.RS
+.nf
+--all
+--sort VALUE
+--modellist-sort-tokens
+--min-input-tokens N
+--min-output-tokens N
+--hide-preview
+--show-preview
+--require-tokens
+--allow-missing-tokens
+--favorites-only
+--model-type VALUE
+.fi
+.RE
+.SH PUBLIC DEMO MODE
+In public mode, a message without a recognized control subject is treated as an
+AI prompt. PUBLIC_SESSION_MODE controls isolation: per-sender, per-message, or
+shared. The default is per-sender.
+.PP
+Public sessions use PUBLIC_SESSION_PREFIX and are cleaned up automatically when
+PUBLIC_SESSION_CLEANUP=1. PUBLIC_SESSION_IDLE_HOURS,
+PUBLIC_SESSION_TTL_HOURS, and PUBLIC_SESSION_MAX_COUNT control deletion.
+PUBLIC_SESSION_MAX_TURNS trims surviving public logs to the most recent
+input/output cycles.
+.PP
+When PUBLIC_SESSION_ARCHIVE_ON_DELETE=1, an expiring public log is emailed to
+the recorded sender before local deletion. PUBLIC_SESSION_ARCHIVE_USER_TOGGLE=1
+lets public users change their own preference with archive-session on/off.
+.SH OUTPUT MODES
+COMMAND_OUTPUT_MODE, MODEL_CACHE_OUTPUT, MODEL_SEARCH_OUTPUT,
+MODEL_LIST_OUTPUT, SESSIONS_OUTPUT, and CONFIG_OUTPUT accept auto, body, or
+attachment. The default is auto globally, with short search/session results in
+the body and large cache/config results as attachments.
+.SH API-KEY MODES
+The mailbot can use an operator/default OpenRouter key, per-user persistent
+keys, or per-user temporary runtime keys. The mode is controlled by
+USER_API_KEY_MODE.
+.TP
+.B USER_API_KEY_MODE=operator
+Use only DEFAULT_OPENROUTER_API_KEY_FILE or API keys from the mailbot process
+environment. User key commands are refused.
+.TP
+.B USER_API_KEY_MODE=persistent
+Allow users to save persistent chmod 600 key files in USER_SECRET_DIR. This is
+the compatibility default.
+.TP
+.B USER_API_KEY_MODE=session
+Allow users to save temporary runtime keys with api-key-session. Persistent key
+files are not used.
+.TP
+.B USER_API_KEY_MODE=both
+Allow temporary and persistent user keys. Temporary runtime keys take priority,
+then persistent user key files, then the operator key if fallback is enabled.
+.TP
+.B USER_API_KEY_TTL_MINUTES=N
+Expiration time for api-key-session keys. The default is 60 minutes.
+.TP
+.B USER_API_KEY_RUNTIME_DIR=PATH
+Directory for temporary runtime key JSON files. The default is
+$XDG_RUNTIME_DIR/ttychatter/mailbot/user-api-keys when XDG_RUNTIME_DIR is set,
+otherwise /tmp/ttychatter-mailbot-UID/user-api-keys. Files are written mode
+0600 and parent directories mode 0700.
+.TP
+.B USER_API_KEY_FALLBACK_TO_OPERATOR=0|1
+When enabled, users without a usable user key fall back to the operator/default
+OpenRouter key. When disabled, USER_API_KEY_MODE=persistent/session/both require
+a user key for that sender. The default is 1 for compatibility.
+.PP
+Temporary API keys avoid long-term storage under .local/state or .config, but
+they are still present in runtime storage while valid and are still exposed to
+the mail path unless the user's email is encrypted end-to-end. They do not hide
+secrets from a trusted host administrator or root.
+.TP
+.B API_KEY_COMMANDS_REQUIRE_BODY=0|1
+When enabled, api-key, api-key-session, and tty-set API-key commands that
+include a secret operand are refused when the secret appears in the subject.
+Users should send Subject: tc:CMD and put the secret command in the message
+body. The default is 1.
+.SH CONFIGURATION KEYS
+Important keys include IMAP_HOST, IMAP_PORT, IMAP_SSL, IMAP_USER,
+IMAP_PASSWORD, IMAP_PASSWORD_GPG_FILE, SEND_METHOD, SENDMAIL_PATH,
+MAIL_FROM, MAIL_TO, ALLOWED_FROM, DENY_FROM, BANNED_FROM, BANNED_LIST,
+REJECT_SELF_SENDER, SUBJECT_PREFIX, SUBJECT_SEPARATOR, SESSION_OPEN_DELIM,
+SESSION_CLOSE_DELIM, BODY_COMMAND_SUBJECTS, ALLOW_COMMANDS_IN_SUBJECT,
+ALLOW_BODY_COMMAND_SUBJECTS, ALLOW_BARE_CONTROL_SUBJECTS,
+ALLOW_LEGACY_BRACED_CONTROL, RE_SESSION_SUBJECTS, OPEN_TO_PUBLIC,
+PUBLIC_SESSION_MODE, PUBLIC_SESSION_PREFIX, PUBLIC_SHARED_SESSION,
+PUBLIC_ALLOWED_COMMANDS, PUBLIC_SESSION_CLEANUP, PUBLIC_SESSION_TTL_HOURS,
+PUBLIC_SESSION_IDLE_HOURS, PUBLIC_SESSION_MAX_COUNT, PUBLIC_SESSION_MAX_TURNS,
+USER_REGISTRY, SUBJECT_SESSIONS, USER_REGISTRY_FILE, USER_HOME_ROOT,
+USER_SECRET_DIR, DEFAULT_OPENROUTER_API_KEY_FILE,
+MIGRATE_PLAINTEXT_OPENROUTER_API_KEY, ALLOW_USER_API_KEYS,
+USER_API_KEY_MODE, API_KEY_MODE, USER_API_KEY_TTL_MINUTES,
+USER_API_KEY_RUNTIME_DIR, USER_API_KEY_FALLBACK_TO_OPERATOR,
+API_KEY_COMMANDS_REQUIRE_BODY, USER_TTYCONFIG_ALLOWED_KEYS, SPAM_PROTECTION,
+RATE_LIMIT_ENABLED,
+DAILY_QUOTA_ENABLED, MAX_SESSIONS_PER_SENDER, API_COST_PROTECTION,
+API_MAX_INPUT_CHARS, API_MAX_ESTIMATED_TOKENS, API_MAX_ATTACHMENT_BYTES,
+TTYCHATTER_BACKEND, TTYCHATTER_CLIENT, TTYCHATTER_COMMAND, TTYCHATTER_EXTRA_ARGS,
+AI_FILE_DOWNLOAD_MODE, MAILBOT_SEND_AI_FILES, TTYCHATTER_CONTROL_TIMEOUT, MODEL_CACHE_FILE, SESSION_DIR, ATTACHMENT_DIR,
+WORK_DIR, PROCESSED_DB, COMMAND_OUTPUT_MODE, MODEL_CACHE_OUTPUT,
+MODEL_SEARCH_OUTPUT, MODEL_LIST_OUTPUT, SESSIONS_OUTPUT, CONFIG_OUTPUT,
+OUTPUT_INLINE_MAX_BYTES, MAX_COMMAND_OUTPUT_BYTES, and
+MAX_OUTGOING_ATTACHMENT_BYTES.
+
+.SH AI-RETURNED FILE ATTACHMENTS
+Current ttychatter backends can record provider-returned file attachments when a
+provider exposes downloadable file metadata, data URLs, or base64 payloads in the
+chat response. The mailbot is noninteractive, so the safest default is metadata
+only unless the operator or user explicitly enables downloading.
+.PP
+Set AI_FILE_DOWNLOAD_MODE to ask, metadata, auto, or off. In mailbot use, ask
+degrades to metadata because there is no terminal prompt. metadata lists returned
+files in the reply body without saving them. auto passes --ai-download auto to
+the selected ttychatter backend and saves returned files under
+ATTACHMENT_DIR/received when possible. off ignores returned file metadata.
+.PP
+When MAILBOT_SEND_AI_FILES=1, saved returned files located under ATTACHMENT_DIR
+are attached to the outgoing email reply, subject to MAX_OUTGOING_ATTACHMENT_BYTES.
+Users in registry mode may request downloads with a tty-set command when
+USER_TTYCONFIG_ALLOWED_KEYS allows AI_FILE_DOWNLOAD_MODE:
+.PP
+.RS
+.nf
+Subject: tc:CMD
+tty-set AI_FILE_DOWNLOAD_MODE auto
+.fi
+.RE
+
+.SH RELIABILITY AND SESSION IDENTITY
+Chat subprocesses have TTYCHATTER_CHAT_TIMEOUT=600 seconds; utility commands
+have TTYCHATTER_CONTROL_TIMEOUT=180 seconds. A timeout stops the subprocess
+group, including shell descendants, and preserves any partial response.
+The termination grace is five seconds, followed by one second for final pipe
+draining after SIGKILL. A detached descendant that still holds an output pipe
+cannot keep the mailbot waiting forever.
+.PP
+Backend stdout capture is limited to the larger of MAX_COMMAND_OUTPUT_BYTES
+and MAX_OUTGOING_ATTACHMENT_BYTES. Diagnostic capture keeps the final
+MAX_COMMAND_OUTPUT_BYTES so session-path markers remain available. Both
+buffers have a minimum of 1000 bytes. Output beyond these limits is drained
+without accumulating in memory, and the returned text explicitly reports
+truncation. The backend's original session log is not shortened by capture.
+.PP
+IMAP, SMTP, and sendmail also use TTYCHATTER_CONTROL_TIMEOUT. IMAP over TLS
+verifies the server certificate and hostname with the system trust store.
+SMTP TLS and STARTTLS use the same verification policy.
+.PP
+When ABUSE_LIMIT_ALLOWED_FROM=1 and MAX_MESSAGE_BYTES is positive, the IMAP
+body fetch itself is bounded to that limit plus one byte. Oversized messages
+remain unread and are skipped before MIME parsing. Setting
+ABUSE_LIMIT_ALLOWED_FROM=0 preserves the configured admin bypass and requires
+fetching the full message before the sender-specific size check.
+.PP
+Before delivery, completed chat, command, and config replies are saved privately under
+pending-chat-replies next to PROCESSED_DB. When transport fails, the next poll
+retries the saved email without generating or charging for another model
+response or repeating a completed command. The pending record is removed after delivery and a processed-message
+record is saved. Keep this directory with the state files during upgrades.
+.PP
+This queue covers completed replies. It does not guarantee exactly-once
+SMTP delivery if the process stops after server acceptance and before the
+local acknowledgment is saved. A process stopped during model generation,
+or after a command changes state but before its reply can be queued, still
+needs operator review before retrying.
+.PP
+Polls using the same PROCESSED_DB share a nonblocking process lock. Overlapping
+cron and daemon polls are skipped. Unaccepted unread messages no longer prevent
+later eligible messages from being processed. MAX_MESSAGES_PER_RUN limits
+processed messages rather than the first unread UIDs examined.
+The processed-ID history is loaded once per locked poll and updated after
+each durable delivery record. It is reloaded on the next poll. Invalid MIME
+charset names use a UTF-8 fallback, and message-local failures leave that
+message unread while the scan continues. A disconnected IMAP transport ends
+the poll so the next run can establish a fresh connection.
+.PP
+Each SESSION_DIR contains a private .mailbot-session-aliases.json index. Keep
+this file with the logs when moving an installation. It links old subjects and
+filenames to stable session IDs and current filenames. A missing alias target
+raises an error instead of silently creating an empty replacement conversation.
+.PP
+Public log trimming preserves session IDs and titles, and does not reset the
+file's idle timestamp. Rename tracking also updates public ownership and cleanup
+references. Registry users retain separate session roots and separate alias maps.
+.SH XDG PATHS
+Without overrides, ttychatter.mailbot follows the XDG base-directory layout:
+.PP
+.RS
+.nf
+config:      $XDG_CONFIG_HOME/ttychatter/mailbot/config
+state:       $XDG_STATE_HOME/ttychatter/mailbot/
+cache:       $XDG_CACHE_HOME/ttychatter/mailbot/
+sessions:    $XDG_DATA_HOME/ttychatter/openrouter/sessions/
+attachments: $XDG_DATA_HOME/ttychatter/openrouter/attachments/
+model cache: $XDG_CACHE_HOME/ttychatter/openrouter/models.json
+runtime user keys: $XDG_RUNTIME_DIR/ttychatter/mailbot/user-api-keys/
+.fi
+.RE
+.PP
+When USER_REGISTRY=1, every sender gets a private HOME under USER_HOME_ROOT.
+That HOME contains the same ttychatter OpenRouter config/data/cache layout used
+by the C, Python, and Bash clients.
+.PP
+Compatibility fallback is retained for the older model cache name
+models-cache.json and older favorites file model-favorites.txt.
+.SH SECURITY
+Public mode is for demos. It should use a separate mailbox, conservative limits,
+per-sender registry homes, subject sessions, and a small PUBLIC_ALLOWED_COMMANDS
+set. Do not expose config mutation, model refresh, session deletion, api-key, api-key-session,
+tty-set, or tty-unset to non-ALLOWED_FROM senders unless the deployment is
+intentionally disposable.
+.PP
+OpenRouter keys are loaded according to USER_API_KEY_MODE. They may come from
+DEFAULT_OPENROUTER_API_KEY_FILE, a per-user persistent secret file, a temporary
+runtime key file, or the mailbot process environment. The selected key is
+injected into the ttychatter subprocess environment. The mailbot migrates legacy
+plaintext API-key lines out of ttychatter config when
+MIGRATE_PLAINTEXT_OPENROUTER_API_KEY=1.
+.PP
+Registry subprocesses clear inherited operator key variables before injecting
+the selected key, so disabling operator fallback also works when a user key is
+missing or expired. XDG_STATE_HOME is isolated along with HOME and the other
+XDG directories.
+.PP
+api-key-session is intended for encrypted-mail or otherwise trusted mail paths.
+It avoids long-term storage by expiring keys from runtime storage, but ordinary
+email and the server host are not secret from the mail operator/root. Keep
+API_KEY_COMMANDS_REQUIRE_BODY=1 so keys are not copied into mail subjects.
+.PP
+SPAM_PROTECTION rejects auto-submitted/list/bulk mail and recipient floods.
+RATE_LIMIT_ENABLED enforces rolling sender/global work caps. DAILY_QUOTA_ENABLED
+enforces daily sender/global caps. MAX_MESSAGE_BYTES, MAX_ATTACHMENT_COUNT,
+MAX_TOTAL_ATTACHMENT_BYTES, MAX_SESSIONS_PER_SENDER, and API_COST_PROTECTION
+protect the mail-to-API boundary before ttychatter is called.
+.SH FILES
+.TP
+.B $XDG_CONFIG_HOME/ttychatter/mailbot/config
+Default mailbot config.
+.TP
+.B $XDG_STATE_HOME/ttychatter/mailbot/processed-ids.txt
+Processed-message database.
+.TP
+.B $XDG_STATE_HOME/ttychatter/mailbot/pending-chat-replies/
+Private completed chat replies awaiting mail delivery.
+.TP
+.B $XDG_STATE_HOME/ttychatter/mailbot/users.json
+User registry.
+.TP
+.B $XDG_STATE_HOME/ttychatter/mailbot/users/
+Per-user HOME roots.
+.TP
+.B ~/.secrets/ttychatter/mailbot/openrouter-default.key
+Default server OpenRouter key.
+.TP
+.B ~/.secrets/ttychatter/mailbot/openrouter-users/
+Per-user persistent OpenRouter keys.
+.TP
+.B $XDG_RUNTIME_DIR/ttychatter/mailbot/user-api-keys/
+Per-user temporary runtime OpenRouter keys, when XDG_RUNTIME_DIR is set.
+.TP
+.B /tmp/ttychatter-mailbot-UID/user-api-keys/
+Fallback temporary runtime OpenRouter key directory when XDG_RUNTIME_DIR is not set.
+.SH EXIT STATUS
+0 indicates success. Nonzero status indicates configuration, IMAP, SMTP,
+sendmail, or ttychatter subprocess failure.

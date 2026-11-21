@@ -1,0 +1,21 @@
+Original recorded measurement (single run, local offline fixture).
+
+Working directory:
+/workspace/scratch/53e911a8244e/work/ttychatter
+
+Equivalent command for the preserved original driver:
+python3 /workspace/scratch/53e911a8244e/shell-benchmark-original.py
+
+The original execution used this same driver inline with python3 - <<'PY'.
+The driver file and this record were saved after that execution. The measurements
+below are the original tool output, not results of another run.
+
+baseline seconds=9.1175 returncode= 0 reply_bytes= 26001 expected_reply= True
+updated seconds=0.3503 returncode= 0 reply_bytes= 26001 expected_reply= True
+
+The fake curl emits 2,000 SSE text events and [DONE] from local fixture data.
+It sleeps for zero seconds after each fixture line, as the shell regression
+fixture does. Both clients return the exact same answer. The measurement
+includes request setup, fake-transport Python startup, SSE parsing, and cleanup.
+It excludes real networking and provider generation. No general production
+speedup is claimed from this single measurement.
